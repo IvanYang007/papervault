@@ -23,6 +23,7 @@ impl PdfRenderer {
 
     /// Run the render loop (blocks until channel closes).
     pub fn run(&mut self) {
+        eprintln!(">>> renderer entering recv loop");
         info!("PDF renderer started (pdfium lazy-init on first request)");
 
         // pdfium is lazy-initialized on the first render request
@@ -62,13 +63,17 @@ impl PdfRenderer {
         // Lazy-init pdfium
         let mut guard = pdfium_ref.lock().unwrap_or_else(|e| e.into_inner());
         if guard.is_none() {
-            info!("Binding pdfium library...");
+            let dll_dir = std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+                .unwrap_or_else(|| std::path::PathBuf::from("."));
+            let dll_path = dll_dir.join("pdfium.dll");
+            eprintln!(">>> attempting to bind pdfium at: {}", dll_path.display());
+            info!("Binding pdfium library: {}", dll_path.display());
             let pdfium = pdfium_render::prelude::Pdfium::new(
-                pdfium_render::prelude::Pdfium::bind_to_library(
-                    pdfium_render::prelude::Pdfium::pdfium_platform_library_name(),
-                )
-                .or_else(|_| pdfium_render::prelude::Pdfium::bind_to_system_library())
-                .context("Failed to bind pdfium library")?,
+                pdfium_render::prelude::Pdfium::bind_to_library(&dll_path)
+                    .or_else(|_| pdfium_render::prelude::Pdfium::bind_to_system_library())
+                    .context("Failed to bind pdfium library")?,
             );
             info!("Pdfium instance created");
             *guard = Some(pdfium);

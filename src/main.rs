@@ -30,7 +30,9 @@ fn main() -> eframe::Result {
     // Set panic hook to log panics before crashing
     panic::set_hook(Box::new(|info| {
         let msg = info.to_string();
-        error!("Panic: {}", msg);
+        let tid = std::thread::current().id();
+        eprintln!("!!! PANIC in thread {:?}: {}", tid, msg);
+        error!("Panic in thread {:?}: {}", tid, msg);
         if let Some(crash_dir) = dirs_next::data_local_dir() {
             let crash_path = crash_dir.join("papervault").join("crash.log");
             if let Some(parent) = crash_path.parent() {

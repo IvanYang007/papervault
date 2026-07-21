@@ -57,6 +57,7 @@ impl FolderRuntime {
     /// into the pipeline thread; only `tag_tx` is stored in the struct for UI access.
     /// Dropping `FolderRuntime` drops `tag_tx`, closing the channel naturally.
     pub fn start(folder: &Path, tag_store: &TagStore) -> Result<Self> {
+        eprintln!(">>> FolderRuntime::start called for: {}", folder.display());
         // ── Channels ──
         let (watcher_tx, watcher_rx) = channel::bounded::<IndexerMessage>(10_000);
         let (progress_tx, progress_rx) = channel::unbounded::<IndexerProgress>();
@@ -115,13 +116,17 @@ impl FolderRuntime {
                 })?;
 
         // Renderer
+        eprintln!(">>> about to spawn renderer");
         let renderer_handle =
             std::thread::Builder::new()
                 .name("renderer".into())
                 .spawn(move || {
+                    eprintln!(">>> renderer thread ALIVE, tid={:?}", std::thread::current().id());
                     let mut renderer = PdfRenderer::new(render_rx, render_result_tx);
                     renderer.run();
+                    eprintln!(">>> renderer thread EXITED");
                 })?;
+        eprintln!(">>> renderer spawned OK");
 
         Ok(Self {
             watcher_shutdown,
