@@ -1,10 +1,10 @@
 use anyhow::Context;
 use crossbeam::channel::{Receiver, Sender};
-use std::sync::Arc;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use tracing::{error, info};
 
 use crate::app::{RenderRequest, RenderResult};
+use crate::pdfium_lock;
 
 /// Background PDF renderer.
 /// Runs on a dedicated thread, receives render requests and sends back RGBA bitmaps.
@@ -24,9 +24,10 @@ impl PdfRenderer {
     /// Run the render loop (blocks until channel closes).
     pub fn run(&mut self) {
         eprintln!(">>> renderer entering recv loop");
-        info!("PDF renderer started (pdfium lazy-init on first request)");
+        info!("PDF renderer started");
 
-        // pdfium is lazy-initialized on the first render request
+        // pdfium is lazy-initialized on the first render request.
+        // The global lock serializes FPDF_InitLibrary() across threads.
         #[allow(clippy::arc_with_non_send_sync)]
         let pdfium: Arc<Mutex<Option<pdfium_render::prelude::Pdfium>>> = Arc::new(Mutex::new(None));
 
@@ -58,11 +59,10 @@ impl PdfRenderer {
     }
 
     fn render_page(
-        &mut self,
+        &self,
         request: &RenderRequest,
         pdfium_ref: &Arc<Mutex<Option<pdfium_render::prelude::Pdfium>>>,
     ) -> anyhow::Result<RenderResult> {
-        // Lazy-init pdfium
         let mut guard = pdfium_ref.lock().unwrap_or_else(|e| e.into_inner());
         if guard.is_none() {
             let dll_dir = std::env::current_exe()
@@ -70,8 +70,9 @@ impl PdfRenderer {
                 .and_then(|p| p.parent().map(|d| d.to_path_buf()))
                 .unwrap_or_else(|| std::path::PathBuf::from("."));
             let dll_path = dll_dir.join("pdfium.dll");
-            eprintln!(">>> attempting to bind pdfium at: {}", dll_path.display());
-            eprintln!(">>> calling bind_to_library...");
+            // Serialize FPDF_InitLibrary() across threads — not reentrant
+            let _lock = pdfium_lock::INIT.lock().unwrap_or_else(|e| e.into_inner());
+            eprintln!(">>> creating Pdfium instance (lock held)...");
             let pdfium = pdfium_render::prelude::Pdfium::new(
                 pdfium_render::prelude::Pdfium::bind_to_library(&dll_path)
                     .or_else(|_| pdfium_render::prelude::Pdfium::bind_to_system_library())
@@ -80,7 +81,7 @@ impl PdfRenderer {
             eprintln!(">>> Pdfium instance created OK");
             *guard = Some(pdfium);
         }
-        let pdfium = guard.as_ref().expect("pdfium was just initialized");
+        let pdfium = guard.as_ref().expect("pdfium initialized");
 
         info!("Reading PDF bytes: {}", request.path.display());
         let bytes = std::fs::read(&request.path)

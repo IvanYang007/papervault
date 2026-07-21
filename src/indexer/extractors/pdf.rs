@@ -3,6 +3,8 @@ use anyhow::{Context, Result};
 use std::fs;
 use std::path::Path;
 
+use crate::pdfium_lock;
+
 /// Extracts text from PDF files using pdfium-render.
 pub struct PdfExtractor {
     pdfium: pdfium_render::prelude::Pdfium,
@@ -16,6 +18,7 @@ impl PdfExtractor {
             .and_then(|p| p.parent().map(|d| d.to_path_buf()))
             .unwrap_or_else(|| std::path::PathBuf::from("."));
         let dll_path = dll_dir.join("pdfium.dll");
+        let _lock = pdfium_lock::INIT.lock().unwrap_or_else(|e| e.into_inner());
         let pdfium = pdfium_render::prelude::Pdfium::new(
             pdfium_render::prelude::Pdfium::bind_to_library(&dll_path)
                 .or_else(|_| pdfium_render::prelude::Pdfium::bind_to_system_library())
