@@ -31,6 +31,7 @@ impl PdfRenderer {
         let pdfium: Arc<Mutex<Option<pdfium_render::prelude::Pdfium>>> = Arc::new(Mutex::new(None));
 
         while let Ok(request) = self.request_rx.recv() {
+            eprintln!(">>> renderer RECEIVED request page={} path={}", request.page, request.path.display());
             match self.render_page(&request, &pdfium) {
                 Ok(result) => {
                     if self.result_tx.send(result).is_err() {
@@ -52,6 +53,7 @@ impl PdfRenderer {
             }
         }
 
+        eprintln!(">>> renderer recv loop EXITED (channel closed)");
         info!("PDF renderer stopped");
     }
 
