@@ -473,55 +473,6 @@ impl eframe::App for PapervaultApp {
             }
         }
 
-        // ── Top bar: search ──
-        TopBottomPanel::top("search_bar").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                let engine_available = self.search_engine.is_some();
-                ui.label("🔍");
-                let resp = ui
-                    .add_enabled_ui(engine_available, |ui| {
-                        ui.add_sized(
-                            [ui.available_width() - 180.0, 24.0],
-                            TextEdit::singleline(&mut self.search_query)
-                                .hint_text("Search documents..."),
-                        )
-                    })
-                    .inner;
-                if resp.changed() {
-                    self.pending_search = Some(self.search_query.clone());
-                    self.last_search_instant = Some(Instant::now());
-                    ctx.request_repaint_after(std::time::Duration::from_millis(50));
-                }
-
-                if ui.button("📁 Folder").clicked() {
-                    self.folder_picker_open = true;
-                    self.folder_picker_input = self
-                        .config
-                        .watched_folder
-                        .as_ref()
-                        .map(|p| p.display().to_string())
-                        .unwrap_or_default();
-                }
-                if ui.button("🏷 Tags").clicked() {
-                    self.tag_panel_open = !self.tag_panel_open;
-                }
-
-                if self.indexing_total > 0 && self.indexing_done < self.indexing_total {
-                    ui.label(format!(
-                        "Indexing {}/{}",
-                        self.indexing_done, self.indexing_total
-                    ));
-                }
-            });
-            // Active tag filter chips
-            if !self.active_tag_filters.is_empty() {
-                ui.horizontal(|ui| {
-                    for tag in &self.active_tag_filters.clone() {
-                        ui.label(format!("🔖 {}", tag));
-                    }
-                });
-            }
-        });
 
         // ── Left panel: tag panel (when open) ──
         if self.tag_panel_open {
@@ -636,6 +587,46 @@ impl eframe::App for PapervaultApp {
 
         // ── Center: preview ──
         CentralPanel::default().show(ctx, |ui| {
+            // Search bar
+            ui.horizontal(|ui| {
+                ui.label("🔍");
+                let resp = ui.text_edit_singleline(&mut self.search_query);
+                if resp.changed() {
+                    self.pending_search = Some(self.search_query.clone());
+                    self.last_search_instant = Some(Instant::now());
+                    ctx.request_repaint_after(std::time::Duration::from_millis(50));
+                }
+
+                if ui.button("📁 Folder").clicked() {
+                    self.folder_picker_open = true;
+                    self.folder_picker_input = self
+                        .config
+                        .watched_folder
+                        .as_ref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_default();
+                }
+                if ui.button("🏷 Tags").clicked() {
+                    self.tag_panel_open = !self.tag_panel_open;
+                }
+
+                if self.indexing_total > 0 && self.indexing_done < self.indexing_total {
+                    ui.label(format!(
+                        "Indexing {}/{}",
+                        self.indexing_done, self.indexing_total
+                    ));
+                }
+            });
+            // Active tag filter chips
+            if !self.active_tag_filters.is_empty() {
+                ui.horizontal(|ui| {
+                    for tag in &self.active_tag_filters.clone() {
+                        ui.label(format!("🔖 {}", tag));
+                    }
+                });
+            }
+            ui.separator();
+
             if self.config.watched_folder.is_some() && self.search_engine.is_none() {
                 ui.vertical_centered(|ui| {
                     ui.add_space(40.0);

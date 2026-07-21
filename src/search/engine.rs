@@ -28,13 +28,32 @@ impl SearchEngine {
     /// Open an existing index or create a new one at the standard location.
     pub fn open_or_create(_watched_folder: &Path) -> Result<Self> {
         let index_dir = Self::index_directory();
+
+        // Ensure the index directory exists before attempting to open it.
+        // MmapDirectory::open fails if the directory does not exist.
+        if !index_dir.exists() {
+            std::fs::create_dir_all(&index_dir)?;
+        }
+
         let dir = MmapDirectory::open(&index_dir)?;
 
         let schema = build_schema();
         let fields = SchemaFields::from_schema(&schema);
 
         let index = if index_dir.join("meta.json").exists() {
-            Index::open(dir)?
+            match Index::open(dir) {
+                Ok(index) => index,
+                Err(e) => {
+                    // Index is corrupted — remove it and recreate.
+                    tracing::warn!(
+                        "Failed to open existing index (likely corrupted): {}. Recreating.",
+                        e
+                    );
+                    std::fs::remove_dir_all(&index_dir)?;
+                    std::fs::create_dir_all(&index_dir)?;
+                    Index::create_in_dir(&index_dir, schema.clone())?
+                }
+            }
         } else {
             Index::create_in_dir(&index_dir, schema.clone())?
         };
