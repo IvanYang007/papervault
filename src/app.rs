@@ -280,25 +280,29 @@ impl PapervaultApp {
     }
 
     fn assign_tag_to_selected(&mut self, tag_id: i64) {
-        if let (Some(selected), Some(ref store)) = (self.selected_result, &self.tag_store) {
-            let content_hash = &self.search_results[selected].content_hash;
-            if store.assign_tag(content_hash, tag_id).is_ok() {
-                // Sync to Tantivy
-                if let Some(ref tx) = self.tag_update_tx {
-                    let tags = store
-                        .get_tags_for_document(content_hash)
-                        .unwrap_or_default()
-                        .into_iter()
-                        .map(|t| t.name)
-                        .collect();
-                    let _ = tx.send(TagUpdate::UpdateDocumentTags {
-                        content_hash: content_hash.clone(),
-                        tags,
-                    });
-                }
-                // Re-search to reflect tag changes
-                self.do_search();
+        let Some(selected) = self.selected_result else { return };
+        if selected >= self.search_results.len() {
+            return;
+        }
+        let Some(ref store) = self.tag_store else { return };
+
+        let content_hash = self.search_results[selected].content_hash.clone();
+        if store.assign_tag(&content_hash, tag_id).is_ok() {
+            // Sync to Tantivy
+            if let Some(ref tx) = self.tag_update_tx {
+                let tags = store
+                    .get_tags_for_document(&content_hash)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|t| t.name)
+                    .collect();
+                let _ = tx.send(TagUpdate::UpdateDocumentTags {
+                    content_hash: content_hash.clone(),
+                    tags,
+                });
             }
+            // Re-search to reflect tag changes
+            self.do_search();
         }
     }
 }
