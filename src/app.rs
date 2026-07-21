@@ -347,7 +347,6 @@ impl PapervaultApp {
         self.preview_file_type = Some(if is_pdf { "pdf".into() } else { "txt".into() });
 
         if is_pdf {
-            // Send render request directly — don't pollute search_results
             self.latest_render_request_id += 1;
             self.current_preview_path = Some(file_path.clone());
             if let Some(ref tx) = self.render_request_tx {
@@ -356,6 +355,7 @@ impl PapervaultApp {
                     path: file_path,
                     page: 1,
                 });
+            } else {
             }
             self.preview_text = None;
         } else {
@@ -424,12 +424,14 @@ impl PapervaultApp {
 
     /// Poll for render results and indexer progress.
     fn poll_channels(&mut self, ctx: &egui::Context) {
+        if self.render_result_rx.is_none() {
+        }
         if let Some(ref rx) = self.render_result_rx {
             for _ in 0..Self::MAX_MESSAGES_PER_FRAME {
-                let Ok(result) = rx.try_recv() else {
-                    break;
+                let result = match rx.try_recv() {
+                    Ok(r) => r,
+                    Err(_) => break,
                 };
-                // Discard stale results from previous requests or different documents
                 if result.request_id != self.latest_render_request_id {
                     continue;
                 }
@@ -447,6 +449,9 @@ impl PapervaultApp {
                         color_image,
                         egui::TextureOptions::default(),
                     ));
+                } else {
+                    // Render failed — keep texture cleared, error will show
+                    self.preview_texture = None;
                 }
             }
         }
@@ -951,6 +956,14 @@ impl eframe::App for PapervaultApp {
                 ui.image(egui::ImageSource::Texture(egui::load::SizedTexture::new(
                     tex_id, tex_size,
                 )));
+            } else if self.browsed_file.as_ref().map_or(false, |f| {
+                f.to_lowercase().ends_with(".pdf")
+            }) {
+                ui.vertical_centered(|ui| {
+                    ui.add_space(40.0);
+                    ui.label("PDF preview not available.");
+                    ui.label("Place pdfium.dll next to papervault.exe for PDF rendering.");
+                });
             } else if let Some(ref text) = self.preview_text {
                 ScrollArea::vertical().show(ui, |ui| {
                     ui.monospace(text);

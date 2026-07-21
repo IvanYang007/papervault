@@ -33,12 +33,11 @@ impl PdfRenderer {
             match self.render_page(&request, &pdfium) {
                 Ok(result) => {
                     if self.result_tx.send(result).is_err() {
-                        break; // UI thread dropped receiver
+                        break;
                     }
                 }
                 Err(e) => {
                     error!("Render error for {}: {}", request.path.display(), e);
-                    // Send empty result as error indicator
                     let _ = self.result_tx.send(RenderResult {
                         request_id: request.request_id,
                         path: request.path.clone(),
@@ -74,10 +73,6 @@ impl PdfRenderer {
             *guard = Some(pdfium);
         }
         let pdfium = guard.as_ref().expect("pdfium was just initialized");
-        // Keep the mutex guard alive for the duration of this render call
-        // (the pdfium reference borrows from guard)
-
-        // Read file
         let bytes = std::fs::read(&request.path)
             .with_context(|| format!("Failed to read: {}", request.path.display()))?;
 
