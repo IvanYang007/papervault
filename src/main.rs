@@ -1,5 +1,8 @@
 use std::panic;
-use tracing::error;
+use std::sync::{Arc, Mutex};
+use std::thread;
+use crossbeam::channel;
+use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
 mod app;
@@ -10,6 +13,15 @@ mod preview;
 mod search;
 mod tags;
 mod watcher;
+
+use app::{
+    IndexerProgress, PapervaultApp, RenderRequest, RenderResult, TagUpdate,
+};
+use indexer::pipeline;
+use preview::pdf_render::PdfRenderer;
+use search::engine::SearchEngine;
+use tags::store::TagStore;
+use watcher::watcher as watcher_mod;
 
 fn main() -> eframe::Result {
     // Initialize tracing
@@ -24,7 +36,6 @@ fn main() -> eframe::Result {
     panic::set_hook(Box::new(|info| {
         let msg = info.to_string();
         error!("Panic: {}", msg);
-        // Write crash log
         if let Some(crash_dir) = dirs_next::data_local_dir() {
             let crash_path = crash_dir.join("papervault").join("crash.log");
             if let Some(parent) = crash_path.parent() {
@@ -32,13 +43,94 @@ fn main() -> eframe::Result {
             }
             let _ = std::fs::write(&crash_path, format!(
                 "Panic at {}: {}\n",
-                chrono::Utc::now().format("%Y-%m-%d %H:%M:%S"),
+                chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
                 msg
             ));
         }
         eprintln!("FATAL: {}", msg);
     }));
 
+    // ── Channels ──
+    // Watcher → Indexer
+    let (watcher_tx, watcher_rx) = channel::bounded::<watcher_mod::IndexerMessage>(10_000);
+    // Indexer → UI (progress)
+    let (progress_tx, progress_rx) = channel::unbounded::<IndexerProgress>();
+    // UI → Indexer (tag updates)
+    let (tag_tx, tag_rx) = channel::unbounded::<TagUpdate>();
+    // UI → Renderer
+    let (render_tx, render_rx) = channel::unbounded::<RenderRequest>();
+    // Renderer → UI
+    let (render_result_tx, render_result_rx) = channel::unbounded::<RenderResult>();
+
+    // ── Search Engine ──
+    let config = config::Config::load();
+    let search_engine = if let Some(ref folder) = config.watched_folder {
+        match SearchEngine::open_or_create(folder) {
+            Ok(engine) => {
+                info!("Search engine initialized for: {}", folder.display());
+                Some(Arc::new(Mutex::new(engine)))
+            }
+            Err(e) => {
+                error!("Failed to open search index: {}", e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // ── Tag Store ──
+    let tag_store = TagStore::open_or_create().ok();
+    let tag_store_writer = tag_store.clone();
+    let tag_store_for_app = tag_store;
+
+    // ── Background Threads ──
+    let search_clone = search_engine.clone();
+
+    // Indexer thread
+    if let (Some(engine), Some(tags)) = (search_clone, tag_store_writer) {
+        let progress_tx_clone = progress_tx.clone();
+        thread::Builder::new()
+            .name("indexer".into())
+            .spawn(move || {
+                let mut p = pipeline::Pipeline::new(
+                    engine,
+                    tags,
+                    watcher_rx,
+                    progress_tx_clone,
+                );
+                p.run();
+            })
+            .ok();
+    }
+
+    // Watcher thread
+    if let Some(ref folder) = config.watched_folder {
+        if folder.exists() {
+            let folder = folder.clone();
+            let watcher_tx_clone = watcher_tx;
+            thread::Builder::new()
+                .name("watcher".into())
+                .spawn(move || {
+                    if let Err(e) = watcher_mod::start_watching(folder, watcher_tx_clone) {
+                        error!("Watcher failed: {}", e);
+                    }
+                })
+                .ok();
+        }
+    }
+
+    // Renderer thread
+    let render_tx_clone = render_tx;
+    thread::Builder::new()
+        .name("renderer".into())
+        .spawn(move || {
+            let mut renderer = PdfRenderer::new(render_rx, render_result_tx);
+            renderer.run();
+        })
+        .ok();
+
+    // ── UI ──
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1200.0, 800.0])
@@ -49,6 +141,16 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "Papervault",
         options,
-        Box::new(|_cc| Ok(Box::new(app::PapervaultApp::default()))),
+        Box::new(move |_cc| {
+            Ok(Box::new(PapervaultApp::new(
+                config,
+                search_engine,
+                progress_rx,
+                Some(tag_tx),
+                Some(render_tx_clone),
+                Some(render_result_rx),
+                tag_store_for_app,
+            )))
+        }),
     )
 }
