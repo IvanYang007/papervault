@@ -120,9 +120,16 @@ fn emit_initial_scan(folder: &PathBuf, tx: &Sender<IndexerMessage>) -> anyhow::R
         }
     }
     if count > 0 {
-        info!("Initial scan: queued {} files in {}", count, folder.display());
+        info!(
+            "Initial scan: queued {} files in {}",
+            count,
+            folder.display()
+        );
     } else {
-        info!("Initial scan: no supported files found in {}", folder.display());
+        info!(
+            "Initial scan: no supported files found in {}",
+            folder.display()
+        );
     }
     Ok(())
 }

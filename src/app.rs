@@ -4,8 +4,8 @@ use crate::search::engine::SearchEngine;
 use crate::search::query::{SearchRequest, SearchResult};
 use crate::search::schema::SchemaFields;
 use crate::tags::model::Tag;
-use crate::tags::store::TagStore;
 use crate::tags::store::DocumentInfo;
+use crate::tags::store::TagStore;
 use crate::watcher::watcher::IndexerMessage;
 use crossbeam::channel::{Receiver, Sender};
 use egui::{
@@ -210,7 +210,10 @@ impl PapervaultApp {
         tracing::info!("Starting folder runtime for: {}", folder.display());
         match FolderRuntime::start(folder, tag_store) {
             Ok(runtime) => {
-                tracing::info!("Folder runtime started successfully for: {}", folder.display());
+                tracing::info!(
+                    "Folder runtime started successfully for: {}",
+                    folder.display()
+                );
                 self.search_reader = Some(runtime.search_reader.clone());
                 self.search_fields = Some(runtime.search_fields.clone());
                 self.search_engine = Some(runtime.search_engine.clone());
@@ -325,36 +328,7 @@ impl PapervaultApp {
             self.preview_text = None;
         } else {
             self.preview_texture = None;
-            const PREVIEW_MAX_BYTES: u64 = 2 * 1024 * 1024; // 2 MB
-            match std::fs::metadata(&file_path) {
-                Ok(meta) if meta.len() > PREVIEW_MAX_BYTES => {
-                    // Read only the first 2 MB to avoid UI freeze on large files
-                    match std::fs::File::open(&file_path) {
-                        Ok(file) => {
-                            use std::io::Read;
-                            let mut reader = std::io::BufReader::new(file.take(PREVIEW_MAX_BYTES));
-                            let mut content = String::new();
-                            if reader.read_to_string(&mut content).is_ok() {
-                                content.push_str("\n\n─── Preview truncated at 2 MB ───");
-                                self.preview_text = Some(content);
-                            } else {
-                                self.preview_text = Some("Error reading file.".to_string());
-                            }
-                        }
-                        Err(e) => {
-                            self.preview_text = Some(format!("Error reading file: {}", e));
-                        }
-                    }
-                }
-                _ => match std::fs::read_to_string(&file_path) {
-                    Ok(content) => {
-                        self.preview_text = Some(content);
-                    }
-                    Err(e) => {
-                        self.preview_text = Some(format!("Error reading file: {}", e));
-                    }
-                },
-            }
+            self.load_text_preview(&PathBuf::from(&file_path));
         }
         self.preview_file_type = Some(file_type);
     }
@@ -373,60 +347,56 @@ impl PapervaultApp {
         self.preview_file_type = Some(if is_pdf { "pdf".into() } else { "txt".into() });
 
         if is_pdf {
-            // Create a temporary SearchResult for the render request
-            self.search_results = vec![SearchResult {
-                file_name: file_path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("")
-                    .to_string(),
-                file_path: path.to_string(),
-                file_type: "pdf".to_string(),
-                snippet: String::new(),
-                match_count: 0,
-                match_terms: Vec::new(),
-                content_hash: String::new(),
-                tags: Vec::new(),
-            }];
-            self.selected_result = Some(0);
-            self.request_page_render();
+            // Send render request directly — don't pollute search_results
+            self.latest_render_request_id += 1;
+            self.current_preview_path = Some(file_path.clone());
+            if let Some(ref tx) = self.render_request_tx {
+                let _ = tx.send(RenderRequest {
+                    request_id: self.latest_render_request_id,
+                    path: file_path,
+                    page: 1,
+                });
+            }
             self.preview_text = None;
         } else {
-            self.search_results.clear();
-            self.selected_result = None;
             self.preview_texture = None;
-            const PREVIEW_MAX_BYTES: u64 = 2 * 1024 * 1024;
-            match std::fs::metadata(&file_path) {
-                Ok(meta) if meta.len() > PREVIEW_MAX_BYTES => {
-                    match std::fs::File::open(&file_path) {
-                        Ok(file) => {
-                            use std::io::Read;
-                            let mut reader =
-                                std::io::BufReader::new(file.take(PREVIEW_MAX_BYTES));
-                            let mut content = String::new();
-                            if reader.read_to_string(&mut content).is_ok() {
-                                content.push_str("\n\n─── Preview truncated at 2 MB ───");
-                                self.preview_text = Some(content);
-                            } else {
-                                self.preview_text =
-                                    Some("Error reading file.".to_string());
-                            }
-                        }
-                        Err(e) => {
+            self.load_text_preview(&file_path);
+        }
+    }
+
+    /// Load a text file preview with 2MB cap.
+    fn load_text_preview(&mut self, file_path: &Path) {
+        const PREVIEW_MAX_BYTES: u64 = 2 * 1024 * 1024;
+        match std::fs::metadata(file_path) {
+            Ok(meta) if meta.len() > PREVIEW_MAX_BYTES => {
+                match std::fs::File::open(file_path) {
+                    Ok(file) => {
+                        use std::io::Read;
+                        let mut reader =
+                            std::io::BufReader::new(file.take(PREVIEW_MAX_BYTES));
+                        let mut content = String::new();
+                        if reader.read_to_string(&mut content).is_ok() {
+                            content.push_str("\n\n─── Preview truncated at 2 MB ───");
+                            self.preview_text = Some(content);
+                        } else {
                             self.preview_text =
-                                Some(format!("Error reading file: {}", e));
+                                Some("Error reading file.".to_string());
                         }
-                    }
-                }
-                _ => match std::fs::read_to_string(&file_path) {
-                    Ok(content) => {
-                        self.preview_text = Some(content);
                     }
                     Err(e) => {
-                        self.preview_text = Some(format!("Error reading file: {}", e));
+                        self.preview_text =
+                            Some(format!("Error reading file: {}", e));
                     }
-                },
+                }
             }
+            _ => match std::fs::read_to_string(file_path) {
+                Ok(content) => {
+                    self.preview_text = Some(content);
+                }
+                Err(e) => {
+                    self.preview_text = Some(format!("Error reading file: {}", e));
+                }
+            },
         }
     }
 
@@ -665,8 +635,7 @@ impl eframe::App for PapervaultApp {
                     self.folder_runtime = Some(new_rt);
                     self.pending_runtime = None;
                     if let Some(ref folder) = self.config.watched_folder {
-                        self.status_message =
-                            format!("Watching: {}", folder.display());
+                        self.status_message = format!("Watching: {}", folder.display());
                     }
                 }
             }
@@ -1021,12 +990,12 @@ impl eframe::App for PapervaultApp {
                             self.search_reader = None;
                             self.search_fields = None;
                             self.search_engine = None;
-                            self.indexer_progress_rx = crossbeam::channel::unbounded::<IndexerProgress>().1;
+                            self.indexer_progress_rx =
+                                crossbeam::channel::unbounded::<IndexerProgress>().1;
                             let old_runtime = self.folder_runtime.take();
                             let new_folder = path.clone();
                             let tag_store = self.tag_store.clone();
-                            self.pending_runtime =
-                                Some(Arc::new(Mutex::new(None)));
+                            self.pending_runtime = Some(Arc::new(Mutex::new(None)));
                             let pending = self
                                 .pending_runtime
                                 .as_ref()
@@ -1050,10 +1019,7 @@ impl eframe::App for PapervaultApp {
                                                 e
                                             );
                                             *error_flag.lock().unwrap() =
-                                                Some(format!(
-                                                    "Failed to start indexing: {}",
-                                                    e
-                                                ));
+                                                Some(format!("Failed to start indexing: {}", e));
                                         }
                                     }
                                 }
@@ -1061,6 +1027,7 @@ impl eframe::App for PapervaultApp {
                             self.config.watched_folder = Some(path);
                             let _ = self.config.save();
                             self.folder_picker_open = false;
+                            self.browsed_file = None;
                             self.status_message = "Switching folder...".to_string();
                         } else {
                             self.status_message =

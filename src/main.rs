@@ -113,32 +113,31 @@ fn main() -> eframe::Result {
         options,
         Box::new(move |_cc| {
             // Extract runtime channels (or use dummies)
-            let (progress_rx, render_tx, render_result_rx) =
-                if let Some(ref rt) = folder_runtime {
-                    (
-                        rt.progress_rx.clone(),
-                        Some(rt.render_tx.clone()),
-                        Some(rt.render_result_rx.clone()),
-                    )
-                } else {
-                    (
-                        dummy_progress_rx,
-                        Some(dummy_render_tx),
-                        Some(dummy_render_rx),
-                    )
-                };
+            let (progress_rx, render_tx, render_result_rx) = if let Some(ref rt) = folder_runtime {
+                (
+                    rt.progress_rx.clone(),
+                    Some(rt.render_tx.clone()),
+                    Some(rt.render_result_rx.clone()),
+                )
+            } else {
+                (
+                    dummy_progress_rx,
+                    Some(dummy_render_tx),
+                    Some(dummy_render_rx),
+                )
+            };
             Ok(Box::new(PapervaultApp::new(
                 app_config,
                 search_engine,
                 search_reader,
                 search_fields,
                 progress_rx,
-                None,  // tag_tx - populated by FolderRuntime::start later
+                None, // tag_tx - populated by FolderRuntime::start later
                 render_tx,
                 render_result_rx,
                 tag_store_for_app,
-                None,  // watcher_shutdown_flag - populated by FolderRuntime::start
-                None,  // watcher_shutdown_tx - populated by FolderRuntime::start
+                None, // watcher_shutdown_flag - populated by FolderRuntime::start
+                None, // watcher_shutdown_tx - populated by FolderRuntime::start
                 folder_runtime,
             )))
         }),
