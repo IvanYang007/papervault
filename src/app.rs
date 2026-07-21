@@ -692,7 +692,7 @@ impl eframe::App for PapervaultApp {
                     ui.separator();
 
                     // Tag list with checkboxes
-                    ScrollArea::vertical().show(ui, |ui| {
+                    ScrollArea::vertical().id_salt("tag_scroll").show(ui, |ui| {
                         let tags = self.all_tags.clone();
                         for tag in &tags {
                             let mut checked = self.active_tag_filters.contains(&tag.name);
@@ -734,7 +734,7 @@ impl eframe::App for PapervaultApp {
                     ui.separator();
 
                     let mut clicked_file: Option<String> = None;
-                    ScrollArea::vertical().show(ui, |ui| {
+                    ScrollArea::vertical().id_salt("file_browser_scroll").show(ui, |ui| {
                         for doc in &self.file_browser_docs {
                             let file_name = std::path::Path::new(&doc.file_path)
                                 .file_name()
@@ -821,7 +821,7 @@ impl eframe::App for PapervaultApp {
                 }
 
                 let mut clicked_idx = self.clicked_index.take();
-                ScrollArea::vertical().show(ui, |ui| {
+                ScrollArea::vertical().id_salt("results_scroll").show(ui, |ui| {
                     for (i, result) in self.search_results.iter().enumerate() {
                         let selected = self.selected_result == Some(i);
                         let bg = if selected {
@@ -967,7 +967,7 @@ impl eframe::App for PapervaultApp {
                     ui.label("Place pdfium.dll next to papervault.exe for PDF rendering.");
                 });
             } else if let Some(ref text) = self.preview_text {
-                ScrollArea::vertical().show(ui, |ui| {
+                ScrollArea::vertical().id_salt("preview_scroll").show(ui, |ui| {
                     ui.monospace(text);
                 });
             }
