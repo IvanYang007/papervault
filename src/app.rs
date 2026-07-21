@@ -1,6 +1,7 @@
 use crate::config::Config;
 use crate::search::engine::SearchEngine;
 use crate::search::query::{SearchRequest, SearchResult};
+use crate::search::schema::SchemaFields;
 use crate::tags::model::Tag;
 use crate::tags::store::TagStore;
 use crate::watcher::watcher::IndexerMessage;
@@ -63,6 +64,8 @@ pub struct PapervaultApp {
     config: Config,
     /// Lock-free reader for search — no Mutex contention with indexer writes.
     search_reader: Option<tantivy::IndexReader>,
+    /// Pre-cloned schema fields — avoids Mutex lock during search.
+    search_fields: Option<SchemaFields>,
     search_engine: Option<Arc<Mutex<SearchEngine>>>,
     search_query: String,
     search_results: Vec<SearchResult>,
@@ -103,6 +106,8 @@ pub struct PapervaultApp {
     // Debounced search-as-you-type
     last_search_instant: Option<Instant>,
     pending_search: Option<String>,
+    /// Request search input focus on the next frame (first-launch UX).
+    focus_search_next_frame: bool,
 }
 
 impl PapervaultApp {
@@ -110,6 +115,7 @@ impl PapervaultApp {
         config: Config,
         search_engine: Option<Arc<Mutex<SearchEngine>>>,
         search_reader: Option<tantivy::IndexReader>,
+        search_fields: Option<SchemaFields>,
         progress_rx: Receiver<IndexerProgress>,
         tag_tx: Option<Sender<TagUpdate>>,
         render_tx: Option<Sender<RenderRequest>>,
@@ -124,9 +130,15 @@ impl PapervaultApp {
         } else {
             String::new()
         };
+        // Load tags once at startup — not every frame.
+        let all_tags = tag_store
+            .as_ref()
+            .and_then(|store| store.list_tags().ok())
+            .unwrap_or_default();
         Self {
             config,
             search_reader,
+            search_fields,
             search_engine,
             search_query: String::new(),
             search_results: Vec::new(),
@@ -142,7 +154,7 @@ impl PapervaultApp {
             render_request_tx: render_tx,
             render_result_rx: render_rx,
             tag_store,
-            all_tags: Vec::new(),
+            all_tags,
             active_tag_filters: Vec::new(),
             tag_panel_open: false,
             new_tag_name: String::new(),
@@ -156,6 +168,7 @@ impl PapervaultApp {
             _indexer_handle,
             last_search_instant: None,
             pending_search: None,
+            focus_search_next_frame: true,
         }
     }
 
@@ -165,7 +178,9 @@ impl PapervaultApp {
             match SearchEngine::open_or_create(folder) {
                 Ok(engine) => {
                     let reader = engine.reader.clone();
+                    let fields = engine.fields().clone();
                     self.search_reader = Some(reader);
+                    self.search_fields = Some(fields);
                     self.search_engine = Some(Arc::new(Mutex::new(engine)));
                     self.status_message = format!("Watching: {}", folder.display());
                 }
@@ -186,12 +201,7 @@ impl PapervaultApp {
         }
 
         if let Some(ref reader) = self.search_reader {
-            // Clone fields briefly under Mutex, then release before search
-            let fields_opt = self
-                .search_engine
-                .as_ref()
-                .map(|e| e.lock().unwrap().fields().clone());
-            if let Some(ref fields) = fields_opt {
+            if let Some(ref fields) = self.search_fields {
                 // Don't pass tag filters to Tantivy — Tantivy tags may be stale.
                 // Instead, post-filter using SQLite which always has the truth.
                 let limit = if self.active_tag_filters.is_empty() {
@@ -283,10 +293,16 @@ impl PapervaultApp {
         }
     }
 
+    /// Maximum messages to process per channel per frame — prevents UI starvation.
+    const MAX_MESSAGES_PER_FRAME: usize = 64;
+
     /// Poll for render results and indexer progress.
     fn poll_channels(&mut self, ctx: &egui::Context) {
         if let Some(ref rx) = self.render_result_rx {
-            while let Ok(result) = rx.try_recv() {
+            for _ in 0..Self::MAX_MESSAGES_PER_FRAME {
+                let Ok(result) = rx.try_recv() else {
+                    break;
+                };
                 if result.width > 0 && result.height > 0 {
                     let color_image = egui::ColorImage::from_rgba_unmultiplied(
                         [result.width, result.height],
@@ -301,7 +317,10 @@ impl PapervaultApp {
             }
         }
 
-        while let Ok(progress) = self.indexer_progress_rx.try_recv() {
+        for _ in 0..Self::MAX_MESSAGES_PER_FRAME {
+            let Ok(progress) = self.indexer_progress_rx.try_recv() else {
+                break;
+            };
             match progress {
                 IndexerProgress::Indexed { total } => {
                     self.indexing_total = total;
@@ -317,12 +336,8 @@ impl PapervaultApp {
             }
         }
 
-        // Reload tags occasionally
-        if let Some(ref store) = self.tag_store {
-            if let Ok(tags) = store.list_tags() {
-                self.all_tags = tags;
-            }
-        }
+        // Tags are now loaded at startup and refreshed only after create/delete.
+        // No per-frame tag query.
     }
 
     // ── Tag operations ──
@@ -591,6 +606,10 @@ impl eframe::App for PapervaultApp {
             ui.horizontal(|ui| {
                 ui.label("🔍");
                 let resp = ui.text_edit_singleline(&mut self.search_query);
+                if self.focus_search_next_frame {
+                    resp.request_focus();
+                    self.focus_search_next_frame = false;
+                }
                 if resp.changed() {
                     self.pending_search = Some(self.search_query.clone());
                     self.last_search_instant = Some(Instant::now());

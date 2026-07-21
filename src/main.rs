@@ -160,10 +160,14 @@ fn main() -> eframe::Result {
             let search_reader = search_engine
                 .as_ref()
                 .map(|e| e.lock().unwrap().reader.clone());
+            let search_fields = search_engine
+                .as_ref()
+                .map(|e| e.lock().unwrap().fields().clone());
             Ok(Box::new(PapervaultApp::new(
                 config,
                 search_engine,
                 search_reader,
+                search_fields,
                 progress_rx,
                 Some(tag_tx),
                 Some(render_tx_clone),
