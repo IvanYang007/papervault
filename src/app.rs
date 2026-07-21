@@ -841,9 +841,12 @@ impl eframe::App for PapervaultApp {
                     if ui.button("Set Folder").clicked() {
                         let path = PathBuf::from(&self.folder_picker_input);
                         if path.exists() && path.is_dir() {
-                            // Stop old runtime before starting new one
+                            // Stop old runtime on a background thread to avoid
+                            // blocking the UI during indexer join + commit.
                             if let Some(rt) = self.folder_runtime.take() {
-                                let _ = rt.stop();
+                                std::thread::spawn(move || {
+                                    let _ = rt.stop();
+                                });
                             }
                             self.config.watched_folder = Some(path.clone());
                             let _ = self.config.save();
