@@ -166,7 +166,15 @@ impl Pipeline {
         // Extract text
         let extracted = match stages::run_chain(path, stages) {
             Ok(Some(content)) => content,
-            Ok(None) => return Ok(()), // Unsupported file type
+            Ok(None) => {
+                // No extractor handles this file type — log and skip.
+                // For PDFs, this typically means pdfium.dll is not available.
+                tracing::warn!(
+                    "No extractor available for {} — file will not be indexed",
+                    path.display()
+                );
+                return Ok(());
+            }
             Err(e) => {
                 // Log error but continue
                 warn!("Extraction failed for {}: {}", path.display(), e);
