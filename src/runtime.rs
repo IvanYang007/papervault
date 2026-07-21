@@ -85,12 +85,14 @@ impl FolderRuntime {
                 .and_then(|p| p.parent().map(|d| d.to_path_buf()))
                 .unwrap_or_else(|| std::path::PathBuf::from("."));
             let dll_path = dll_dir.join("pdfium.dll");
-            // Create and immediately drop — init is process-global
-            let _ = pdfium_render::prelude::Pdfium::new(
+            // Create and keep alive — dropping would call FPDF_DestroyLibrary()
+            // which tears down global state while other threads still need pdfium.
+            let pdfium = pdfium_render::prelude::Pdfium::new(
                 pdfium_render::prelude::Pdfium::bind_to_library(&dll_path)
                     .or_else(|_| pdfium_render::prelude::Pdfium::bind_to_system_library())
                     .expect("Failed to pre-init pdfium library"),
             );
+            std::mem::forget(pdfium); // never drop — other threads rely on global init
             info!("Pdfium pre-initialized on main thread");
         }
 
