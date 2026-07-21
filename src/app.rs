@@ -116,6 +116,8 @@ pub struct PapervaultApp {
     focus_search_next_frame: bool,
     /// Folder path queued for switch — started when old runtime finishes.
     pending_runtime: Option<Arc<Mutex<Option<FolderRuntime>>>>,
+    /// Error from background folder switch thread (shared with spawned thread).
+    background_error: Option<Arc<Mutex<Option<String>>>>,
 }
 
 impl PapervaultApp {
@@ -183,6 +185,7 @@ impl PapervaultApp {
             focus_search_next_frame: true,
             folder_runtime,
             pending_runtime: None,
+            background_error: None,
         }
     }
 
@@ -585,6 +588,15 @@ impl eframe::App for PapervaultApp {
                 }
             }
         }
+        // Show background thread errors if any
+        let err_flag = self.background_error.clone();
+        if let Some(err_flag) = err_flag {
+            let mut guard = err_flag.lock().unwrap();
+            if let Some(msg) = guard.take() {
+                self.status_message = msg;
+                self.background_error = None;
+            }
+        }
 
         // Pre-compute whether the search query is non-empty (avoids redundant trim scans)
         let has_search_query = !self.search_query.trim().is_empty();
@@ -884,16 +896,29 @@ impl eframe::App for PapervaultApp {
                                 .as_ref()
                                 .cloned()
                                 .expect("pending_runtime just set");
+                            let error_flag = Arc::new(Mutex::new(None::<String>));
+                            self.background_error = Some(error_flag.clone());
                             std::thread::spawn(move || {
                                 if let Some(rt) = old_runtime {
                                     let _ = rt.stop();
                                 }
                                 // Old engine released — start new runtime
                                 if let Some(ref ts) = tag_store {
-                                    if let Ok(new_rt) =
-                                        FolderRuntime::start(&new_folder, ts)
-                                    {
-                                        *pending.lock().unwrap() = Some(new_rt);
+                                    match FolderRuntime::start(&new_folder, ts) {
+                                        Ok(new_rt) => {
+                                            *pending.lock().unwrap() = Some(new_rt);
+                                        }
+                                        Err(e) => {
+                                            tracing::error!(
+                                                "Failed to start folder runtime: {}",
+                                                e
+                                            );
+                                            *error_flag.lock().unwrap() =
+                                                Some(format!(
+                                                    "Failed to start indexing: {}",
+                                                    e
+                                                ));
+                                        }
                                     }
                                 }
                             });
