@@ -2,197 +2,201 @@
 
 **Date:** 2026-07-21  
 **Branch:** `feat/pdf-search-viewer`  
-**Status:** v1 feature-complete, 47 unit tests passing, release binary 14MB
+**Status:** v1 feature-complete, 48 unit tests passing, PDF rendering partially working
 
 ---
 
 ## What's Built (v1)
 
-A Windows 11 desktop PDF/text search & viewer with egui, Tantivy, pdfium, and SQLite. Full-text search with snippets, tag management, PDF preview with page navigation, file system watching, crash recovery, and graceful shutdown.
+A Windows 11 desktop PDF/text search & viewer with egui 0.30, Tantivy 0.22, pdfium-render 0.8.37, and SQLite. Full-text search with highlighted snippets, tag management, recursive subfolder indexing, file browser panel, graceful shutdown, and atomic config save.
 
-### Key Technical Decisions
+### Current Architecture
+
+```
+4 Threads:
+  UI         — egui rendering, lock-free Tantivy search, file browser
+  Indexer    — PDF/text extraction → blake3 hash → Tantivy + SQLite write
+  Renderer   — pdfium page → RGBA bitmap → channel → UI TextureHandle
+  Watcher    — notify-debouncer-full → recursive folder watching
+
+5 Channels:
+  watcher_tx ──bounded(10k)──▶ watcher_rx → Pipeline
+  tag_tx     ──unbounded────▶ tag_rx    → Pipeline
+  render_tx  ──unbounded────▶ render_rx → PdfRenderer
+  result_tx  ──unbounded────▶ UI        → TextureHandle
+  progress_tx──unbounded────▶ UI        → status bar
+
+Layout:
+  Left panel:    📂 File browser (all indexed docs from SQLite)
+                 🏷 Tag panel (conditional)
+  Center top:    🔍 Search bar
+  Center below:  Search results (when typing) OR file preview
+  Bottom:        Status bar
+```
+
+---
+
+## PDF Rendering — Critical Issue
+
+### Current State: PARTIALLY WORKING
+
+PDF **rendering** was verified to work in a debug session (2026-07-21 21:02 UTC):
+```
+✓ Pdfium instance created OK
+✓ Reading PDF bytes: ...0125.pdf
+✓ PDF opened: 36 pages
+✓ Page rendered: 612x792
+```
+Multiple PDFs rendered successfully. **However**, after removing debug eprintlns and cleaning up, the production build still shows "PDF preview not available" when clicking PDFs. The exact blocker is:
+
+### Root Cause Chain (Confirmed)
+
+1. **`FPDF_InitLibrary()` is NOT reentrant** — pdfium's C-level init function deadlocks when called simultaneously from two threads.
+2. **Both indexer and renderer create separate `Pdfium` instances** — each calls `FPDF_InitLibrary()` internally.
+3. **`Pdfium` is `!Send`** — pdfium-render's type cannot be shared across threads, preventing a single-instance design.
+4. **`Pdfium::Drop` calls `FPDF_DestroyLibrary()`** — destroys pdfium's global state. If one thread drops its instance while the other is alive, documents become invalid.
+
+### Fixes Applied (in order)
+
+| Fix | Status | Detail |
+|-----|--------|--------|
+| `thread_safe` feature on pdfium-render | ✅ Applied | Wraps each FFI call in per-instance Mutex |
+| `current_exe()`-relative DLL path | ✅ Applied | `D:\...\target\debug\pdfium.dll` instead of bare `"pdfium.dll"` |
+| `pdfium_lock::INIT` global Mutex | ✅ Applied | Serializes `Pdfium::new()` calls: `src/main.rs:14-16` |
+| Lock scope shrink | ✅ Applied | `_lock` drops immediately after `Pdfium::new()` in `PdfExtractor::new()` |
+| Pre-init on main thread | ✅ Applied | `FolderRuntime::start()` calls `Pdfium::new()` before spawning threads |
+| `std::mem::forget` on pre-init Pdfium | ✅ Applied | Prevents `FPDF_DestroyLibrary()` from tearing down global state |
+| Render request coalescing | ✅ Applied | `try_recv()` drain loop keeps only latest request |
+| Correct pdfium.dll | ✅ Applied | Chromium build 7543 (matches pdfium-render 0.8.37), 5.8MB |
+
+### Remaining Issue
+
+Despite all fixes, the production build shows `"PDF preview not available"` when clicking PDFs. The debug session proved rendering works — the issue is likely a timing/initialization race.
+
+### Recommended Next Steps
+
+1. **Add back eprintln traces around pdfium init** in `src/preview/pdf_render.rs` and `src/runtime.rs` to trace exactly where the init fails
+2. **Verify `pdfium.dll` is correctly placed** next to `papervault.exe` (Chromium 7543, 64-bit, ~5.8MB)
+3. **Test with `RUST_BACKTRACE=1`** to catch panics in the renderer thread
+4. **Consider the single-thread pdfium approach** (see U1 below)
+
+---
+
+## Fresh Setup Guide
+
+### 1. Prerequisites
+- Rust 1.97+ (MSVC toolchain, Windows 11)
+- Git
+
+### 2. Clone and Build
+```powershell
+git clone https://github.com/IvanYang007/papervault.git
+cd papervault
+git checkout feat/pdf-search-viewer
+cargo build
+```
+
+### 3. Get pdfium.dll
+Download Chromium build 7543 from bblanchon/pdfium-binaries:
+```
+https://github.com/bblanchon/pdfium-binaries/releases/download/chromium/7543/pdfium-win-x64.tgz
+```
+Extract `bin/pdfium.dll` and place it next to `target/debug/papervault.exe`.
+
+### 4. Clean State (Fresh Start)
+```powershell
+Remove-Item -Recurse -Force $env:LOCALAPPDATA\papervault
+Remove-Item -Force $env:APPDATA\papervault\config.json
+```
+
+### 5. Run
+```powershell
+D:\Github\papervault\target\debug\papervault.exe
+```
+Click 📁 Folder → select a folder with PDFs → files will be indexed within seconds.
+
+---
+
+## Key Technical Decisions
 
 | Decision | Rationale | See |
 |----------|-----------|-----|
-| Tantivy `IndexReader` cloned for UI — lock-free search | Mutex-free search path, <1ms latency | `src/search/engine.rs` |
-| Tags denormalized into Tantivy + SQLite post-filter | Immediate tag filtering without Tantivy re-index | `src/app.rs::do_search()` |
-| Extractor chain built on indexer thread (not main) | Avoids `Send` requirement on pdfium | `src/indexer/pipeline.rs::run()` |
-| `ReloadPolicy::Manual` in tests, `OnCommitWithDelay` in prod | Deterministic tests, async reload in production | `src/search/engine.rs` |
-| Tokenizer registered under field name `"body"` | Tantivy 0.22 quirk — `TEXT` fields need namespaced tokenizer | `src/search/engine.rs:43` |
-| SQLite WAL mode + `busy_timeout=5000` | Concurrent UI reads + indexer writes without SQLITE_BUSY | `src/tags/store.rs` |
-| `Box::leak` for watcher debouncer | Lifetime must match process; alternative is `Arc<AtomicBool>` shutdown | `src/watcher/watcher.rs` |
+| Tantivy `IndexReader` cloned for UI | Lock-free search, <1ms latency | `src/search/engine.rs` |
+| Tags: SQLite authoritative + Tantivy denormalized | Immediate tag filtering without re-index | `src/app.rs::do_search()` |
+| `FolderRuntime` owns thread lifecycle | Start/stop/switch folders cleanly | `src/runtime.rs` |
+| Per-folder index via blake3 hash of canonical path | Isolate indexes, support switching back | `src/search/engine.rs:index_directory()` |
+| `SchemaFields` pre-cloned for UI | Remove Mutex from hot search path | `src/app.rs` (U1 lock-free search) |
+| `thread_safe` feature on pdfium-render | Per-instance Mutex for FFI calls | `Cargo.toml` |
+| `pdfium_lock::INIT` global Mutex | Serialize `FPDF_InitLibrary()` calls | `src/main.rs:14-16` |
+| `std::mem::forget` on pre-init Pdfium | Prevent `FPDF_DestroyLibrary` during operation | `src/runtime.rs:96` |
 
-### Test Coverage
+---
 
-- **47 unit tests** across config, error, search, extraction, tags, pipeline
+## Test Coverage
+
+- **48 unit tests** across config, error, search, extraction, tags, pipeline, store
 - **1 ignored** (10K-doc performance benchmark)
-- PDF tests gracefully skip when `pdfium.dll` unavailable
-- No integration tests yet (`tests/` directory has fixtures only)
-
-### Known Issues (Accepted for v1)
-
-| Issue | Severity | Mitigation |
-|-------|----------|------------|
-| `PapervaultError` variants unused in library code | P2 | `anyhow::Result` used throughout; typed errors exist for future wiring |
-| Tag Tantivy sync is deferred | P1 | UI post-filters via SQLite; tags apply on next file event |
-| `match_count` always 0 or 1 | P2 | BM25 scoring provides relevance ordering |
-| No integration tests | P2 | Unit tests cover core logic; manual testing for UI |
-| Unbounded channels (except watcher) | P2 | Low-volume channels in desktop app; bounded for watcher backpressure |
-
----
-
-## v1.1+ Roadmap
-
-### P0 — Must Do
-
-1. **OCR for scanned/image PDFs** — Add `OcrExtractor` to pipeline stages. Options: Windows built-in OCR API (`windows-rs`) or Tesseract via `leptess`. The `Extractor` trait and pipeline are designed for this — just add a new struct.
-   - Files: `src/indexer/extractors/mod.rs` (add implementation), `src/indexer/stages.rs` (register in chain)
-   - Related: `docs/plans/2026-01-15-001-feat-pdf-search-viewer-plan.md` Section "v2 extension points"
-
-2. **AI auto-tagging** — Add `AiTagExtractor` to pipeline. Calls a local or cloud model to suggest/generate tags. The `TagUpdate` channel and `TagStore` are ready for programmatic tag assignment.
-   - Files: `src/indexer/extractors/mod.rs`, `src/indexer/stages.rs`, `src/app.rs` (TagUpdate)
-   - Key property: `document_tags` SQLite table is a simple junction — AI model can INSERT directly
-
-3. **Fix tag Tantivy sync** — Store body text in SQLite so `process_tag_update` can re-index without file re-extraction.
-   - Files: `src/tags/store.rs` (add `body_text` column), `src/indexer/pipeline.rs` (`process_tag_update`)
-
-### P1 — Should Do
-
-4. **Integration tests** — `tests/` directory per the test plan (`docs/test-plan.md`). Priority: pipeline end-to-end, concurrent search+index, crash recovery
-5. **Keyboard shortcuts** — Enter to select, arrows to navigate, Ctrl+F to focus search
-6. **Search history** — Persist last 10 queries in `Config`
-7. **Light mode** — Follow egui `Visuals::light()` toggle
-8. **Installer** — MSIX packaging via `cargo wix` or NSIS
-9. **SQLite connection pooling** — Replace per-operation `connect()` with persistent connections
-10. **Progress bar** — Visual progress during initial scan/indexing
-
-### P2 — Nice to Have
-
-11. **Multi-folder watching** — Extend config and watcher for multiple watch locations
-12. **Markdown syntax stripping** — Clean snippet rendering for `.md` files
-13. **Sort options** — Date modified, filename, file type
-14. **Dark/light mode toggle** — Persist in config
-15. **Zoom support** — Ctrl+= / Ctrl+- for UI and PDF zoom
-16. **Open externally** — "Open with default app" and "Show in Explorer" actions
-17. **Multi-select + batch tagging** — Ctrl+Click for multi-selection
-18. **WAL checkpoint on shutdown** — `PRAGMA wal_checkpoint(TRUNCATE)` 
-19. **Symlink filtering** — Skip symlinks in watcher
-20. **CJK tokenizer** — Register `CangJieTokenizer` alongside `SimpleTokenizer`
-
----
-
-## Architecture Quick Reference
-
-### Thread Model
-```
-UI Thread    ─── search (lock-free reader), egui render
-Indexer      ─── extraction → blake3 hash → Tantivy write → SQLite write → commit/2s
-Renderer     ─── pdfium page → RGBA bitmap → channel → UI TextureHandle
-Watcher      ─── notify-debouncer-full → IndexerMessage {Upsert, Delete}
-```
-
-### Channel Map
-```
-watcher_tx ──bounded(10k)──▶ watcher_rx → Pipeline
-tag_tx     ──unbounded────▶ tag_rx    → Pipeline.process_tag_update()
-render_tx  ──unbounded────▶ render_rx → PdfRenderer
-render_rx  ──unbounded────▶ UI        → TextureHandle
-progress_tx──unbounded────▶ UI        → status bar
-shutdown   ──AtomicBool───▶ watcher stop → channel close → indexer exit
-```
-
-### Data Flow: Indexing
-```
-File event → Watcher.debounce(500ms) → IndexerMessage::Upsert
-  → Pipeline.process_upsert()
-    → metadata fast-path (SQLite: path+mtime+size → skip if unchanged)
-    → extractor chain (PdfExtractor or TextExtractor)
-    → blake3 hash + dedup check
-    → old-hash cleanup if content changed
-    → Tantivy index_document (delete_term + add_document)
-    → SQLite upsert_document
-    → commit every 10 docs or 2s
-```
-
-### Data Flow: Search
-```
-User types → 150ms debounce → do_search()
-  → clone SchemaFields under brief Mutex
-  → search_with_reader(fields, reader, request) — NO Mutex held
-    → TermQuery on body + file_name (OR per term, AND across terms)
-    → MultiCollector: Count + TopDocs(limit)
-    → SnippetGenerator for context-aware snippets
-    → If tag filters: post-filter via SQLite TagStore
-```
-
-### Crash Recovery
-```
-Startup → reconcile()
-  → garbage_collect_files() (Tantivy stale segments)
-  → for each Tantivy doc:
-    → check file exists on disk
-    → check SQLite has matching row
-    → backfill missing SQLite rows from Tantivy stored fields
-```
+- No integration tests yet
 
 ---
 
 ## Key Files by Concern
 
-| Concern | Primary File | Secondary |
-|---------|-------------|-----------|
-| Search correctness | `src/search/engine.rs` | `src/search/schema.rs` |
-| Indexing pipeline | `src/indexer/pipeline.rs` | `src/indexer/stages.rs` |
-| PDF extraction | `src/indexer/extractors/pdf.rs` | `src/preview/pdf_render.rs` |
-| File watching | `src/watcher/watcher.rs` | — |
-| Tag storage | `src/tags/store.rs` | `src/tags/model.rs` |
-| UI layout | `src/app.rs` | — |
-| Thread orchestration | `src/main.rs` | — |
-| Test plan | `docs/test-plan.md` | — |
-| Design document | `docs/plans/2026-01-15-001-feat-pdf-search-viewer-plan.md` | — |
-| Requirements | `docs/brainstorms/2026-01-15-pdf-search-viewer-requirements.md` | — |
+| Concern | Primary File | Notes |
+|---------|-------------|-------|
+| PDF rendering | `src/preview/pdf_render.rs` | Pdfium lazy-init, render loop, coalescing |
+| PDF extraction (indexer) | `src/indexer/extractors/pdf.rs` | Text extraction, separate Pdfium instance |
+| Pdfium lock | `src/main.rs:14-16` | `mod pdfium_lock` — global Mutex |
+| Runtime orchestrator | `src/runtime.rs` | `FolderRuntime::start/stop`, thread spawn, pdfium pre-init |
+| Search engine | `src/search/engine.rs` | `SearchEngine`, lock-free `search_with_reader()` |
+| UI layout | `src/app.rs` | File browser, search results, preview, `browse_file()` |
+| Indexing pipeline | `src/indexer/pipeline.rs` | Event loop, commit batching, reconciliation |
+| File watcher | `src/watcher/watcher.rs` | Recursive, `walkdir` initial scan |
+| Tag storage | `src/tags/store.rs` | SQLite, batch `get_tags_for_hashes()`, `list_all_documents()` |
+| Thread orchestration | `src/main.rs` | Channel creation, `FolderRuntime` wiring |
+| Config | `src/config.rs` | Atomic save (tmp → rename) |
+| Plans | `docs/plans/` | 6 plan documents covering implementation history |
 
 ---
 
-## Common Development Tasks
+## Git History (Key Commits)
 
-### Running with console output (debugging)
-Comment out `#![windows_subsystem = "windows"]` in `src/main.rs` and use `cargo run`.
-
-### Adding a new file type
-1. Add extension to `SUPPORTED_EXTENSIONS` in `src/indexer/extractors/mod.rs`
-2. Create a new extractor implementing `Extractor` trait
-3. Register it in `src/indexer/stages.rs::create_extractor_chain()`
-
-### Adding a new tag operation
-1. Add variant to `TagUpdate` enum in `src/app.rs`
-2. Handle in `Pipeline::process_tag_update()` in `src/indexer/pipeline.rs`
-3. Add UI in `src/app.rs`
-
-### Running a specific test
-```bash
-cargo test search::engine::tests::index_and_search_single_document -- --nocapture
 ```
-
-### Release build
-```bash
-cargo build --release
-# Binary: target/release/papervault.exe (~14MB)
+6cdcbe8 fix: keep pre-init Pdfium alive with mem::forget
+be40850 fix: pre-init pdfium on main thread before spawning worker threads
+1b09924 fix: shrink lock scope, add render coalescing
+7eca893 fix: serialize FPDF_InitLibrary() across threads with global Mutex
+f22d42f fix: enable thread_safe feature for pdfium-render
+dc77133 fix: PDF rendering now works — serialized FPDF_InitLibrary, clean debug
+f6ea215 fix: wire FolderRuntime into PapervaultApp for first-launch indexing
+cb9264f fix: handle Mutex poisoning, replace fragile unwrap with expect
+4ee4ee7 fix: file browser preview, PDF page nav, search result font size
+c777cbf fix: clear old channel clones before stopping runtime
+353e7fb feat(runtime): add FolderRuntime with per-folder indexes
+097aaab fix: correctness fixes — unicode safety, render identity, progress, tags
 ```
 
 ---
 
-## Git Workflow
+## Remaining Work
 
-- **Main branch:** `master` — documents only (README, plans, test plan)
-- **Feature branch:** `feat/pdf-search-viewer` — all source code
-- **Branch naming:** `feat/<description>`, `fix/<description>`
-- **Commit style:** conventional commits (`feat:`, `fix:`, `perf:`, `docs:`, `refactor:`)
+### P0 — PDF Rendering
+- Diagnose why production build shows "PDF preview not available" despite debug session proving rendering works
+- Consider single-thread pdfium owner architecture:
+  ```
+  One thread owns Pdfium for both extraction and rendering
+  Uses two channels: high-priority render requests, low-priority extraction jobs
+  Eliminates all locking complexity, prevents destroy-on-drop hazard
+  ```
 
----
+### P1 — Polish
+- SQLite connection caching (per-operation `connect()` is wasteful)
+- `all_tags.clone()` per frame in tag panel
+- Latin-1/Windows-1252 explicit encoding support
+- CI pipeline (GitHub Actions)
 
-## Contact / Repo
-
-- **GitHub:** https://github.com/IvanYang007/papervault
-- **Author:** Ivan Pi (`xn31415@gmail.com`)
-- **License:** MIT
+### P2 — Future
+- OCR for scanned PDFs
+- AI auto-tagging
+- Keyboard shortcuts
+- Release packaging / installer
