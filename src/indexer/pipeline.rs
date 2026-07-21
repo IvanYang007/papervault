@@ -174,6 +174,16 @@ impl Pipeline {
         let hash_bytes = blake3::hash(&file_bytes);
         let content_hash = hash_bytes.to_hex().to_string();
 
+        // Clean up old Tantivy document if content changed at this path
+        if let Ok(Some(old_hash)) = self.tag_store.get_hash_by_path(&path_str) {
+            if old_hash != content_hash {
+                let mut engine = self.search_engine.lock().unwrap();
+                if let Err(e) = engine.delete_by_hash(&old_hash) {
+                    warn!("Failed to delete old doc {}: {}", old_hash, e);
+                }
+            }
+        }
+
         // Dedup check
         if self.tag_store.already_indexed_by_hash(&content_hash)? {
             // Same content, different path — update path only
@@ -206,16 +216,9 @@ impl Pipeline {
             .map(|t| t.name)
             .collect::<Vec<String>>();
 
-        // Write SQLite FIRST (before Tantivy — crash safety)
-        self.tag_store.upsert_document(
-            &content_hash,
-            &path_str,
-            &file_type,
-            size as i64,
-            modified_ts,
-        )?;
-
-        // Write to Tantivy
+        // Write Tantivy FIRST, then SQLite (correct crash-safety ordering).
+        // If crash between writes: Tantivy has doc, SQLite doesn't → next file event
+        // re-indexes because metadata check finds no SQLite row.
         {
             let mut engine = self.search_engine.lock().unwrap();
             engine.index_document(
@@ -229,6 +232,14 @@ impl Pipeline {
                 &tags,
             )?;
         }
+
+        self.tag_store.upsert_document(
+            &content_hash,
+            &path_str,
+            &file_type,
+            size as i64,
+            modified_ts,
+        )?;
 
         Ok(())
     }
