@@ -397,14 +397,16 @@ impl PapervaultApp {
 
     /// Send a render request for the current page of the selected result.
     fn request_page_render(&mut self) {
-        let Some(selected) = self.selected_result else {
+        let path = if let Some(selected) = self.selected_result {
+            if selected >= self.search_results.len() {
+                return;
+            }
+            PathBuf::from(&self.search_results[selected].file_path)
+        } else if let Some(ref browsed) = self.browsed_file {
+            PathBuf::from(browsed)
+        } else {
             return;
         };
-        if selected >= self.search_results.len() {
-            return;
-        }
-        let result = &self.search_results[selected];
-        let path = PathBuf::from(&result.file_path);
         self.latest_render_request_id += 1;
         self.current_preview_path = Some(path.clone());
         if let Some(ref tx) = self.render_request_tx {
@@ -526,7 +528,7 @@ impl PapervaultApp {
     /// Render a snippet with matched terms highlighted in gold.
     fn render_highlighted_snippet(ui: &mut egui::Ui, snippet: &str, match_terms: &[String]) {
         if match_terms.is_empty() {
-            ui.label(RichText::new(snippet).small().color(Color32::GRAY));
+            ui.label(RichText::new(snippet).color(Color32::GRAY));
             return;
         }
 
@@ -549,7 +551,7 @@ impl PapervaultApp {
         }
 
         if spans.is_empty() {
-            ui.label(RichText::new(snippet).small().color(Color32::GRAY));
+            ui.label(RichText::new(snippet).color(Color32::GRAY));
             return;
         }
 
@@ -893,7 +895,7 @@ impl eframe::App for PapervaultApp {
                     ui.label("No watched folder configured.");
                     ui.label("Click 📁 Folder to get started.");
                 });
-            } else if self.selected_result.is_none() && self.search_query.is_empty() {
+            } else if self.selected_result.is_none() && self.search_query.is_empty() && self.browsed_file.is_none() {
                 ui.vertical_centered(|ui| {
                     ui.add_space(100.0);
                     ui.label("Type a search query to find documents.");
