@@ -882,15 +882,18 @@ impl eframe::App for PapervaultApp {
                     if ui.button("Set Folder").clicked() {
                         let path = PathBuf::from(&self.folder_picker_input);
                         if path.exists() && path.is_dir() {
-                            // Stop old runtime + start new one on background thread.
                             // Clear old channel references first — they hold sender clones
-                            // that keep the renderer channel open, preventing stop() from completing.
+                            // that keep the renderer and indexer channels open, preventing
+                            // stop() from joining the threads.
                             self.render_request_tx = None;
                             self.render_result_rx = None;
                             self.tag_update_tx = None;
+                            self.watcher_shutdown_flag = None;
+                            self.watcher_shutdown_tx = None;
                             self.search_reader = None;
                             self.search_fields = None;
                             self.search_engine = None;
+                            self.indexer_progress_rx = crossbeam::channel::unbounded::<IndexerProgress>().1;
                             let old_runtime = self.folder_runtime.take();
                             let new_folder = path.clone();
                             let tag_store = self.tag_store.clone();
