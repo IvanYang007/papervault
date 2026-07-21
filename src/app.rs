@@ -349,14 +349,12 @@ impl PapervaultApp {
         if is_pdf {
             self.latest_render_request_id += 1;
             self.current_preview_path = Some(file_path.clone());
-            match self.render_request_tx.as_ref().map(|tx| tx.send(RenderRequest {
-                request_id: self.latest_render_request_id,
-                path: file_path,
-                page: 1,
-            })) {
-                Some(Ok(_)) => eprintln!(">>> render request SENT"),
-                Some(Err(_)) => eprintln!(">>> render channel DEAD (receiver dropped)"),
-                None => eprintln!(">>> render_tx is None!"),
+            if let Some(ref tx) = self.render_request_tx {
+                let _ = tx.send(RenderRequest {
+                    request_id: self.latest_render_request_id,
+                    path: file_path,
+                    page: 1,
+                });
             }
             self.preview_text = None;
         } else {

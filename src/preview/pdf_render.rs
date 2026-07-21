@@ -23,7 +23,6 @@ impl PdfRenderer {
 
     /// Run the render loop (blocks until channel closes).
     pub fn run(&mut self) {
-        eprintln!(">>> renderer entering recv loop");
         info!("PDF renderer started");
 
         // pdfium is lazy-initialized on the first render request.
@@ -32,7 +31,6 @@ impl PdfRenderer {
         let pdfium: Arc<Mutex<Option<pdfium_render::prelude::Pdfium>>> = Arc::new(Mutex::new(None));
 
         while let Ok(request) = self.request_rx.recv() {
-            eprintln!(">>> renderer RECEIVED request page={} path={}", request.page, request.path.display());
             match self.render_page(&request, &pdfium) {
                 Ok(result) => {
                     if self.result_tx.send(result).is_err() {
@@ -54,7 +52,6 @@ impl PdfRenderer {
             }
         }
 
-        eprintln!(">>> renderer recv loop EXITED (channel closed)");
         info!("PDF renderer stopped");
     }
 
@@ -72,13 +69,11 @@ impl PdfRenderer {
             let dll_path = dll_dir.join("pdfium.dll");
             // Serialize FPDF_InitLibrary() across threads — not reentrant
             let _lock = pdfium_lock::INIT.lock().unwrap_or_else(|e| e.into_inner());
-            eprintln!(">>> creating Pdfium instance (lock held)...");
             let pdfium = pdfium_render::prelude::Pdfium::new(
                 pdfium_render::prelude::Pdfium::bind_to_library(&dll_path)
                     .or_else(|_| pdfium_render::prelude::Pdfium::bind_to_system_library())
                     .context("Failed to bind pdfium library")?,
             );
-            eprintln!(">>> Pdfium instance created OK");
             *guard = Some(pdfium);
         }
         let pdfium = guard.as_ref().expect("pdfium initialized");
