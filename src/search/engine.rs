@@ -1,29 +1,28 @@
 use std::path::{Path, PathBuf};
-use std::fs;
 use tantivy::collector::TopDocs;
+use tantivy::directory::MmapDirectory;
 use tantivy::query::{BooleanQuery, Occur, Query, TermQuery};
 use tantivy::schema::*;
 use tantivy::tokenizer::*;
 use tantivy::{doc, Index, IndexReader, IndexWriter, ReloadPolicy, TantivyDocument};
-use tantivy::directory::MmapDirectory;
 
-use crate::error::Result;
 use super::query::{SearchRequest, SearchResult, SearchResults};
 use super::schema::{build_schema, SchemaFields};
+use crate::error::Result;
 
 /// Manages the Tantivy search index lifecycle.
 pub struct SearchEngine {
     index: Index,
     schema: Schema,
     fields: SchemaFields,
-    reader: IndexReader,
+    /// Lock-free reader — clone for UI thread without Mutex contention.
+    pub reader: IndexReader,
     writer: IndexWriter,
-    index_dir: PathBuf,
 }
 
 impl SearchEngine {
     /// Open an existing index or create a new one at the standard location.
-    pub fn open_or_create(watched_folder: &Path) -> Result<Self> {
+    pub fn open_or_create(_watched_folder: &Path) -> Result<Self> {
         let index_dir = Self::index_directory();
         let dir = MmapDirectory::open(&index_dir)?;
 
@@ -33,14 +32,13 @@ impl SearchEngine {
         let index = if index_dir.join("meta.json").exists() {
             Index::open(dir)?
         } else {
-            let index = Index::create_in_dir(&index_dir, schema.clone())?;
-            index
+            Index::create_in_dir(&index_dir, schema.clone())?
         };
 
         // Register tokenizer under the field name — Tantivy TEXT fields look up by field name
         let tokenizer = TextAnalyzer::builder(SimpleTokenizer::default())
-                .filter(LowerCaser)
-                .build();
+            .filter(LowerCaser)
+            .build();
         index.tokenizers().register("body", tokenizer);
 
         let writer = index.writer(50_000_000)?; // 50MB buffer
@@ -61,14 +59,12 @@ impl SearchEngine {
             fields,
             reader,
             writer,
-            index_dir,
         })
     }
 
     /// Returns the standard index directory path.
     fn index_directory() -> PathBuf {
-        let base = dirs_next::data_local_dir()
-            .unwrap_or_else(|| PathBuf::from("."));
+        let base = dirs_next::data_local_dir().unwrap_or_else(|| PathBuf::from("."));
         base.join("papervault").join("index")
     }
 
@@ -99,93 +95,7 @@ impl SearchEngine {
 
     /// Search the index.
     pub fn search(&self, request: &SearchRequest) -> Result<SearchResults> {
-        if request.query.trim().is_empty() {
-            return Ok(SearchResults {
-                items: Vec::new(),
-                total_hits: 0,
-            });
-        }
-
-        let searcher = self.reader.searcher();
-
-        // Build query using TermQuery (proven correct by debug_search_returns_results).
-        // Tantivy 0.22 requires the tokenizer registered under the field name, not just "default".
-        // TermQuery bypasses QueryParser tokenizer mapping issues.
-        let terms: Vec<&str> = request.query.split_whitespace().collect();
-        let mut subqueries: Vec<(Occur, Box<dyn Query>)> = Vec::new();
-
-        for term in &terms {
-            let t = Term::from_field_text(self.fields.body, &term.to_lowercase());
-            subqueries.push((Occur::Must, Box::new(TermQuery::new(t, IndexRecordOption::Basic))));
-        }
-
-        // Add tag filters as AND clauses
-        for tag in &request.tag_filters {
-            let t = Term::from_field_text(self.fields.tags, tag);
-            subqueries.push((Occur::Must, Box::new(TermQuery::new(t, IndexRecordOption::Basic))));
-        }
-
-        let query: Box<dyn Query> = if subqueries.len() == 1 {
-            subqueries.remove(0).1
-        } else {
-            Box::new(BooleanQuery::new(subqueries))
-        };
-
-        let top_docs = searcher.search(&query, &TopDocs::with_limit(request.limit))?;
-        let total_hits = top_docs.len();
-
-        let mut items = Vec::new();
-        for (_score, doc_address) in top_docs {
-            let doc: TantivyDocument = searcher.doc(doc_address)?;
-
-            let file_name = doc
-                .get_first(self.fields.file_name)
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown")
-                .to_string();
-
-            let file_path = doc
-                .get_first(self.fields.file_path)
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-
-            let file_type = doc
-                .get_first(self.fields.file_type)
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-
-            let content_hash = doc
-                .get_first(self.fields.content_hash)
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-
-            let tags: Vec<String> = doc
-                .get_all(self.fields.tags)
-                .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                .collect();
-
-            let match_count = doc
-                .get_all(self.fields.body)
-                .count();
-
-            // Generate snippet from stored body text
-            let snippet = self.generate_snippet(&doc, &request.query);
-
-            items.push(SearchResult {
-                file_name,
-                file_path,
-                file_type,
-                snippet,
-                match_count,
-                content_hash,
-                tags,
-            });
-        }
-
-        Ok(SearchResults { items, total_hits })
+        search_with_reader(&self.fields, &self.reader, request)
     }
 
     /// Generate a snippet from the stored body text with query term highlighting.
@@ -282,6 +192,112 @@ impl SearchEngine {
     }
 }
 
+/// Lock-free search using a cloned reader and fields.
+/// Does NOT require &SearchEngine — usable without the Mutex.
+pub fn search_with_reader(
+    fields: &SchemaFields,
+    reader: &IndexReader,
+    request: &SearchRequest,
+) -> Result<SearchResults> {
+    if request.query.trim().is_empty() {
+        return Ok(SearchResults {
+            items: Vec::new(),
+            total_hits: 0,
+        });
+    }
+
+    let searcher = reader.searcher();
+
+    let terms: Vec<&str> = request.query.split_whitespace().collect();
+    let mut subqueries: Vec<(Occur, Box<dyn Query>)> = Vec::new();
+
+    for term in &terms {
+        let t = Term::from_field_text(fields.body, &term.to_lowercase());
+        subqueries.push((
+            Occur::Must,
+            Box::new(TermQuery::new(t, IndexRecordOption::Basic)),
+        ));
+    }
+
+    for tag in &request.tag_filters {
+        let t = Term::from_field_text(fields.tags, tag);
+        subqueries.push((
+            Occur::Must,
+            Box::new(TermQuery::new(t, IndexRecordOption::Basic)),
+        ));
+    }
+
+    let query: Box<dyn Query> = if subqueries.len() == 1 {
+        subqueries.remove(0).1
+    } else {
+        Box::new(BooleanQuery::new(subqueries))
+    };
+
+    let top_docs = searcher.search(&query, &TopDocs::with_limit(request.limit))?;
+    let total_hits = top_docs.len();
+
+    let mut items = Vec::new();
+    for (_score, doc_address) in top_docs {
+        let doc: TantivyDocument = searcher.doc(doc_address)?;
+
+        let file_name = doc
+            .get_first(fields.file_name)
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown")
+            .to_string();
+
+        let file_path = doc
+            .get_first(fields.file_path)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        let file_type = doc
+            .get_first(fields.file_type)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        let content_hash = doc
+            .get_first(fields.content_hash)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        let tags: Vec<String> = doc
+            .get_all(fields.tags)
+            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+            .collect();
+
+        let match_count = doc.get_all(fields.body).count();
+
+        // Simple snippet: first 200 chars of body
+        let body_text = doc
+            .get_first(fields.body)
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let snippet = if body_text.len() > 200 {
+            let mut s = body_text.chars().take(200).collect::<String>();
+            s.push_str("...");
+            s
+        } else {
+            body_text.to_string()
+        };
+
+        items.push(SearchResult {
+            file_name,
+            file_path,
+            file_type,
+            snippet,
+            match_count,
+            content_hash,
+            tags,
+        });
+    }
+
+    Ok(SearchResults { items, total_hits })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -294,11 +310,9 @@ mod tests {
         let index = Index::create_in_dir(dir.path(), schema.clone()).unwrap();
 
         // Register tokenizer under field name — Tantivy TEXT fields look up by field name
-        let tokenizer = TextAnalyzer::builder(
-                tantivy::tokenizer::SimpleTokenizer::default()
-            )
-                .filter(tantivy::tokenizer::LowerCaser)
-                .build();
+        let tokenizer = TextAnalyzer::builder(tantivy::tokenizer::SimpleTokenizer::default())
+            .filter(tantivy::tokenizer::LowerCaser)
+            .build();
         index.tokenizers().register("body", tokenizer);
 
         let writer = index.writer(50_000_000).unwrap();
@@ -317,45 +331,39 @@ mod tests {
             fields,
             reader,
             writer,
-            index_dir: dir.path().to_path_buf(),
         };
         (engine, dir)
     }
 
     #[test]
     fn open_or_create_creates_new_index() {
-        let dir = TempDir::new().unwrap();
-        // Create a fake watched folder
-        let watched = dir.path().join("docs");
-        fs::create_dir_all(&watched).unwrap();
-
-        // Create temp index dir
-        let index_dir = dir.path().join("index");
-        fs::create_dir_all(&index_dir).unwrap();
-
-        // Use the test helper instead since we can't override index_directory
         let (_engine, _temp) = create_test_engine();
+        // Engine created successfully
     }
 
     #[test]
     fn index_and_search_single_document() {
         let (mut engine, _dir) = create_test_engine();
 
-        engine.index_document(
-            "abc123pdf",
-            Path::new("/test/doc.pdf"),
-            "doc.pdf",
-            "hello world invoice march",
-            "pdf",
-            1700000000,
-            "abc123",
-            &[],
-        ).unwrap();
+        engine
+            .index_document(
+                "abc123pdf",
+                Path::new("/test/doc.pdf"),
+                "doc.pdf",
+                "hello world invoice march",
+                "pdf",
+                1700000000,
+                "abc123",
+                &[],
+            )
+            .unwrap();
 
         engine.commit().unwrap();
         engine.reload().unwrap();
 
-        let results = engine.search(&SearchRequest::new("invoice".into())).unwrap();
+        let results = engine
+            .search(&SearchRequest::new("invoice".into()))
+            .unwrap();
         assert_eq!(results.total_hits, 1);
         assert!(results.items[0].file_name.contains("doc.pdf"));
     }
@@ -364,21 +372,25 @@ mod tests {
     fn search_absent_term_returns_empty() {
         let (mut engine, _dir) = create_test_engine();
 
-        engine.index_document(
-            "abc123pdf",
-            Path::new("/test/doc.pdf"),
-            "doc.pdf",
-            "invoice report",
-            "pdf",
-            1700000000,
-            "abc123",
-            &[],
-        ).unwrap();
+        engine
+            .index_document(
+                "abc123pdf",
+                Path::new("/test/doc.pdf"),
+                "doc.pdf",
+                "invoice report",
+                "pdf",
+                1700000000,
+                "abc123",
+                &[],
+            )
+            .unwrap();
 
         engine.commit().unwrap();
         engine.reload().unwrap();
 
-        let results = engine.search(&SearchRequest::new("nonexistent".into())).unwrap();
+        let results = engine
+            .search(&SearchRequest::new("nonexistent".into()))
+            .unwrap();
         assert_eq!(results.total_hits, 0);
     }
 
@@ -387,23 +399,25 @@ mod tests {
         let (mut engine, _dir) = create_test_engine();
 
         for i in 0..10 {
-            engine.index_document(
-                &format!("hash{}pdf", i),
-                Path::new(&format!("/test/doc{}.pdf", i)),
-                &format!("doc{}.pdf", i),
-                "common term in all documents",
-                "pdf",
-                1700000000,
-                &format!("hash{}", i),
-                &[],
-            ).unwrap();
+            engine
+                .index_document(
+                    &format!("hash{}pdf", i),
+                    Path::new(&format!("/test/doc{}.pdf", i)),
+                    &format!("doc{}.pdf", i),
+                    "common term in all documents",
+                    "pdf",
+                    1700000000,
+                    &format!("hash{}", i),
+                    &[],
+                )
+                .unwrap();
         }
         engine.commit().unwrap();
         engine.reload().unwrap();
 
-        let results = engine.search(
-            &SearchRequest::new("common".into()).with_limit(3)
-        ).unwrap();
+        let results = engine
+            .search(&SearchRequest::new("common".into()).with_limit(3))
+            .unwrap();
         assert_eq!(results.items.len(), 3);
         assert!(results.total_hits >= 3);
     }
@@ -412,16 +426,18 @@ mod tests {
     fn delete_document_removes_from_search() {
         let (mut engine, _dir) = create_test_engine();
 
-        engine.index_document(
-            "del1pdf",
-            Path::new("/test/del.pdf"),
-            "del.pdf",
-            "delete me please",
-            "pdf",
-            1700000000,
-            "hash_del",
-            &[],
-        ).unwrap();
+        engine
+            .index_document(
+                "del1pdf",
+                Path::new("/test/del.pdf"),
+                "del.pdf",
+                "delete me please",
+                "pdf",
+                1700000000,
+                "hash_del",
+                &[],
+            )
+            .unwrap();
         engine.commit().unwrap();
         engine.reload().unwrap();
 
@@ -441,25 +457,27 @@ mod tests {
         let (mut engine, _dir) = create_test_engine();
 
         for i in 0..5 {
-            engine.index_document(
-                &format!("hash{}pdf", i),
-                Path::new(&format!("/test/doc{}.pdf", i)),
-                &format!("doc{}.pdf", i),
-                "common term in all",
-                "pdf",
-                1700000000,
-                &format!("hash{}", i),
-                &[],
-            ).unwrap();
+            engine
+                .index_document(
+                    &format!("hash{}pdf", i),
+                    Path::new(&format!("/test/doc{}.pdf", i)),
+                    &format!("doc{}.pdf", i),
+                    "common term in all",
+                    "pdf",
+                    1700000000,
+                    &format!("hash{}", i),
+                    &[],
+                )
+                .unwrap();
         }
         engine.commit().unwrap();
         engine.reload().unwrap();
 
         // With limit 2, items are capped but total_hits is also cap (TopDocs limitation)
         // For v1, overflow is detected when total_hits == limit
-        let results = engine.search(
-            &SearchRequest::new("common".into()).with_limit(2)
-        ).unwrap();
+        let results = engine
+            .search(&SearchRequest::new("common".into()).with_limit(2))
+            .unwrap();
         assert_eq!(results.items.len(), 2);
         // total_hits reflects the actual count from TopDocs (capped by limit)
         assert_eq!(results.total_hits, 2);

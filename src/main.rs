@@ -1,7 +1,7 @@
+use crossbeam::channel;
 use std::panic;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use crossbeam::channel;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
@@ -14,9 +14,7 @@ mod search;
 mod tags;
 mod watcher;
 
-use app::{
-    IndexerProgress, PapervaultApp, RenderRequest, RenderResult, TagUpdate,
-};
+use app::{IndexerProgress, PapervaultApp, RenderRequest, RenderResult, TagUpdate};
 use indexer::pipeline;
 use preview::pdf_render::PdfRenderer;
 use search::engine::SearchEngine;
@@ -27,8 +25,7 @@ fn main() -> eframe::Result {
     // Initialize tracing
     tracing_subscriber::fmt()
         .with_env_filter(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("info")),
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .init();
 
@@ -41,11 +38,14 @@ fn main() -> eframe::Result {
             if let Some(parent) = crash_path.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
-            let _ = std::fs::write(&crash_path, format!(
-                "Panic at {}: {}\n",
-                chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
-                msg
-            ));
+            let _ = std::fs::write(
+                &crash_path,
+                format!(
+                    "Panic at {}: {}\n",
+                    chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
+                    msg
+                ),
+            );
         }
         eprintln!("FATAL: {}", msg);
     }));
@@ -93,12 +93,8 @@ fn main() -> eframe::Result {
         thread::Builder::new()
             .name("indexer".into())
             .spawn(move || {
-                let mut p = pipeline::Pipeline::new(
-                    engine,
-                    tags,
-                    watcher_rx,
-                    progress_tx_clone,
-                );
+                let mut p =
+                    pipeline::Pipeline::new(engine, tags, watcher_rx, tag_rx, progress_tx_clone);
                 p.run();
             })
             .ok();
@@ -142,9 +138,13 @@ fn main() -> eframe::Result {
         "Papervault",
         options,
         Box::new(move |_cc| {
+            let search_reader = search_engine
+                .as_ref()
+                .map(|e| e.lock().unwrap().reader.clone());
             Ok(Box::new(PapervaultApp::new(
                 config,
                 search_engine,
+                search_reader,
                 progress_rx,
                 Some(tag_tx),
                 Some(render_tx_clone),

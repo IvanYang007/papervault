@@ -72,8 +72,7 @@ mod tests {
 
     #[test]
     fn search_request_with_tag_filters() {
-        let req = SearchRequest::new("test".into())
-            .with_tags(vec!["tax".into(), "2025".into()]);
+        let req = SearchRequest::new("test".into()).with_tags(vec!["tax".into(), "2025".into()]);
         assert_eq!(req.tag_filters.len(), 2);
         assert_eq!(req.tag_filters[0], "tax");
     }

@@ -1,7 +1,7 @@
-use std::path::Path;
-use std::fs;
+use super::{ExtractedContent, Extractor};
 use anyhow::{Context, Result};
-use super::{Extractor, ExtractedContent};
+use std::fs;
+use std::path::Path;
 
 /// Extracts text from PDF files using pdfium-render.
 pub struct PdfExtractor {
@@ -15,9 +15,7 @@ impl PdfExtractor {
             pdfium_render::prelude::Pdfium::bind_to_library(
                 pdfium_render::prelude::Pdfium::pdfium_platform_library_name(),
             )
-            .or_else(|_| {
-                pdfium_render::prelude::Pdfium::bind_to_system_library()
-            })
+            .or_else(|_| pdfium_render::prelude::Pdfium::bind_to_system_library())
             .context("Failed to bind pdfium library")?,
         );
 
@@ -33,8 +31,8 @@ impl Extractor for PdfExtractor {
             _ => return Ok(None),
         }
 
-        let bytes = fs::read(path)
-            .with_context(|| format!("Failed to read PDF: {}", path.display()))?;
+        let bytes =
+            fs::read(path).with_context(|| format!("Failed to read PDF: {}", path.display()))?;
 
         let doc = match self.pdfium.load_pdf_from_byte_slice(&bytes, None) {
             Ok(doc) => doc,

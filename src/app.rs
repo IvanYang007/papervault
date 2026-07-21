@@ -1,12 +1,14 @@
-use egui::{CentralPanel, TopBottomPanel, SidePanel, ScrollArea, TextEdit, RichText, Color32, Frame};
-use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
-use crossbeam::channel::{Sender, Receiver};
 use crate::config::Config;
 use crate::search::engine::SearchEngine;
 use crate::search::query::{SearchRequest, SearchResult};
-use crate::tags::store::TagStore;
 use crate::tags::model::Tag;
+use crate::tags::store::TagStore;
+use crossbeam::channel::{Receiver, Sender};
+use egui::{
+    CentralPanel, Color32, Frame, RichText, ScrollArea, SidePanel, TextEdit, TopBottomPanel,
+};
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 /// Messages from the indexer thread to the UI thread.
 #[derive(Debug, Clone)]
@@ -53,6 +55,8 @@ pub struct HighlightRect {
 /// Top-level application state.
 pub struct PapervaultApp {
     config: Config,
+    /// Lock-free reader for search — no Mutex contention with indexer writes.
+    search_reader: Option<tantivy::IndexReader>,
     search_engine: Option<Arc<Mutex<SearchEngine>>>,
     search_query: String,
     search_results: Vec<SearchResult>,
@@ -86,6 +90,7 @@ impl PapervaultApp {
     pub fn new(
         config: Config,
         search_engine: Option<Arc<Mutex<SearchEngine>>>,
+        search_reader: Option<tantivy::IndexReader>,
         progress_rx: Receiver<IndexerProgress>,
         tag_tx: Option<Sender<TagUpdate>>,
         render_tx: Option<Sender<RenderRequest>>,
@@ -99,6 +104,7 @@ impl PapervaultApp {
         };
         Self {
             config,
+            search_reader,
             search_engine,
             search_query: String::new(),
             search_results: Vec::new(),
@@ -129,6 +135,8 @@ impl PapervaultApp {
         if let Some(ref folder) = self.config.watched_folder {
             match SearchEngine::open_or_create(folder) {
                 Ok(engine) => {
+                    let reader = engine.reader.clone();
+                    self.search_reader = Some(reader);
                     self.search_engine = Some(Arc::new(Mutex::new(engine)));
                     self.status_message = format!("Watching: {}", folder.display());
                 }
@@ -139,7 +147,7 @@ impl PapervaultApp {
         }
     }
 
-    /// Perform a search query.
+    /// Perform a search query using lock-free reader (no Mutex during search).
     fn do_search(&mut self) {
         let query = self.search_query.trim().to_string();
         if query.is_empty() {
@@ -148,17 +156,23 @@ impl PapervaultApp {
             return;
         }
 
-        if let Some(ref engine) = self.search_engine {
-            let engine = engine.lock().unwrap();
-            let request = SearchRequest::new(query.clone())
-                .with_tags(self.active_tag_filters.clone());
-            match engine.search(&request) {
-                Ok(results) => {
-                    self.total_hits = results.total_hits;
-                    self.search_results = results.items;
-                }
-                Err(e) => {
-                    self.status_message = format!("Search error: {}", e);
+        if let Some(ref reader) = self.search_reader {
+            // Clone fields briefly under Mutex, then release before search
+            let fields_opt = self
+                .search_engine
+                .as_ref()
+                .map(|e| e.lock().unwrap().fields().clone());
+            if let Some(ref fields) = fields_opt {
+                let request = SearchRequest::new(query.clone())
+                    .with_tags(self.active_tag_filters.clone());
+                match crate::search::engine::search_with_reader(fields, reader, &request) {
+                    Ok(results) => {
+                        self.total_hits = results.total_hits;
+                        self.search_results = results.items;
+                    }
+                    Err(e) => {
+                        self.status_message = format!("Search error: {}", e);
+                    }
                 }
             }
         }
@@ -178,7 +192,8 @@ impl PapervaultApp {
                 let request = RenderRequest {
                     path,
                     page: 1,
-                    search_terms: self.search_query
+                    search_terms: self
+                        .search_query
                         .split_whitespace()
                         .map(|s| s.to_string())
                         .collect(),
@@ -270,7 +285,8 @@ impl PapervaultApp {
             if store.assign_tag(content_hash, tag_id).is_ok() {
                 // Sync to Tantivy
                 if let Some(ref tx) = self.tag_update_tx {
-                    let tags = store.get_tags_for_document(content_hash)
+                    let tags = store
+                        .get_tags_for_document(content_hash)
                         .unwrap_or_default()
                         .into_iter()
                         .map(|t| t.name)
@@ -297,8 +313,7 @@ impl eframe::App for PapervaultApp {
                 ui.label("🔍");
                 let resp = ui.add_sized(
                     [ui.available_width() - 180.0, 24.0],
-                    TextEdit::singleline(&mut self.search_query)
-                        .hint_text("Search documents..."),
+                    TextEdit::singleline(&mut self.search_query).hint_text("Search documents..."),
                 );
                 if resp.changed() {
                     self.do_search();
@@ -312,7 +327,10 @@ impl eframe::App for PapervaultApp {
                 }
 
                 if self.indexing_total > 0 && self.indexing_done < self.indexing_total {
-                    ui.label(format!("Indexing {}/{}", self.indexing_done, self.indexing_total));
+                    ui.label(format!(
+                        "Indexing {}/{}",
+                        self.indexing_done, self.indexing_total
+                    ));
                 }
             });
             // Active tag filter chips
@@ -336,8 +354,10 @@ impl eframe::App for PapervaultApp {
 
                     // Create new tag
                     ui.horizontal(|ui| {
-                        ui.add_sized([120.0, 20.0], TextEdit::singleline(&mut self.new_tag_name)
-                            .hint_text("New tag..."));
+                        ui.add_sized(
+                            [120.0, 20.0],
+                            TextEdit::singleline(&mut self.new_tag_name).hint_text("New tag..."),
+                        );
                         if ui.button("+").clicked() && !self.new_tag_name.trim().is_empty() {
                             let name = self.new_tag_name.trim().to_string();
                             self.create_tag(&name);
@@ -358,10 +378,9 @@ impl eframe::App for PapervaultApp {
                                 ui.label(&tag.name);
 
                                 // Assign to selected document
-                                if self.selected_result.is_some() {
-                                    if ui.small_button("📌").clicked() {
-                                        self.assign_tag_to_selected(tag.id);
-                                    }
+                                if self.selected_result.is_some() && ui.small_button("📌").clicked()
+                                {
+                                    self.assign_tag_to_selected(tag.id);
                                 }
                             });
                         }
@@ -395,40 +414,33 @@ impl eframe::App for PapervaultApp {
                             Color32::TRANSPARENT
                         };
 
-                        Frame::default()
-                            .fill(bg)
-                            .inner_margin(4.0)
-                            .show(ui, |ui| {
-                                let resp = ui.add_sized(
-                                    [ui.available_width(), 40.0],
-                                    egui::SelectableLabel::new(
-                                        selected,
-                                        RichText::new(format!(
-                                            "{} ({})",
-                                            result.file_name, result.match_count
-                                        ))
-                                        .strong(),
-                                    ),
-                                );
-                                if resp.clicked() {
-                                    clicked_idx = Some(i);
-                                }
+                        Frame::default().fill(bg).inner_margin(4.0).show(ui, |ui| {
+                            let resp = ui.add_sized(
+                                [ui.available_width(), 40.0],
+                                egui::SelectableLabel::new(
+                                    selected,
+                                    RichText::new(format!(
+                                        "{} ({})",
+                                        result.file_name, result.match_count
+                                    ))
+                                    .strong(),
+                                ),
+                            );
+                            if resp.clicked() {
+                                clicked_idx = Some(i);
+                            }
 
-                                // Show tags
-                                if !result.tags.is_empty() {
-                                    ui.horizontal(|ui| {
-                                        for t in &result.tags {
-                                            ui.label(RichText::new(format!("🏷{}", t)).small());
-                                        }
-                                    });
-                                }
+                            // Show tags
+                            if !result.tags.is_empty() {
+                                ui.horizontal(|ui| {
+                                    for t in &result.tags {
+                                        ui.label(RichText::new(format!("🏷{}", t)).small());
+                                    }
+                                });
+                            }
 
-                                ui.label(
-                                    RichText::new(&result.snippet)
-                                        .small()
-                                        .color(Color32::GRAY),
-                                );
-                            });
+                            ui.label(RichText::new(&result.snippet).small().color(Color32::GRAY));
+                        });
                     }
                 });
 
@@ -453,9 +465,10 @@ impl eframe::App for PapervaultApp {
                     ui.label("Type a search query to find documents.");
                 });
             } else if let Some(ref texture) = self.preview_texture {
-                ui.image(egui::ImageSource::Texture(
-                    egui::load::SizedTexture::new(texture.id(), texture.size_vec2()),
-                ));
+                ui.image(egui::ImageSource::Texture(egui::load::SizedTexture::new(
+                    texture.id(),
+                    texture.size_vec2(),
+                )));
             } else if let Some(ref text) = self.preview_text {
                 ScrollArea::vertical().show(ui, |ui| {
                     ui.monospace(text);
@@ -475,12 +488,15 @@ impl eframe::App for PapervaultApp {
                 .resizable(false)
                 .show(ctx, |ui| {
                     ui.label("Enter the folder path to watch:");
-                    let mut path_str = self.config.watched_folder
+                    let mut path_str = self
+                        .config
+                        .watched_folder
                         .as_ref()
                         .map(|p| p.display().to_string())
                         .unwrap_or_default();
-                    if ui.text_edit_singleline(&mut path_str).lost_focus() ||
-                       ui.button("Set Folder").clicked() {
+                    if ui.text_edit_singleline(&mut path_str).lost_focus()
+                        || ui.button("Set Folder").clicked()
+                    {
                         let path = PathBuf::from(&path_str);
                         if path.exists() && path.is_dir() {
                             self.config.watched_folder = Some(path);

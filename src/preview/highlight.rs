@@ -21,7 +21,7 @@ fn char_to_rect(
     _char_index: usize,
     _total_chars: usize,
     page_width: f32,
-    page_height: f32,
+    _page_height: f32,
 ) -> HighlightRect {
     // Approximate: distribute characters evenly in a grid
     let chars_per_row = (page_width / 8.0) as usize; // ~8px per character

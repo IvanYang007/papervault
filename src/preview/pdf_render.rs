@@ -1,8 +1,8 @@
+use anyhow::Context;
+use crossbeam::channel::{Receiver, Sender};
 use std::sync::Arc;
 use std::sync::Mutex;
-use crossbeam::channel::{Receiver, Sender};
-use anyhow::Context;
-use tracing::{info, error};
+use tracing::{error, info};
 
 use crate::app::{RenderRequest, RenderResult};
 
@@ -14,11 +14,11 @@ pub struct PdfRenderer {
 }
 
 impl PdfRenderer {
-    pub fn new(
-        request_rx: Receiver<RenderRequest>,
-        result_tx: Sender<RenderResult>,
-    ) -> Self {
-        Self { request_rx, result_tx }
+    pub fn new(request_rx: Receiver<RenderRequest>, result_tx: Sender<RenderResult>) -> Self {
+        Self {
+            request_rx,
+            result_tx,
+        }
     }
 
     /// Run the render loop (blocks until channel closes).
@@ -26,8 +26,7 @@ impl PdfRenderer {
         info!("PDF renderer started (pdfium lazy-init on first request)");
 
         // pdfium is lazy-initialized on the first render request
-        let pdfium: Arc<Mutex<Option<pdfium_render::prelude::Pdfium>>> =
-            Arc::new(Mutex::new(None));
+        let pdfium: Arc<Mutex<Option<pdfium_render::prelude::Pdfium>>> = Arc::new(Mutex::new(None));
 
         while let Ok(request) = self.request_rx.recv() {
             match self.render_page(&request, &pdfium) {
@@ -65,9 +64,7 @@ impl PdfRenderer {
                 pdfium_render::prelude::Pdfium::bind_to_library(
                     pdfium_render::prelude::Pdfium::pdfium_platform_library_name(),
                 )
-                .or_else(|_| {
-                    pdfium_render::prelude::Pdfium::bind_to_system_library()
-                })
+                .or_else(|_| pdfium_render::prelude::Pdfium::bind_to_system_library())
                 .context("Failed to bind pdfium library")?,
             );
             *guard = Some(pdfium);
@@ -80,7 +77,8 @@ impl PdfRenderer {
         let bytes = std::fs::read(&request.path)
             .with_context(|| format!("Failed to read: {}", request.path.display()))?;
 
-        let doc = pdfium.load_pdf_from_byte_slice(&bytes, None)
+        let doc = pdfium
+            .load_pdf_from_byte_slice(&bytes, None)
             .context("Failed to load PDF")?;
 
         let pages = doc.pages();
@@ -97,8 +95,7 @@ impl PdfRenderer {
         let page_count = pages.len();
         let page_idx: pdfium_render::prelude::PdfPageIndex =
             ((request.page.max(1) - 1) as u16).min(page_count.saturating_sub(1));
-        let page = pages.get(page_idx)
-            .context("Failed to get page")?;
+        let page = pages.get(page_idx).context("Failed to get page")?;
 
         let width = page.width().value as usize;
         let height = page.height().value as usize;
@@ -107,7 +104,10 @@ impl PdfRenderer {
         let max_dim = 2000;
         let (render_width, render_height) = if width > max_dim || height > max_dim {
             let scale = max_dim as f64 / width.max(height) as f64;
-            ((width as f64 * scale) as usize, (height as f64 * scale) as usize)
+            (
+                (width as f64 * scale) as usize,
+                (height as f64 * scale) as usize,
+            )
         } else {
             (width.max(1), height.max(1))
         };

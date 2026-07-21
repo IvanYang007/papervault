@@ -3,8 +3,8 @@ pub mod text;
 pub mod pdf;
 
 mod private {
-    use std::path::Path;
     use anyhow::Result;
+    use std::path::Path;
 
     /// Single-method extractor — returns Ok(None) for unsupported files.
     pub trait Extractor {

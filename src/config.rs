@@ -1,25 +1,16 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Config {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub watched_folder: Option<PathBuf>,
 }
 
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            watched_folder: None,
-        }
-    }
-}
-
 impl Config {
     /// Returns the path to the config file in the user's config directory.
     fn config_path() -> PathBuf {
-        let base = dirs_next::config_dir()
-            .unwrap_or_else(|| PathBuf::from("."));
+        let base = dirs_next::config_dir().unwrap_or_else(|| PathBuf::from("."));
         base.join("papervault").join("config.json")
     }
 
@@ -28,9 +19,7 @@ impl Config {
         let path = Self::config_path();
         if path.exists() {
             match std::fs::read_to_string(&path) {
-                Ok(contents) => {
-                    serde_json::from_str(&contents).unwrap_or_default()
-                }
+                Ok(contents) => serde_json::from_str(&contents).unwrap_or_default(),
                 Err(_) => Self::default(),
             }
         } else {

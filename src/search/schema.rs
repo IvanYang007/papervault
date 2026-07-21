@@ -30,6 +30,7 @@ pub fn build_schema() -> Schema {
 }
 
 /// Returns field getters for all schema fields.
+#[derive(Clone)]
 pub struct SchemaFields {
     pub doc_id: Field,
     pub file_path: Field,
@@ -50,7 +51,9 @@ impl SchemaFields {
             body: schema.get_field("body").expect("body field"),
             file_type: schema.get_field("file_type").expect("file_type field"),
             modified_ts: schema.get_field("modified_ts").expect("modified_ts field"),
-            content_hash: schema.get_field("content_hash").expect("content_hash field"),
+            content_hash: schema
+                .get_field("content_hash")
+                .expect("content_hash field"),
             tags: schema.get_field("tags").expect("tags field"),
         }
     }
@@ -91,7 +94,10 @@ mod tests {
         let field = schema.get_field("content_hash").unwrap();
         let entry = schema.get_field_entry(field);
 
-        assert!(entry.is_indexed(), "content_hash must be indexed for delete_term");
+        assert!(
+            entry.is_indexed(),
+            "content_hash must be indexed for delete_term"
+        );
         assert!(entry.is_stored(), "content_hash must be stored");
     }
 }

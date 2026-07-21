@@ -1,7 +1,7 @@
-use std::path::Path;
-use std::fs;
+use super::{ExtractedContent, Extractor};
 use anyhow::{Context, Result};
-use super::{Extractor, ExtractedContent};
+use std::fs;
+use std::path::Path;
 
 /// Extracts text from plain text files (.txt, .md, .log).
 pub struct TextExtractor;
@@ -9,9 +9,7 @@ pub struct TextExtractor;
 impl Extractor for TextExtractor {
     fn extract(&self, path: &Path) -> Result<Option<ExtractedContent>> {
         // Determine if this is a text file we handle
-        let ext = path.extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("");
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
         let is_text = matches!(ext.to_lowercase().as_str(), "txt" | "md" | "log");
 
         if !is_text {
@@ -43,9 +41,7 @@ impl Extractor for TextExtractor {
             }
         };
 
-        let file_name = path.file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("");
+        let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
 
         Ok(Some(ExtractedContent {
             text: content,

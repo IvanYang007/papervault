@@ -1,26 +1,25 @@
+use anyhow::Context;
+use crossbeam::channel::{Receiver, Sender};
 use std::path::PathBuf;
 use std::sync::Arc;
-use crossbeam::channel::{Receiver, Sender};
-use anyhow::Context;
-use tracing::{info, warn, error};
+use std::time::{Duration, Instant};
+use tracing::{error, info, warn};
 
+use crate::app::{IndexerProgress, TagUpdate};
+use crate::indexer::stages;
 use crate::search::engine::SearchEngine;
 use crate::tags::store::TagStore;
 use crate::watcher::watcher::IndexerMessage;
-use crate::app::IndexerProgress;
-use crate::indexer::stages;
 
 /// The indexing pipeline orchestrator.
 /// Receives file events from the watcher, runs extraction, and commits to Tantivy + SQLite.
 pub struct Pipeline {
-    stages: Vec<Box<dyn crate::indexer::extractors::Extractor>>,
     search_engine: Arc<std::sync::Mutex<SearchEngine>>,
     tag_store: TagStore,
     msg_rx: Receiver<IndexerMessage>,
+    tag_rx: Receiver<TagUpdate>,
     progress_tx: Sender<IndexerProgress>,
-    /// Number of documents processed since last commit.
     pending_count: usize,
-    /// Commit every N documents or every 2 seconds.
     commit_batch_size: usize,
 }
 
@@ -29,59 +28,79 @@ impl Pipeline {
         search_engine: Arc<std::sync::Mutex<SearchEngine>>,
         tag_store: TagStore,
         msg_rx: Receiver<IndexerMessage>,
+        tag_rx: Receiver<TagUpdate>,
         progress_tx: Sender<IndexerProgress>,
     ) -> Self {
-        let stages = stages::create_extractor_chain();
         Self {
-            stages,
             search_engine,
             tag_store,
             msg_rx,
+            tag_rx,
             progress_tx,
             pending_count: 0,
             commit_batch_size: 10,
         }
     }
 
-    /// Run the pipeline event loop (blocks until channel closes).
+    /// Run the pipeline event loop (blocks until file channel closes).
+    /// Handles file events, tag updates, and auto-commits every 2s.
     pub fn run(&mut self) {
         info!("Pipeline started");
-        let start_time = std::time::Instant::now();
-        let mut total_processed: usize = 0;
 
-        while let Ok(msg) = self.msg_rx.recv() {
-            match msg {
-                IndexerMessage::Upsert { path, mtime, size } => {
-                    match self.process_upsert(&path, mtime, size) {
-                        Ok(()) => {
-                            total_processed += 1;
-                            self.pending_count += 1;
-                        }
-                        Err(e) => {
-                            error!("Pipeline error for {}: {}", path.display(), e);
-                            let _ = self.progress_tx.send(IndexerProgress::Error {
-                                path: path.clone(),
-                                error: e.to_string(),
-                            });
+        // Build extractor chain on this thread (avoids Send requirement on pdfium)
+        let stages = stages::create_extractor_chain();
+        let mut total_processed: usize = 0;
+        let mut last_commit = Instant::now();
+        let commit_interval = Duration::from_secs(2);
+
+        loop {
+            // Use recv_timeout to periodically check commit timer even when idle
+            match self.msg_rx.recv_timeout(Duration::from_millis(500)) {
+                Ok(msg) => match msg {
+                    IndexerMessage::Upsert { path, mtime, size } => {
+                        match self.process_upsert(&path, mtime, size, &stages) {
+                            Ok(()) => {
+                                total_processed += 1;
+                                self.pending_count += 1;
+                            }
+                            Err(e) => {
+                                error!("Pipeline error for {}: {}", path.display(), e);
+                                let _ = self.progress_tx.send(IndexerProgress::Error {
+                                    path: path.clone(),
+                                    error: e.to_string(),
+                                });
+                            }
                         }
                     }
+                    IndexerMessage::Delete { path } => {
+                        if let Err(e) = self.process_delete(&path) {
+                            error!("Delete error for {}: {}", path.display(), e);
+                        }
+                    }
+                },
+                Err(crossbeam::channel::RecvTimeoutError::Timeout) => {
+                    // Timer tick — check if we should commit
                 }
-                IndexerMessage::Delete { path } => {
-                    if let Err(e) = self.process_delete(&path) {
-                        error!("Delete error for {}: {}", path.display(), e);
-                    }
+                Err(crossbeam::channel::RecvTimeoutError::Disconnected) => {
+                    break; // Watcher channel closed — shutdown
                 }
             }
 
-            // Commit periodically
-            let should_commit = self.pending_count >= self.commit_batch_size ||
-                (self.pending_count > 0 && start_time.elapsed().as_secs() >= 2);
+            // Drain any pending tag updates without blocking
+            while let Ok(update) = self.tag_rx.try_recv() {
+                self.process_tag_update(update);
+            }
+
+            // Commit periodically: every N docs or every 2 seconds
+            let should_commit = self.pending_count >= self.commit_batch_size
+                || (self.pending_count > 0 && last_commit.elapsed() >= commit_interval);
 
             if should_commit {
                 if let Err(e) = self.commit() {
                     error!("Commit error: {}", e);
                 }
                 self.pending_count = 0;
+                last_commit = Instant::now();
 
                 let _ = self.progress_tx.send(IndexerProgress::Indexed {
                     path: PathBuf::new(),
@@ -104,17 +123,45 @@ impl Pipeline {
         info!("Pipeline stopped");
     }
 
+    /// Process a tag update from the UI thread.
+    fn process_tag_update(&mut self, update: TagUpdate) {
+        match update {
+            TagUpdate::UpdateDocumentTags {
+                content_hash,
+                tags,
+            } => {
+                // Do NOT delete the Tantivy document — it must remain searchable.
+                // Tags in SQLite will be picked up on next process_upsert (which calls
+                // get_tags_for_document). Immediate sync requires storing body text
+                // in SQLite for re-indexing without file re-extraction — deferred to v1.1.
+                info!(
+                    "Tag update for {}: {:?} (takes effect on next file index)",
+                    content_hash, tags
+                );
+            }
+        }
+    }
+
     /// Process a file create/modify event.
-    fn process_upsert(&mut self, path: &PathBuf, mtime: u64, size: u64) -> anyhow::Result<()> {
+    fn process_upsert(
+        &mut self,
+        path: &PathBuf,
+        mtime: u64,
+        size: u64,
+        stages: &[Box<dyn crate::indexer::extractors::Extractor>],
+    ) -> anyhow::Result<()> {
         let path_str = path.display().to_string();
 
         // Fast-path: check metadata in SQLite
-        if self.tag_store.already_indexed_by_metadata(&path_str, size, mtime)? {
+        if self
+            .tag_store
+            .already_indexed_by_metadata(&path_str, size, mtime)?
+        {
             return Ok(());
         }
 
         // Extract text
-        let extracted = match stages::run_chain(path, &self.stages) {
+        let extracted = match stages::run_chain(path, stages) {
             Ok(Some(content)) => content,
             Ok(None) => return Ok(()), // Unsupported file type
             Err(e) => {
@@ -138,12 +185,14 @@ impl Pipeline {
         }
 
         // Determine file type
-        let file_type = path.extension()
+        let file_type = path
+            .extension()
             .and_then(|e| e.to_str())
             .unwrap_or("")
             .to_lowercase();
 
-        let file_name = path.file_name()
+        let file_name = path
+            .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("")
             .to_string();
@@ -152,7 +201,9 @@ impl Pipeline {
         let modified_ts = mtime as i64;
 
         // Get tags from TagStore (if any — will be empty for new docs)
-        let tags = self.tag_store.get_tags_for_document(&content_hash)
+        let tags = self
+            .tag_store
+            .get_tags_for_document(&content_hash)
             .unwrap_or_default()
             .into_iter()
             .map(|t| t.name)
@@ -212,10 +263,7 @@ impl Pipeline {
 }
 
 /// Run reconciliation on startup: ensure Tantivy and SQLite are consistent.
-pub fn reconcile(
-    engine: Arc<std::sync::Mutex<SearchEngine>>,
-    _tag_store: &TagStore,
-) {
+pub fn reconcile(engine: Arc<std::sync::Mutex<SearchEngine>>, _tag_store: &TagStore) {
     info!("Running startup reconciliation...");
 
     if let Err(e) = {

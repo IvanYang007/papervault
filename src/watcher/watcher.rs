@@ -20,80 +20,64 @@ pub enum IndexerMessage {
 
 /// Start watching a directory for changes.
 /// Sends `IndexerMessage` variants to the provided channel.
-pub fn start_watching(
-    folder: PathBuf,
-    tx: Sender<IndexerMessage>,
-) -> anyhow::Result<()> {
-    let extensions: Vec<String> = vec![
-        "pdf".into(),
-        "txt".into(),
-        "md".into(),
-        "log".into(),
-    ];
+pub fn start_watching(folder: PathBuf, tx: Sender<IndexerMessage>) -> anyhow::Result<()> {
+    let extensions: Vec<String> = vec!["pdf".into(), "txt".into(), "md".into(), "log".into()];
 
     // Emit initial scan events for existing files
     emit_initial_scan(&folder, &extensions, &tx)?;
 
-    let event_handler = move |result: DebounceEventResult| {
-        match result {
-            Ok(events) => {
-                for event in events {
-                    match event.kind {
-                        EventKind::Create(_) | EventKind::Modify(_) => {
-                            for path in &event.paths {
-                                if is_supported_extension(path, &extensions) {
-                                    if let Ok(meta) = std::fs::metadata(path) {
-                                        let mtime = meta.modified()
-                                            .map(|t| {
-                                                t.duration_since(std::time::UNIX_EPOCH)
-                                                    .unwrap_or_default()
-                                                    .as_secs()
-                                            })
-                                            .unwrap_or(0);
-                                        let size = meta.len();
-                                        let _ = tx.send(IndexerMessage::Upsert {
-                                            path: path.clone(),
-                                            mtime,
-                                            size,
-                                        });
-                                    }
-                                }
-                            }
-                        }
-                        EventKind::Remove(_) => {
-                            for path in &event.paths {
-                                if is_supported_extension(path, &extensions) {
-                                    let _ = tx.send(IndexerMessage::Delete {
+    let event_handler = move |result: DebounceEventResult| match result {
+        Ok(events) => {
+            for event in events {
+                match event.kind {
+                    EventKind::Create(_) | EventKind::Modify(_) => {
+                        for path in &event.paths {
+                            if is_supported_extension(path, &extensions) {
+                                if let Ok(meta) = std::fs::metadata(path) {
+                                    let mtime = meta
+                                        .modified()
+                                        .map(|t| {
+                                            t.duration_since(std::time::UNIX_EPOCH)
+                                                .unwrap_or_default()
+                                                .as_secs()
+                                        })
+                                        .unwrap_or(0);
+                                    let size = meta.len();
+                                    let _ = tx.send(IndexerMessage::Upsert {
                                         path: path.clone(),
+                                        mtime,
+                                        size,
                                     });
                                 }
                             }
                         }
-                        _ => {}
                     }
+                    EventKind::Remove(_) => {
+                        for path in &event.paths {
+                            if is_supported_extension(path, &extensions) {
+                                let _ = tx.send(IndexerMessage::Delete { path: path.clone() });
+                            }
+                        }
+                    }
+                    _ => {}
                 }
             }
-            Err(errors) => {
-                for e in errors {
-                    error!("Watcher error: {:?}", e);
-                }
+        }
+        Err(errors) => {
+            for e in errors {
+                error!("Watcher error: {:?}", e);
             }
         }
     };
 
-    let mut debouncer = notify_debouncer_full::new_debouncer(
-        Duration::from_millis(500),
-        None,
-        event_handler,
-    )?;
+    let mut debouncer =
+        notify_debouncer_full::new_debouncer(Duration::from_millis(500), None, event_handler)?;
 
-    debouncer
-        .watch(&folder, RecursiveMode::NonRecursive)?;
+    debouncer.watch(&folder, RecursiveMode::NonRecursive)?;
 
-    // Store the watcher so it stays alive — it works via callback
-    // The debouncer must not be dropped during the app lifetime
-    // We leak it intentionally (it lives for the app's lifetime)
-    std::mem::forget(debouncer);
+    // The debouncer must stay alive for the app's lifetime.
+    // Box::leak makes the intentional ownership transfer explicit.
+    let _ = Box::leak(Box::new(debouncer));
 
     info!("Watching folder: {}", folder.display());
     Ok(())
@@ -117,7 +101,8 @@ fn emit_initial_scan(
         let path = entry.path();
         if path.is_file() && is_supported_extension(&path, extensions) {
             if let Ok(meta) = entry.metadata() {
-                let mtime = meta.modified()
+                let mtime = meta
+                    .modified()
                     .map(|t| {
                         t.duration_since(std::time::UNIX_EPOCH)
                             .unwrap_or_default()
