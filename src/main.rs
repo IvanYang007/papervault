@@ -89,24 +89,14 @@ fn main() -> eframe::Result {
         (None, None, None)
     };
 
-    let (progress_rx, tag_tx, render_tx, render_result_rx, watcher_shutdown, watcher_shutdown_tx) =
-        if let Some(ref rt) = folder_runtime {
-            (
-                rt.progress_rx.clone(),
-                rt.tag_tx.clone(),
-                Some(rt.render_tx.clone()),
-                Some(rt.render_result_rx.clone()),
-                Some(rt.watcher_shutdown()),
-                rt.watcher_shutdown_tx(),
-            )
-        } else {
-            // Dummy channels for app startup without a folder runtime
-            use crossbeam::channel;
-            let (_, prx) = channel::unbounded::<app::IndexerProgress>();
-            let (rtx2, _) = channel::bounded::<app::RenderRequest>(1);
-            let (_, rrx) = channel::bounded::<app::RenderResult>(1);
-            (prx, None, Some(rtx2), Some(rrx), None, None)
-        };
+    // Dummy channels for app startup without a folder runtime
+    let (dummy_progress_rx, dummy_render_tx, dummy_render_rx) = {
+        use crossbeam::channel;
+        let (_, prx) = channel::unbounded::<app::IndexerProgress>();
+        let (rtx, _) = channel::bounded::<app::RenderRequest>(1);
+        let (_, rrx) = channel::bounded::<app::RenderResult>(1);
+        (prx, rtx, rrx)
+    };
 
     // ── UI ──
     let options = eframe::NativeOptions {
@@ -122,32 +112,37 @@ fn main() -> eframe::Result {
         "Papervault",
         options,
         Box::new(move |_cc| {
+            // Extract runtime channels (or use dummies)
+            let (progress_rx, render_tx, render_result_rx) =
+                if let Some(ref rt) = folder_runtime {
+                    (
+                        rt.progress_rx.clone(),
+                        Some(rt.render_tx.clone()),
+                        Some(rt.render_result_rx.clone()),
+                    )
+                } else {
+                    (
+                        dummy_progress_rx,
+                        Some(dummy_render_tx),
+                        Some(dummy_render_rx),
+                    )
+                };
             Ok(Box::new(PapervaultApp::new(
                 app_config,
                 search_engine,
                 search_reader,
                 search_fields,
                 progress_rx,
-                tag_tx,
+                None,  // tag_tx - populated by FolderRuntime::start later
                 render_tx,
                 render_result_rx,
                 tag_store_for_app,
-                watcher_shutdown,
-                watcher_shutdown_tx,
+                None,  // watcher_shutdown_flag - populated by FolderRuntime::start
+                None,  // watcher_shutdown_tx - populated by FolderRuntime::start
+                folder_runtime,
             )))
         }),
     )?;
-
-    // ── Graceful Shutdown ──
-    // eframe::run_native returns when the window closes.
-    // Stop the folder runtime to join all background threads.
-    if let Some(rt) = folder_runtime {
-        info!("Shutting down folder runtime...");
-        if let Err(e) = rt.stop() {
-            error!("Error during folder runtime shutdown: {}", e);
-        }
-        info!("Folder runtime stopped.");
-    }
 
     Ok(())
 }

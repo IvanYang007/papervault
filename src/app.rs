@@ -1,4 +1,5 @@
 use crate::config::Config;
+use crate::runtime::FolderRuntime;
 use crate::search::engine::SearchEngine;
 use crate::search::query::{SearchRequest, SearchResult};
 use crate::search::schema::SchemaFields;
@@ -10,8 +11,8 @@ use egui::{
     CentralPanel, Color32, Frame, RichText, ScrollArea, SidePanel, TextEdit, TopBottomPanel,
 };
 use std::collections::HashSet;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -64,6 +65,8 @@ pub struct PapervaultApp {
     /// Pre-cloned schema fields — avoids Mutex lock during search.
     search_fields: Option<SchemaFields>,
     search_engine: Option<Arc<Mutex<SearchEngine>>>,
+    /// Owns watcher, indexer, renderer threads and channels for folder lifecycle.
+    folder_runtime: Option<FolderRuntime>,
     search_query: String,
     search_results: Vec<SearchResult>,
     total_hits: usize,
@@ -127,6 +130,7 @@ impl PapervaultApp {
         tag_store: Option<TagStore>,
         watcher_shutdown_flag: Option<Arc<AtomicBool>>,
         watcher_shutdown_tx: Option<Sender<IndexerMessage>>,
+        folder_runtime: Option<FolderRuntime>,
     ) -> Self {
         let status = if config.watched_folder.is_some() && search_engine.is_some() {
             "Ready".to_string()
@@ -175,24 +179,34 @@ impl PapervaultApp {
             last_search_instant: None,
             pending_search: None,
             focus_search_next_frame: true,
+            folder_runtime,
         }
     }
 
-    /// Initialize the search engine for the configured watched folder.
-    fn init_search_engine(&mut self) {
-        if let Some(ref folder) = self.config.watched_folder {
-            match SearchEngine::open_or_create(folder) {
-                Ok(engine) => {
-                    let reader = engine.reader.clone();
-                    let fields = engine.fields().clone();
-                    self.search_reader = Some(reader);
-                    self.search_fields = Some(fields);
-                    self.search_engine = Some(Arc::new(Mutex::new(engine)));
-                    self.status_message = format!("Watching: {}", folder.display());
-                }
-                Err(e) => {
-                    self.status_message = format!("Failed to open index: {}", e);
-                }
+    /// Start the full folder runtime: opens engine, spawns indexer/watcher/renderer,
+    /// runs reconciliation, and begins watching for file changes.
+    fn start_folder_runtime(&mut self, folder: &Path) {
+        let Some(ref tag_store) = self.tag_store else {
+            self.status_message = "Tag store not available — cannot index.".to_string();
+            return;
+        };
+        match FolderRuntime::start(folder, tag_store) {
+            Ok(runtime) => {
+                self.search_reader = Some(runtime.search_reader.clone());
+                self.search_fields = Some(runtime.search_fields.clone());
+                self.search_engine = Some(runtime.search_engine.clone());
+                // Replace channels with ones from the new runtime
+                self.indexer_progress_rx = runtime.progress_rx.clone();
+                self.tag_update_tx = runtime.tag_tx.clone();
+                self.render_request_tx = Some(runtime.render_tx.clone());
+                self.render_result_rx = Some(runtime.render_result_rx.clone());
+                self.watcher_shutdown_flag = Some(runtime.watcher_shutdown());
+                self.watcher_shutdown_tx = runtime.watcher_shutdown_tx();
+                self.folder_runtime = Some(runtime);
+                self.status_message = format!("Watching: {}", folder.display());
+            }
+            Err(e) => {
+                self.status_message = format!("Failed to start indexing: {}", e);
             }
         }
     }
@@ -825,11 +839,14 @@ impl eframe::App for PapervaultApp {
                     if ui.button("Set Folder").clicked() {
                         let path = PathBuf::from(&self.folder_picker_input);
                         if path.exists() && path.is_dir() {
-                            self.config.watched_folder = Some(path);
+                            // Stop old runtime before starting new one
+                            if let Some(rt) = self.folder_runtime.take() {
+                                let _ = rt.stop();
+                            }
+                            self.config.watched_folder = Some(path.clone());
                             let _ = self.config.save();
-                            self.init_search_engine();
+                            self.start_folder_runtime(&path);
                             self.folder_picker_open = false;
-                            self.status_message = format!("Watching: {}", self.folder_picker_input);
                         } else {
                             self.status_message =
                                 format!("Invalid folder: {}", self.folder_picker_input);
@@ -842,13 +859,9 @@ impl eframe::App for PapervaultApp {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         let _ = self.config.save();
 
-        // Signal the watcher to stop gracefully.
-        // This drops the debouncer → closes the watcher channel → indexer
-        // receives Disconnected → commits pending and exits.
-        if let Some(ref flag) = self.watcher_shutdown_flag {
-            flag.store(true, Ordering::Relaxed);
+        // Gracefully stop the folder runtime (joins all background threads).
+        if let Some(rt) = self.folder_runtime.take() {
+            let _ = rt.stop();
         }
-        // Drop our sender clone to help close the channel
-        drop(self.watcher_shutdown_tx.take());
     }
 }
