@@ -163,8 +163,8 @@ impl PapervaultApp {
                 .as_ref()
                 .map(|e| e.lock().unwrap().fields().clone());
             if let Some(ref fields) = fields_opt {
-                let request = SearchRequest::new(query.clone())
-                    .with_tags(self.active_tag_filters.clone());
+                let request =
+                    SearchRequest::new(query.clone()).with_tags(self.active_tag_filters.clone());
                 match crate::search::engine::search_with_reader(fields, reader, &request) {
                     Ok(results) => {
                         self.total_hits = results.total_hits;

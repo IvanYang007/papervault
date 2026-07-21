@@ -126,10 +126,7 @@ impl Pipeline {
     /// Process a tag update from the UI thread.
     fn process_tag_update(&mut self, update: TagUpdate) {
         match update {
-            TagUpdate::UpdateDocumentTags {
-                content_hash,
-                tags,
-            } => {
+            TagUpdate::UpdateDocumentTags { content_hash, tags } => {
                 // Do NOT delete the Tantivy document — it must remain searchable.
                 // Tags in SQLite will be picked up on next process_upsert (which calls
                 // get_tags_for_document). Immediate sync requires storing body text
@@ -278,4 +275,239 @@ pub fn reconcile(engine: Arc<std::sync::Mutex<SearchEngine>>, _tag_store: &TagSt
     // For v1, garbage_collect_filess() handles the common crash case.
 
     info!("Reconciliation complete");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tags::store::TagStore;
+    use rusqlite::Connection;
+    use std::sync::Arc;
+
+    fn setup_tag_store() -> (TagStore, tempfile::TempDir) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db_path = dir.path().join("test.db");
+
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")
+            .unwrap();
+        conn.execute_batch(
+            "CREATE TABLE documents (
+                content_hash TEXT PRIMARY KEY,
+                file_path   TEXT NOT NULL,
+                file_type   TEXT NOT NULL,
+                file_size   INTEGER NOT NULL DEFAULT 0,
+                modified_ts INTEGER NOT NULL DEFAULT 0,
+                indexed_at  TEXT NOT NULL DEFAULT '',
+                last_error  TEXT
+            );
+            CREATE TABLE tags (
+                id   INTEGER PRIMARY KEY,
+                name TEXT UNIQUE NOT NULL
+            );
+            CREATE TABLE document_tags (
+                content_hash TEXT NOT NULL REFERENCES documents(content_hash) ON DELETE CASCADE,
+                tag_id      INTEGER NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
+                PRIMARY KEY (content_hash, tag_id)
+            );",
+        )
+        .unwrap();
+
+        (
+            TagStore {
+                db_path: db_path.clone(),
+            },
+            dir,
+        )
+    }
+
+    #[test]
+    fn metadata_fast_path_skips_unchanged_file() {
+        let (store, _dir) = setup_tag_store();
+
+        let path = "/test/doc.pdf";
+        let size: u64 = 1024;
+        let mtime: u64 = 1700000000;
+
+        // First check: not indexed yet
+        assert!(
+            !store
+                .already_indexed_by_metadata(path, size, mtime)
+                .unwrap(),
+            "Should not be indexed before upsert"
+        );
+
+        // Index the document
+        store
+            .upsert_document("hash1", path, "pdf", size as i64, mtime as i64)
+            .unwrap();
+
+        // Same metadata should report as already indexed
+        assert!(
+            store
+                .already_indexed_by_metadata(path, size, mtime)
+                .unwrap(),
+            "Same (path, size, mtime) should be detected as unchanged"
+        );
+
+        // Different size should NOT be detected as unchanged
+        assert!(
+            !store
+                .already_indexed_by_metadata(path, size + 1, mtime)
+                .unwrap(),
+            "Different size should trigger re-index"
+        );
+
+        // Different mtime should NOT be detected as unchanged
+        assert!(
+            !store
+                .already_indexed_by_metadata(path, size, mtime + 1)
+                .unwrap(),
+            "Different mtime should trigger re-index"
+        );
+    }
+
+    #[test]
+    fn content_hash_dedup_skips_duplicate() {
+        let (store, _dir) = setup_tag_store();
+
+        let hash = "abc123def456";
+
+        // Not yet indexed
+        assert!(!store.already_indexed_by_hash(hash).unwrap());
+
+        // Index at first path
+        store
+            .upsert_document(hash, "/first/path/doc.pdf", "pdf", 2048, 1700000000)
+            .unwrap();
+
+        // Now detected as duplicate
+        assert!(store.already_indexed_by_hash(hash).unwrap());
+
+        // Update path for existing hash (dedup: new path, same content)
+        store.update_path(hash, "/second/path/copy.pdf").unwrap();
+
+        // Old path should no longer be in DB for this hash
+        let old_hash = store.get_hash_by_path("/first/path/doc.pdf").unwrap();
+        assert!(old_hash.is_none());
+
+        // New path should map to same hash
+        let new_hash = store
+            .get_hash_by_path("/second/path/copy.pdf")
+            .unwrap()
+            .unwrap();
+        assert_eq!(new_hash, hash);
+    }
+
+    #[test]
+    fn failed_file_logged_to_last_error() {
+        let (store, _dir) = setup_tag_store();
+
+        // Insert a document and verify last_error column exists and can be set
+        store
+            .upsert_document("hash1", "/test/bad.pdf", "pdf", 0, 1700000000)
+            .unwrap();
+
+        // Set last_error manually (simulating what the pipeline would do for a corrupt file)
+        let conn = Connection::open(&store.db_path).unwrap();
+        conn.execute(
+            "UPDATE documents SET last_error = ?1 WHERE content_hash = ?2",
+            rusqlite::params!["Extraction failed: corrupt PDF header", "hash1"],
+        )
+        .unwrap();
+
+        // Verify last_error was stored
+        let error: String = conn
+            .query_row(
+                "SELECT last_error FROM documents WHERE content_hash = ?1",
+                rusqlite::params!["hash1"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(error.contains("corrupt PDF header"));
+    }
+
+    #[test]
+    fn shutdown_commits_pending() {
+        use crate::app::TagUpdate;
+        use crate::search::engine::SearchEngine;
+        use crate::watcher::watcher::IndexerMessage;
+        use std::path::PathBuf;
+
+        let (store, _dir) = setup_tag_store();
+
+        // Create a temp-search engine
+        let index_dir = tempfile::TempDir::new().unwrap();
+        let schema = crate::search::schema::build_schema();
+        let fields = crate::search::schema::SchemaFields::from_schema(&schema);
+        let index = tantivy::Index::create_in_dir(index_dir.path(), schema.clone()).unwrap();
+        let tokenizer = tantivy::tokenizer::TextAnalyzer::builder(
+            tantivy::tokenizer::SimpleTokenizer::default(),
+        )
+        .filter(tantivy::tokenizer::LowerCaser)
+        .build();
+        index.tokenizers().register("body", tokenizer);
+        let writer = index.writer(50_000_000).unwrap();
+        let reader = index
+            .reader_builder()
+            .reload_policy(tantivy::ReloadPolicy::Manual)
+            .try_into()
+            .unwrap();
+
+        let engine = SearchEngine {
+            index,
+            schema,
+            fields,
+            reader,
+            writer,
+        };
+        let engine = Arc::new(std::sync::Mutex::new(engine));
+
+        // Channels
+        let (msg_tx, msg_rx) = crossbeam::channel::bounded::<IndexerMessage>(100);
+        let (tag_tx, tag_rx) = crossbeam::channel::bounded::<TagUpdate>(100);
+        let (progress_tx, _progress_rx) = crossbeam::channel::bounded::<IndexerProgress>(100);
+
+        // Create a temp file that exists on disk (needed for process_upsert)
+        let tmp_file_dir = tempfile::TempDir::new().unwrap();
+        let file_path = tmp_file_dir.path().join("shutdown_test.txt");
+        std::fs::write(&file_path, "document content for shutdown test").unwrap();
+        let metadata = std::fs::metadata(&file_path).unwrap();
+
+        // Send an Upsert message through the channel so the pipeline processes it
+        msg_tx
+            .send(IndexerMessage::Upsert {
+                path: file_path.clone(),
+                mtime: metadata
+                    .modified()
+                    .unwrap()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs(),
+                size: metadata.len(),
+            })
+            .unwrap();
+
+        // Drop senders to signal shutdown AFTER the upsert message is in the queue
+        drop(msg_tx);
+        drop(tag_tx);
+
+        // Create pipeline — it will process the Upsert then hit Disconnected
+        let mut pipeline = Pipeline::new(engine.clone(), store, msg_rx, tag_rx, progress_tx);
+
+        // Run should process the document, then shutdown and commit
+        pipeline.run();
+
+        // After shutdown, the document should be committed.
+        // Reader uses ReloadPolicy::Manual — must reload to see committed docs.
+        {
+            let mut eng = engine.lock().unwrap();
+            eng.reload().unwrap();
+            let count = eng.doc_count().unwrap();
+            assert!(
+                count > 0,
+                "Document should be committed after pipeline shutdown"
+            );
+        }
+    }
 }

@@ -1,5 +1,5 @@
 use std::path::{Path, PathBuf};
-use tantivy::collector::TopDocs;
+use tantivy::collector::{Count, MultiCollector, TopDocs};
 use tantivy::directory::MmapDirectory;
 use tantivy::query::{BooleanQuery, Occur, Query, TermQuery};
 use tantivy::schema::*;
@@ -12,12 +12,12 @@ use crate::error::Result;
 
 /// Manages the Tantivy search index lifecycle.
 pub struct SearchEngine {
-    index: Index,
-    schema: Schema,
-    fields: SchemaFields,
+    pub(crate) index: Index,
+    pub(crate) schema: Schema,
+    pub(crate) fields: SchemaFields,
     /// Lock-free reader — clone for UI thread without Mutex contention.
     pub reader: IndexReader,
-    writer: IndexWriter,
+    pub(crate) writer: IndexWriter,
 }
 
 impl SearchEngine {
@@ -233,8 +233,14 @@ pub fn search_with_reader(
         Box::new(BooleanQuery::new(subqueries))
     };
 
-    let top_docs = searcher.search(&query, &TopDocs::with_limit(request.limit))?;
-    let total_hits = top_docs.len();
+    // Use MultiCollector to get both limited results AND true total count
+    let mut multi = MultiCollector::new();
+    let count_handle = multi.add_collector(Count);
+    let top_docs_handle = multi.add_collector(TopDocs::with_limit(request.limit));
+
+    let mut multi_fruit = searcher.search(&query, &multi)?;
+    let total_hits = count_handle.extract(&mut multi_fruit);
+    let top_docs = top_docs_handle.extract(&mut multi_fruit);
 
     let mut items = Vec::new();
     for (_score, doc_address) in top_docs {
@@ -473,20 +479,129 @@ mod tests {
         engine.commit().unwrap();
         engine.reload().unwrap();
 
-        // With limit 2, items are capped but total_hits is also cap (TopDocs limitation)
-        // For v1, overflow is detected when total_hits == limit
+        // With limit 2, items are capped at 2 but total_hits reflects actual count
         let results = engine
             .search(&SearchRequest::new("common".into()).with_limit(2))
             .unwrap();
         assert_eq!(results.items.len(), 2);
-        // total_hits reflects the actual count from TopDocs (capped by limit)
-        assert_eq!(results.total_hits, 2);
-        // Overflow detected: total == limit means there may be more
+        // total_hits is the true count from Count collector (not capped by limit)
+        assert_eq!(results.total_hits, 5);
     }
 
     #[test]
     fn garbage_collect_does_not_crash() {
         let (mut engine, _dir) = create_test_engine();
         engine.garbage_collect().unwrap();
+    }
+
+    #[test]
+    fn open_or_create_opens_existing_index() {
+        use tantivy::doc;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let schema = build_schema();
+        let fields = SchemaFields::from_schema(&schema);
+
+        // First call: create the index and add a document
+        let index = Index::create_in_dir(dir.path(), schema.clone()).unwrap();
+        let tokenizer = TextAnalyzer::builder(tantivy::tokenizer::SimpleTokenizer::default())
+            .filter(tantivy::tokenizer::LowerCaser)
+            .build();
+        index.tokenizers().register("body", tokenizer);
+
+        {
+            let mut writer = index.writer(50_000_000).unwrap();
+            writer
+                .add_document(doc!(
+                    fields.doc_id => "hash1pdf",
+                    fields.file_path => "/test/doc.pdf",
+                    fields.file_name => "doc.pdf",
+                    fields.body => "persistent document content",
+                    fields.file_type => "pdf",
+                    fields.modified_ts => 1700000000i64,
+                    fields.content_hash => "hash1",
+                ))
+                .unwrap();
+            writer.commit().unwrap();
+        }
+
+        // Drop first index to release file locks
+        drop(index);
+
+        // Second call: open the existing index — should find the document
+        let dir = tantivy::directory::MmapDirectory::open(dir.path()).unwrap();
+        let index2 = Index::open(dir).unwrap();
+        let reader: IndexReader = index2
+            .reader_builder()
+            .reload_policy(ReloadPolicy::Manual)
+            .try_into()
+            .unwrap();
+        reader.reload().unwrap();
+
+        let searcher = reader.searcher();
+        assert_eq!(
+            searcher.num_docs(),
+            1,
+            "Opening existing index should preserve documents"
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn search_performance_with_10k_docs() {
+        use std::time::Instant;
+        use tantivy::doc;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let schema = build_schema();
+        let fields = SchemaFields::from_schema(&schema);
+        let index = Index::create_in_dir(dir.path(), schema.clone()).unwrap();
+
+        let tokenizer = TextAnalyzer::builder(tantivy::tokenizer::SimpleTokenizer::default())
+            .filter(tantivy::tokenizer::LowerCaser)
+            .build();
+        index.tokenizers().register("body", tokenizer);
+
+        let mut writer = index.writer(50_000_000).unwrap();
+
+        // Index 10K documents
+        for i in 0..10_000 {
+            let body = format!("document number {} contains various terms", i);
+            writer
+                .add_document(doc!(
+                    fields.doc_id => format!("hash{}pdf", i),
+                    fields.file_path => format!("/test/doc{}.pdf", i),
+                    fields.file_name => format!("doc{}.pdf", i),
+                    fields.body => body,
+                    fields.file_type => "pdf",
+                    fields.modified_ts => (1700000000i64 + i as i64),
+                    fields.content_hash => format!("hash{}", i),
+                ))
+                .unwrap();
+        }
+        writer.commit().unwrap();
+
+        let reader: IndexReader = index
+            .reader_builder()
+            .reload_policy(ReloadPolicy::Manual)
+            .try_into()
+            .unwrap();
+        reader.reload().unwrap();
+
+        // Search should complete quickly
+        let start = Instant::now();
+        let request = SearchRequest::new("document".into());
+        let results = search_with_reader(&fields, &reader, &request).unwrap();
+        let elapsed = start.elapsed();
+
+        assert!(!results.items.is_empty(), "Should find matching documents");
+
+        // Warn if search takes >50ms
+        if elapsed.as_millis() > 50 {
+            eprintln!(
+                "WARNING: search_performance_with_10k_docs took {}ms (>50ms target)",
+                elapsed.as_millis()
+            );
+        }
     }
 }

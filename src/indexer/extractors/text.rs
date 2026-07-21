@@ -100,4 +100,52 @@ mod tests {
         let result = extractor.extract(&path).unwrap().unwrap();
         assert!(result.text.is_empty());
     }
+
+    #[test]
+    fn extract_log_returns_content() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("app.log");
+        fs::write(&path, "[INFO] Application started\n[WARN] Disk space low\n").unwrap();
+
+        let extractor = TextExtractor;
+        let result = extractor.extract(&path).unwrap().unwrap();
+        assert!(result.text.contains("Application started"));
+        assert!(result.text.contains("Disk space low"));
+    }
+
+    #[test]
+    fn extract_non_utf8_lossy_decode() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("latin1.txt");
+        // Write Latin-1 encoded bytes that are NOT valid UTF-8
+        // 0xE9 = é in Latin-1, but invalid standalone byte in UTF-8
+        let bytes: Vec<u8> = vec![
+            0x48, 0x65, 0x6C, 0x6C, 0x6F, 0x20, // "Hello "
+            0xE9, // invalid UTF-8 byte (would be part of 3-byte sequence)
+            0x20, 0x77, 0x6F, 0x72, 0x6C, 0x64, // " world"
+        ];
+        fs::write(&path, &bytes).unwrap();
+
+        let extractor = TextExtractor;
+        let result = extractor.extract(&path).unwrap().unwrap();
+        // Should decode with lossy replacement — no crash, text is present
+        assert!(
+            !result.text.is_empty(),
+            "Should produce some text via lossy decode"
+        );
+        assert!(
+            result.text.contains("Hello"),
+            "Should contain ASCII prefix, got: {}",
+            result.text
+        );
+    }
+
+    #[test]
+    fn extract_missing_file_returns_error() {
+        let path = std::path::Path::new("/nonexistent/path/that/cannot/exist/file.txt");
+
+        let extractor = TextExtractor;
+        let result = extractor.extract(path);
+        assert!(result.is_err(), "Missing file should return an error");
+    }
 }

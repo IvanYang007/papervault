@@ -89,6 +89,17 @@ mod tests {
     }
 
     #[test]
+    fn schema_rejects_duplicate_field_names() {
+        let mut builder = Schema::builder();
+        builder.add_text_field("dup_field", STRING | STORED);
+        // Tantivy panics when adding a field with a duplicate name
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            builder.add_text_field("dup_field", STRING | STORED);
+        }));
+        assert!(result.is_err(), "Duplicate field names should be rejected");
+    }
+
+    #[test]
     fn content_hash_field_is_indexed_str() {
         let schema = build_schema();
         let field = schema.get_field("content_hash").unwrap();
