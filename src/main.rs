@@ -1,4 +1,7 @@
+#![windows_subsystem = "windows"]
+
 use crossbeam::channel;
+
 use std::panic;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};

@@ -192,10 +192,23 @@ pub fn search_with_reader(
     let mut subqueries: Vec<(Occur, Box<dyn Query>)> = Vec::new();
 
     for term in &terms {
-        let t = Term::from_field_text(fields.body, &term.to_lowercase());
+        let lower = term.to_lowercase();
+        // Each term matches body OR file_name (Should = OR)
+        let mut term_subqueries: Vec<(Occur, Box<dyn Query>)> = Vec::new();
+        let body_term = Term::from_field_text(fields.body, &lower);
+        term_subqueries.push((
+            Occur::Should,
+            Box::new(TermQuery::new(body_term, IndexRecordOption::Basic)),
+        ));
+        let file_term = Term::from_field_text(fields.file_name, &lower);
+        term_subqueries.push((
+            Occur::Should,
+            Box::new(TermQuery::new(file_term, IndexRecordOption::Basic)),
+        ));
+        // Wrap in a BooleanQuery — at least one Should clause must match
         subqueries.push((
             Occur::Must,
-            Box::new(TermQuery::new(t, IndexRecordOption::Basic)),
+            Box::new(BooleanQuery::new(term_subqueries)),
         ));
     }
 
