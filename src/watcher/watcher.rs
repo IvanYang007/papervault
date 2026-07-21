@@ -105,6 +105,7 @@ fn emit_initial_scan(folder: &PathBuf, tx: &Sender<IndexerMessage>) -> anyhow::R
         }
     };
 
+    let mut count = 0u64;
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_file() && is_supported_extension(&path) {
@@ -122,8 +123,14 @@ fn emit_initial_scan(folder: &PathBuf, tx: &Sender<IndexerMessage>) -> anyhow::R
                     mtime,
                     size: meta.len(),
                 });
+                count += 1;
             }
         }
+    }
+    if count > 0 {
+        info!("Initial scan: queued {} files in {}", count, folder.display());
+    } else {
+        info!("Initial scan: no supported files found in {}", folder.display());
     }
     Ok(())
 }

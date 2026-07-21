@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tantivy::schema::Value;
 use tantivy::DocAddress;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::app::{IndexerProgress, TagUpdate};
 use crate::indexer::stages;
@@ -55,11 +55,14 @@ impl Pipeline {
         let mut last_commit = Instant::now();
         let commit_interval = Duration::from_secs(2);
 
+        info!("Pipeline started, waiting for messages...");
+
         loop {
             // Use recv_timeout to periodically check commit timer even when idle
             match self.msg_rx.recv_timeout(Duration::from_millis(500)) {
                 Ok(msg) => match msg {
                     IndexerMessage::Upsert { path, mtime, size } => {
+                        debug!("Pipeline upsert: {}", path.display());
                         match self.process_upsert(&path, mtime, size, &stages) {
                             Ok(()) => {
                                 total_processed += 1;
@@ -78,6 +81,7 @@ impl Pipeline {
                         }
                     }
                     IndexerMessage::Delete { path } => {
+                        debug!("Pipeline delete: {}", path.display());
                         if let Err(e) = self.process_delete(&path) {
                             error!("Delete error for {}: {}", path.display(), e);
                         }
@@ -87,6 +91,7 @@ impl Pipeline {
                     // Timer tick — check if we should commit
                 }
                 Err(crossbeam::channel::RecvTimeoutError::Disconnected) => {
+                    info!("Pipeline channel disconnected, shutting down...");
                     break; // Watcher channel closed — shutdown
                 }
             }
@@ -101,6 +106,7 @@ impl Pipeline {
                 || (self.pending_count > 0 && last_commit.elapsed() >= commit_interval);
 
             if should_commit {
+                debug!("Pipeline committing {} pending docs...", self.pending_count);
                 if let Err(e) = self.commit() {
                     error!("Commit error: {}", e);
                 }

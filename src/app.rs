@@ -190,8 +190,10 @@ impl PapervaultApp {
             self.status_message = "Tag store not available — cannot index.".to_string();
             return;
         };
+        tracing::info!("Starting folder runtime for: {}", folder.display());
         match FolderRuntime::start(folder, tag_store) {
             Ok(runtime) => {
+                tracing::info!("Folder runtime started successfully for: {}", folder.display());
                 self.search_reader = Some(runtime.search_reader.clone());
                 self.search_fields = Some(runtime.search_fields.clone());
                 self.search_engine = Some(runtime.search_engine.clone());

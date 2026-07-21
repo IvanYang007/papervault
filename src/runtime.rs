@@ -3,6 +3,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
+use tracing::info;
+
 use crossbeam::channel::{self, Receiver, Sender};
 
 use crate::app::{IndexerProgress, RenderRequest, RenderResult, TagUpdate};
@@ -72,7 +74,9 @@ impl FolderRuntime {
         let watcher_shutdown = Arc::new(AtomicBool::new(false));
 
         // ── Startup Reconciliation ──
+        info!("Running startup reconciliation...");
         pipeline::reconcile(engine.clone(), tag_store);
+        info!("Reconciliation complete.");
 
         // ── Background Threads ──
         // Indexer
