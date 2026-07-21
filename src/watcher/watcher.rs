@@ -1,7 +1,10 @@
+use crate::indexer::extractors::SUPPORTED_EXTENSIONS;
 use crossbeam::channel::Sender;
 use notify_debouncer_full::notify::*;
 use notify_debouncer_full::DebounceEventResult;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 use tracing::{error, info, warn};
 
@@ -20,11 +23,15 @@ pub enum IndexerMessage {
 
 /// Start watching a directory for changes.
 /// Sends `IndexerMessage` variants to the provided channel.
-pub fn start_watching(folder: PathBuf, tx: Sender<IndexerMessage>) -> anyhow::Result<()> {
-    let extensions: Vec<String> = vec!["pdf".into(), "txt".into(), "md".into(), "log".into()];
-
+/// The `shutdown` flag signals the watcher to stop; when set, the debouncer
+/// is dropped (closing the channel) and the function returns.
+pub fn start_watching(
+    folder: PathBuf,
+    tx: Sender<IndexerMessage>,
+    shutdown: Arc<AtomicBool>,
+) -> anyhow::Result<()> {
     // Emit initial scan events for existing files
-    emit_initial_scan(&folder, &extensions, &tx)?;
+    emit_initial_scan(&folder, &tx)?;
 
     let event_handler = move |result: DebounceEventResult| match result {
         Ok(events) => {
@@ -32,7 +39,7 @@ pub fn start_watching(folder: PathBuf, tx: Sender<IndexerMessage>) -> anyhow::Re
                 match event.kind {
                     EventKind::Create(_) | EventKind::Modify(_) => {
                         for path in &event.paths {
-                            if is_supported_extension(path, &extensions) {
+                            if is_supported_extension(path) {
                                 if let Ok(meta) = std::fs::metadata(path) {
                                     let mtime = meta
                                         .modified()
@@ -54,7 +61,7 @@ pub fn start_watching(folder: PathBuf, tx: Sender<IndexerMessage>) -> anyhow::Re
                     }
                     EventKind::Remove(_) => {
                         for path in &event.paths {
-                            if is_supported_extension(path, &extensions) {
+                            if is_supported_extension(path) {
                                 let _ = tx.send(IndexerMessage::Delete { path: path.clone() });
                             }
                         }
@@ -74,19 +81,23 @@ pub fn start_watching(folder: PathBuf, tx: Sender<IndexerMessage>) -> anyhow::Re
         notify_debouncer_full::new_debouncer(Duration::from_millis(500), None, event_handler)?;
 
     debouncer.watch(&folder, RecursiveMode::NonRecursive)?;
-
-    // The debouncer must stay alive for the app's lifetime.
-    // Box::leak makes the intentional ownership transfer explicit.
-    let _ = Box::leak(Box::new(debouncer));
-
     info!("Watching folder: {}", folder.display());
+
+    // Keep the debouncer alive until shutdown is signaled.
+    // Dropping the debouncer closes the sender channel, which signals the
+    // indexer to shut down gracefully.
+    while !shutdown.load(Ordering::Relaxed) {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    // debouncer drops here → sender channel closes → indexer shuts down
+    info!("Watcher stopped");
     Ok(())
 }
 
 /// Emit events for all existing supported files in the folder.
 fn emit_initial_scan(
     folder: &PathBuf,
-    extensions: &[String],
     tx: &Sender<IndexerMessage>,
 ) -> anyhow::Result<()> {
     let entries = match std::fs::read_dir(folder) {
@@ -99,7 +110,7 @@ fn emit_initial_scan(
 
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.is_file() && is_supported_extension(&path, extensions) {
+        if path.is_file() && is_supported_extension(&path) {
             if let Ok(meta) = entry.metadata() {
                 let mtime = meta
                     .modified()
@@ -120,9 +131,9 @@ fn emit_initial_scan(
     Ok(())
 }
 
-fn is_supported_extension(path: &PathBuf, extensions: &[String]) -> bool {
+fn is_supported_extension(path: &PathBuf) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
-        .map(|ext| extensions.iter().any(|ex| ex.eq_ignore_ascii_case(ext)))
+        .map(|ext| SUPPORTED_EXTENSIONS.iter().any(|ex| ex.eq_ignore_ascii_case(ext)))
         .unwrap_or(false)
 }

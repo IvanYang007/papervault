@@ -62,8 +62,6 @@ impl SchemaFields {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tantivy::schema::*;
-
     #[test]
     fn schema_has_all_required_fields() {
         let schema = build_schema();

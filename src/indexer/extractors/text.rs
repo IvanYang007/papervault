@@ -1,4 +1,4 @@
-use super::{ExtractedContent, Extractor};
+use super::{ExtractedContent, Extractor, SUPPORTED_EXTENSIONS};
 use anyhow::{Context, Result};
 use std::fs;
 use std::path::Path;
@@ -10,7 +10,9 @@ impl Extractor for TextExtractor {
     fn extract(&self, path: &Path) -> Result<Option<ExtractedContent>> {
         // Determine if this is a text file we handle
         let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-        let is_text = matches!(ext.to_lowercase().as_str(), "txt" | "md" | "log");
+        let is_text = SUPPORTED_EXTENSIONS
+            .iter()
+            .any(|e| e.eq_ignore_ascii_case(ext) && *e != "pdf");
 
         if !is_text {
             return Ok(None);

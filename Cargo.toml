@@ -21,12 +21,13 @@ thiserror = "2"
 dirs-next = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-lopdf = "0.34"
 chrono = "0.4"
+rfd = { version = "0.14", default-features = false, features = ["file-handle-inner"] }
 
 [dev-dependencies]
 tempfile = "3"
 printpdf = "0.7"
+lopdf = "0.34"
 
 ## Benchmarks (requires nightly)
 ## [[bench]]

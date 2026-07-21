@@ -47,6 +47,7 @@ pub struct SearchResult {
     pub file_type: String,
     pub snippet: String,
     pub match_count: usize,
+    pub match_terms: Vec<String>,
     pub content_hash: String,
     pub tags: Vec<String>,
 }

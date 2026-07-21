@@ -210,7 +210,6 @@ impl TagStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
     use std::thread;
 
     /// Create a TagStore backed by a temp-file database with schema initialized.

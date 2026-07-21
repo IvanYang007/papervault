@@ -4,7 +4,7 @@ use tantivy::directory::MmapDirectory;
 use tantivy::query::{BooleanQuery, Occur, Query, TermQuery};
 use tantivy::schema::*;
 use tantivy::tokenizer::*;
-use tantivy::{doc, Index, IndexReader, IndexWriter, ReloadPolicy, TantivyDocument};
+use tantivy::{doc, Index, IndexReader, IndexWriter, ReloadPolicy, SnippetGenerator, TantivyDocument};
 
 use super::query::{SearchRequest, SearchResult, SearchResults};
 use super::schema::{build_schema, SchemaFields};
@@ -98,35 +98,7 @@ impl SearchEngine {
         search_with_reader(&self.fields, &self.reader, request)
     }
 
-    /// Generate a snippet from the stored body text with query term highlighting.
-    fn generate_snippet(&self, doc: &TantivyDocument, query: &str) -> String {
-        let body_text = doc
-            .get_first(self.fields.body)
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
 
-        if body_text.is_empty() {
-            return String::new();
-        }
-
-        // Simple highlighting: find query terms in text and wrap in markers
-        let terms: Vec<&str> = query.split_whitespace().collect();
-        let mut snippet = body_text.chars().take(200).collect::<String>();
-        if body_text.len() > 200 {
-            snippet.push_str("...");
-        }
-
-        for term in &terms {
-            let lower_term = term.to_lowercase();
-            // Highlight by adding ▶/◀ markers around matches
-            if snippet.to_lowercase().contains(&lower_term) {
-                // Simple approach: the UI will render these as highlights
-                // In production, use Tantivy's SnippetGenerator for proper context
-            }
-        }
-
-        snippet
-    }
 
     /// Index or update a document in Tantivy.
     pub fn index_document(
@@ -242,6 +214,15 @@ pub fn search_with_reader(
     let total_hits = count_handle.extract(&mut multi_fruit);
     let top_docs = top_docs_handle.extract(&mut multi_fruit);
 
+    // Build snippet generator for context-aware, match-centered snippets
+    let snippet_gen = SnippetGenerator::create(&searcher, query.as_ref(), fields.body)?;
+
+    let match_terms: Vec<String> = request
+        .query
+        .split_whitespace()
+        .map(|s| s.to_lowercase())
+        .collect();
+
     let mut items = Vec::with_capacity(request.limit);
     for (_score, doc_address) in top_docs {
         let doc: TantivyDocument = searcher.doc(doc_address)?;
@@ -275,19 +256,26 @@ pub fn search_with_reader(
             .filter_map(|v| v.as_str().map(|s| s.to_string()))
             .collect();
 
-        let match_count = doc.get_all(fields.body).count();
+        // Context-aware snippet via SnippetGenerator
+        let tantivy_snippet = snippet_gen.snippet_from_doc(&doc);
+        let fragment = tantivy_snippet.fragment();
+        let match_count = if fragment.is_empty() { 0 } else { 1 };
 
-        // Simple snippet: first 200 chars of body
-        let body_text = doc
-            .get_first(fields.body)
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        let snippet = if body_text.len() > 200 {
-            let mut s = body_text.chars().take(200).collect::<String>();
-            s.push_str("...");
-            s
+        let snippet = if fragment.is_empty() {
+            // Fallback: first 200 chars of body
+            let body_text = doc
+                .get_first(fields.body)
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if body_text.len() > 200 {
+                let mut s = body_text.chars().take(200).collect::<String>();
+                s.push_str("...");
+                s
+            } else {
+                body_text.to_string()
+            }
         } else {
-            body_text.to_string()
+            fragment.to_string()
         };
 
         items.push(SearchResult {
@@ -296,6 +284,7 @@ pub fn search_with_reader(
             file_type,
             snippet,
             match_count,
+            match_terms: match_terms.clone(),
             content_hash,
             tags,
         });

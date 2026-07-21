@@ -3,12 +3,15 @@ use crate::search::engine::SearchEngine;
 use crate::search::query::{SearchRequest, SearchResult};
 use crate::tags::model::Tag;
 use crate::tags::store::TagStore;
+use crate::watcher::watcher::IndexerMessage;
 use crossbeam::channel::{Receiver, Sender};
 use egui::{
     CentralPanel, Color32, Frame, RichText, ScrollArea, SidePanel, TextEdit, TopBottomPanel,
 };
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 /// Messages from the indexer thread to the UI thread.
 #[derive(Debug, Clone)]
@@ -79,11 +82,21 @@ pub struct PapervaultApp {
     active_tag_filters: Vec<String>,
     tag_panel_open: bool,
     new_tag_name: String,
+    /// Persistent text input for the folder picker dialog.
+    folder_picker_input: String,
     // Indexing progress
     indexing_total: usize,
     indexing_done: usize,
     // Pending click target (resolved outside results loop to avoid borrow conflict)
     clicked_index: Option<usize>,
+    // PDF page navigation
+    current_page: usize,
+    // Graceful shutdown: signals watcher to stop, closing the channel to indexer
+    watcher_shutdown_flag: Option<Arc<AtomicBool>>,
+    watcher_shutdown_tx: Option<Sender<IndexerMessage>>,
+    // Debounced search-as-you-type
+    last_search_instant: Option<Instant>,
+    pending_search: Option<String>,
 }
 
 impl PapervaultApp {
@@ -96,6 +109,8 @@ impl PapervaultApp {
         render_tx: Option<Sender<RenderRequest>>,
         render_rx: Option<Receiver<RenderResult>>,
         tag_store: Option<TagStore>,
+        watcher_shutdown_flag: Option<Arc<AtomicBool>>,
+        watcher_shutdown_tx: Option<Sender<IndexerMessage>>,
     ) -> Self {
         let status = if config.watched_folder.is_some() && search_engine.is_some() {
             "Ready".to_string()
@@ -124,9 +139,15 @@ impl PapervaultApp {
             active_tag_filters: Vec::new(),
             tag_panel_open: false,
             new_tag_name: String::new(),
+            folder_picker_input: String::new(),
             indexing_total: 0,
             indexing_done: 0,
             clicked_index: None,
+            current_page: 1,
+            watcher_shutdown_flag,
+            watcher_shutdown_tx,
+            last_search_instant: None,
+            pending_search: None,
         }
     }
 
@@ -163,10 +184,35 @@ impl PapervaultApp {
                 .as_ref()
                 .map(|e| e.lock().unwrap().fields().clone());
             if let Some(ref fields) = fields_opt {
-                let request =
-                    SearchRequest::new(query.clone()).with_tags(self.active_tag_filters.clone());
+                // Don't pass tag filters to Tantivy — Tantivy tags may be stale.
+                // Instead, post-filter using SQLite which always has the truth.
+                let limit = if self.active_tag_filters.is_empty() {
+                    50
+                } else {
+                    200 // Higher limit for post-filter headroom
+                };
+                let request = SearchRequest::new(query.clone()).with_limit(limit);
                 match crate::search::engine::search_with_reader(fields, reader, &request) {
-                    Ok(results) => {
+                    Ok(mut results) => {
+                        // Post-filter by tags using SQLite (always up-to-date)
+                        if !self.active_tag_filters.is_empty() {
+                            if let Some(ref store) = self.tag_store {
+                                results.items.retain(|result| {
+                                    match store.get_tags_for_document(&result.content_hash) {
+                                        Ok(tags) => {
+                                            let names: Vec<&str> =
+                                                tags.iter().map(|t| t.name.as_str()).collect();
+                                            self.active_tag_filters
+                                                .iter()
+                                                .all(|f| names.contains(&f.as_str()))
+                                        }
+                                        Err(_) => false,
+                                    }
+                                });
+                            }
+                            results.items.truncate(50);
+                            results.total_hits = results.items.len();
+                        }
                         self.total_hits = results.total_hits;
                         self.search_results = results.items;
                     }
@@ -184,26 +230,17 @@ impl PapervaultApp {
             return;
         }
         self.selected_result = Some(index);
-        let result = &self.search_results[index];
-        let path = PathBuf::from(&result.file_path);
+        self.current_page = 1;
+        let is_pdf = self.search_results[index].file_type == "pdf";
+        let file_path = self.search_results[index].file_path.clone();
+        let file_type = self.search_results[index].file_type.clone();
 
-        if result.file_type == "pdf" {
-            if let Some(ref tx) = self.render_request_tx {
-                let request = RenderRequest {
-                    path,
-                    page: 1,
-                    search_terms: self
-                        .search_query
-                        .split_whitespace()
-                        .map(|s| s.to_string())
-                        .collect(),
-                };
-                let _ = tx.send(request);
-            }
+        if is_pdf {
+            self.request_page_render();
             self.preview_text = None;
         } else {
             self.preview_texture = None;
-            match std::fs::read_to_string(&result.file_path) {
+            match std::fs::read_to_string(&file_path) {
                 Ok(content) => {
                     self.preview_text = Some(content);
                 }
@@ -212,7 +249,30 @@ impl PapervaultApp {
                 }
             }
         }
-        self.preview_file_type = Some(result.file_type.clone());
+        self.preview_file_type = Some(file_type);
+    }
+
+    /// Send a render request for the current page of the selected result.
+    fn request_page_render(&mut self) {
+        let Some(selected) = self.selected_result else {
+            return;
+        };
+        if selected >= self.search_results.len() {
+            return;
+        }
+        let result = &self.search_results[selected];
+        if let Some(ref tx) = self.render_request_tx {
+            let request = RenderRequest {
+                path: PathBuf::from(&result.file_path),
+                page: self.current_page,
+                search_terms: self
+                    .search_query
+                    .split_whitespace()
+                    .map(|s| s.to_string())
+                    .collect(),
+            };
+            let _ = tx.send(request);
+        }
     }
 
     /// Poll for render results and indexer progress.
@@ -309,26 +369,130 @@ impl PapervaultApp {
             self.do_search();
         }
     }
+
+    /// Render a snippet with matched terms highlighted in gold.
+    fn render_highlighted_snippet(ui: &mut egui::Ui, snippet: &str, match_terms: &[String]) {
+        if match_terms.is_empty() {
+            ui.label(RichText::new(snippet).small().color(Color32::GRAY));
+            return;
+        }
+
+        let lower_snippet = snippet.to_lowercase();
+        let mut spans: Vec<(usize, usize)> = Vec::new();
+
+        // Find all match positions (case-insensitive)
+        for term in match_terms {
+            let lower_term = term.to_lowercase();
+            if lower_term.is_empty() {
+                continue;
+            }
+            let mut search_start = 0;
+            while let Some(pos) = lower_snippet[search_start..].find(&lower_term) {
+                let abs_start = search_start + pos;
+                let abs_end = abs_start + lower_term.len();
+                spans.push((abs_start, abs_end));
+                search_start = abs_end;
+            }
+        }
+
+        if spans.is_empty() {
+            ui.label(RichText::new(snippet).small().color(Color32::GRAY));
+            return;
+        }
+
+        // Sort and merge overlapping spans
+        spans.sort_by_key(|s| s.0);
+        let mut merged: Vec<(usize, usize)> = Vec::new();
+        for span in spans {
+            if let Some(last) = merged.last_mut() {
+                if span.0 <= last.1 {
+                    last.1 = last.1.max(span.1);
+                } else {
+                    merged.push(span);
+                }
+            } else {
+                merged.push(span);
+            }
+        }
+
+        // Render segments with alternating colors
+        ui.horizontal(|ui| {
+            let mut cursor = 0;
+            for (start, end) in &merged {
+                if cursor < *start {
+                    ui.label(
+                        RichText::new(&snippet[cursor..*start])
+                            .small()
+                            .color(Color32::GRAY),
+                    );
+                }
+                ui.label(
+                    RichText::new(&snippet[*start..*end])
+                        .small()
+                        .color(Color32::BLACK)
+                        .background_color(Color32::from_rgb(255, 215, 0)),
+                );
+                cursor = *end;
+            }
+            if cursor < snippet.len() {
+                ui.label(
+                    RichText::new(&snippet[cursor..])
+                        .small()
+                        .color(Color32::GRAY),
+                );
+            }
+        });
+    }
 }
 
 impl eframe::App for PapervaultApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_channels(ctx);
 
+        // Debounced search: execute when 150ms has elapsed since last keystroke
+        if let (Some(ref pending), Some(ref instant)) =
+            (&self.pending_search, &self.last_search_instant)
+        {
+            let elapsed = instant.elapsed();
+            if elapsed >= std::time::Duration::from_millis(150) {
+                if self.search_query == *pending {
+                    self.do_search();
+                    self.pending_search = None;
+                    self.last_search_instant = None;
+                }
+            } else {
+                ctx.request_repaint_after(std::time::Duration::from_millis(150) - elapsed);
+            }
+        }
+
         // ── Top bar: search ──
         TopBottomPanel::top("search_bar").show(ctx, |ui| {
             ui.horizontal(|ui| {
+                let engine_available = self.search_engine.is_some();
                 ui.label("🔍");
-                let resp = ui.add_sized(
-                    [ui.available_width() - 180.0, 24.0],
-                    TextEdit::singleline(&mut self.search_query).hint_text("Search documents..."),
-                );
+                let resp = ui
+                    .add_enabled_ui(engine_available, |ui| {
+                        ui.add_sized(
+                            [ui.available_width() - 180.0, 24.0],
+                            TextEdit::singleline(&mut self.search_query)
+                                .hint_text("Search documents..."),
+                        )
+                    })
+                    .inner;
                 if resp.changed() {
-                    self.do_search();
+                    self.pending_search = Some(self.search_query.clone());
+                    self.last_search_instant = Some(Instant::now());
+                    ctx.request_repaint_after(std::time::Duration::from_millis(50));
                 }
 
                 if ui.button("📁 Folder").clicked() {
                     self.folder_picker_open = true;
+                    self.folder_picker_input = self
+                        .config
+                        .watched_folder
+                        .as_ref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_default();
                 }
                 if ui.button("🏷 Tags").clicked() {
                     self.tag_panel_open = !self.tag_panel_open;
@@ -447,7 +611,11 @@ impl eframe::App for PapervaultApp {
                                 });
                             }
 
-                            ui.label(RichText::new(&result.snippet).small().color(Color32::GRAY));
+                            Self::render_highlighted_snippet(
+                                ui,
+                                &result.snippet,
+                                &result.match_terms,
+                            );
                         });
                     }
                 });
@@ -460,7 +628,23 @@ impl eframe::App for PapervaultApp {
 
         // ── Center: preview ──
         CentralPanel::default().show(ctx, |ui| {
-            if self.config.watched_folder.is_none() {
+            if self.config.watched_folder.is_some() && self.search_engine.is_none() {
+                ui.vertical_centered(|ui| {
+                    ui.add_space(40.0);
+                    ui.colored_label(
+                        Color32::RED,
+                        format!(
+                            "Search engine failed to initialize for {}",
+                            self.config
+                                .watched_folder
+                                .as_ref()
+                                .map(|p| p.display().to_string())
+                                .unwrap_or_default(),
+                        ),
+                    );
+                    ui.label("The index may be corrupted. Try re-selecting the folder.");
+                });
+            } else if self.config.watched_folder.is_none() {
                 ui.vertical_centered(|ui| {
                     ui.add_space(100.0);
                     ui.heading("Papervault");
@@ -472,10 +656,37 @@ impl eframe::App for PapervaultApp {
                     ui.add_space(100.0);
                     ui.label("Type a search query to find documents.");
                 });
-            } else if let Some(ref texture) = self.preview_texture {
+            } else if self.search_results.is_empty() && !self.search_query.trim().is_empty() {
+                ui.vertical_centered(|ui| {
+                    ui.add_space(40.0);
+                    ui.label(format!("No results for '{}'", self.search_query.trim()));
+                    ui.label("Try different terms or remove tag filters.");
+                });
+            } else if self.preview_texture.is_some() {
+                let is_pdf = self.preview_file_type.as_deref() == Some("pdf");
+                let current_page = self.current_page;
+
+                // PDF page navigation (before preview borrow)
+                if is_pdf {
+                    ui.horizontal(|ui| {
+                        if ui.button("◀ Prev").clicked() && current_page > 1 {
+                            self.current_page -= 1;
+                            self.request_page_render();
+                        }
+                        ui.label(format!("Page {}", self.current_page));
+                        if ui.button("Next ▶").clicked() {
+                            self.current_page += 1;
+                            self.request_page_render();
+                        }
+                    });
+                    ui.separator();
+                }
+
+                let tex_id = self.preview_texture.as_ref().unwrap().id();
+                let tex_size = self.preview_texture.as_ref().unwrap().size_vec2();
                 ui.image(egui::ImageSource::Texture(egui::load::SizedTexture::new(
-                    texture.id(),
-                    texture.size_vec2(),
+                    tex_id,
+                    tex_size,
                 )));
             } else if let Some(ref text) = self.preview_text {
                 ScrollArea::vertical().show(ui, |ui| {
@@ -496,24 +707,29 @@ impl eframe::App for PapervaultApp {
                 .resizable(false)
                 .show(ctx, |ui| {
                     ui.label("Enter the folder path to watch:");
-                    let mut path_str = self
-                        .config
-                        .watched_folder
-                        .as_ref()
-                        .map(|p| p.display().to_string())
-                        .unwrap_or_default();
-                    if ui.text_edit_singleline(&mut path_str).lost_focus()
-                        || ui.button("Set Folder").clicked()
-                    {
-                        let path = PathBuf::from(&path_str);
+                    ui.horizontal(|ui| {
+                        ui.add_sized(
+                            [250.0, 20.0],
+                            TextEdit::singleline(&mut self.folder_picker_input),
+                        );
+                        if ui.button("Browse...").clicked() {
+                            if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                                self.folder_picker_input = path.display().to_string();
+                            }
+                        }
+                    });
+                    if ui.button("Set Folder").clicked() {
+                        let path = PathBuf::from(&self.folder_picker_input);
                         if path.exists() && path.is_dir() {
                             self.config.watched_folder = Some(path);
                             let _ = self.config.save();
                             self.init_search_engine();
                             self.folder_picker_open = false;
-                            self.status_message = format!("Watching: {}", path_str);
+                            self.status_message =
+                                format!("Watching: {}", self.folder_picker_input);
                         } else {
-                            self.status_message = format!("Invalid folder: {}", path_str);
+                            self.status_message =
+                                format!("Invalid folder: {}", self.folder_picker_input);
                         }
                     }
                 });
@@ -522,5 +738,14 @@ impl eframe::App for PapervaultApp {
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         let _ = self.config.save();
+
+        // Signal the watcher to stop gracefully.
+        // This drops the debouncer → closes the watcher channel → indexer
+        // receives Disconnected → commits pending and exits.
+        if let Some(ref flag) = self.watcher_shutdown_flag {
+            flag.store(true, Ordering::Relaxed);
+        }
+        // Drop our sender clone to help close the channel
+        drop(self.watcher_shutdown_tx.take());
     }
 }

@@ -1,5 +1,6 @@
 use crossbeam::channel;
 use std::panic;
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use tracing::{error, info};
@@ -84,6 +85,11 @@ fn main() -> eframe::Result {
     let tag_store_writer = tag_store.clone();
     let tag_store_for_app = tag_store;
 
+    // ── Shutdown signal ──
+    let shutdown_flag = Arc::new(AtomicBool::new(false));
+    let shutdown_flag_for_watcher = shutdown_flag.clone();
+    let watcher_tx_for_shutdown = watcher_tx.clone();
+
     // ── Background Threads ──
     let search_clone = search_engine.clone();
 
@@ -105,10 +111,11 @@ fn main() -> eframe::Result {
         if folder.exists() {
             let folder = folder.clone();
             let watcher_tx_clone = watcher_tx;
+            let shutdown = shutdown_flag_for_watcher;
             thread::Builder::new()
                 .name("watcher".into())
                 .spawn(move || {
-                    if let Err(e) = watcher_mod::start_watching(folder, watcher_tx_clone) {
+                    if let Err(e) = watcher_mod::start_watching(folder, watcher_tx_clone, shutdown) {
                         error!("Watcher failed: {}", e);
                     }
                 })
@@ -150,6 +157,8 @@ fn main() -> eframe::Result {
                 Some(render_tx_clone),
                 Some(render_result_rx),
                 tag_store_for_app,
+                Some(shutdown_flag),
+                Some(watcher_tx_for_shutdown),
             )))
         }),
     )

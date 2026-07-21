@@ -3,6 +3,8 @@ use crossbeam::channel::{Receiver, Sender};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tantivy::schema::Value;
+use tantivy::DocAddress;
 use tracing::{error, info, warn};
 
 use crate::app::{IndexerProgress, TagUpdate};
@@ -216,9 +218,19 @@ impl Pipeline {
             .map(|t| t.name)
             .collect::<Vec<String>>();
 
-        // Write Tantivy FIRST, then SQLite (correct crash-safety ordering).
-        // If crash between writes: Tantivy has doc, SQLite doesn't → next file event
-        // re-indexes because metadata check finds no SQLite row.
+        // Write SQLite FIRST, then Tantivy.
+        // If crash between writes: SQLite has doc, Tantivy doesn't → next file event
+        // triggers re-indexing (metadata fast-path skip fails because mtime unchanged
+        // but Tantivy won't have the doc, so search returns stale results until next event).
+        // Reconciliation on startup backfills any Tantivy-missing docs.
+        self.tag_store.upsert_document(
+            &content_hash,
+            &path_str,
+            &file_type,
+            size as i64,
+            modified_ts,
+        )?;
+
         {
             let mut engine = self.search_engine.lock().unwrap();
             engine.index_document(
@@ -232,14 +244,6 @@ impl Pipeline {
                 &tags,
             )?;
         }
-
-        self.tag_store.upsert_document(
-            &content_hash,
-            &path_str,
-            &file_type,
-            size as i64,
-            modified_ts,
-        )?;
 
         Ok(())
     }
@@ -271,9 +275,11 @@ impl Pipeline {
 }
 
 /// Run reconciliation on startup: ensure Tantivy and SQLite are consistent.
-pub fn reconcile(engine: Arc<std::sync::Mutex<SearchEngine>>, _tag_store: &TagStore) {
+/// Backfills SQLite rows for Tantivy documents that are missing them (crashes).
+pub fn reconcile(engine: Arc<std::sync::Mutex<SearchEngine>>, tag_store: &TagStore) {
     info!("Running startup reconciliation...");
 
+    // Garbage collect stale segments
     if let Err(e) = {
         let mut eng = engine.lock().unwrap();
         eng.garbage_collect()
@@ -281,9 +287,92 @@ pub fn reconcile(engine: Arc<std::sync::Mutex<SearchEngine>>, _tag_store: &TagSt
         warn!("Garbage collection during reconciliation: {}", e);
     }
 
-    // TODO: Full reconciliation — iterate Tantivy docs, verify SQLite presence,
-    // remove documents whose files no longer exist, etc.
-    // For v1, garbage_collect_filess() handles the common crash case.
+    // Iterate all Tantivy documents and verify SQLite presence
+    let eng = engine.lock().unwrap();
+    let searcher = eng.reader.searcher();
+    let mut backfill_count: usize = 0;
+
+    for (segment_ord, segment_reader) in searcher.segment_readers().iter().enumerate() {
+        for doc_id in 0u32..segment_reader.max_doc() {
+            if segment_reader.is_deleted(doc_id) {
+                continue;
+            }
+
+            let doc_addr = DocAddress::new(segment_ord as u32, doc_id);
+            let Ok(doc) = searcher.doc::<tantivy::TantivyDocument>(doc_addr) else {
+                continue;
+            };
+
+            let file_path = doc
+                .get_first(eng.fields.file_path)
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let content_hash = doc
+                .get_first(eng.fields.content_hash)
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let file_type = doc
+                .get_first(eng.fields.file_type)
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+
+            if content_hash.is_empty() {
+                continue;
+            }
+
+            // Check if file still exists on disk
+            if !file_path.is_empty() && !std::path::Path::new(file_path).exists() {
+                continue;
+            }
+
+            // Check if SQLite has this document
+            match tag_store.already_indexed_by_hash(content_hash) {
+                Ok(false) => {
+                    // Backfill: insert into SQLite from Tantivy stored fields
+                    let file_size = if file_path.is_empty() {
+                        0i64
+                    } else {
+                        std::fs::metadata(file_path)
+                            .map(|m| m.len() as i64)
+                            .unwrap_or(0)
+                    };
+                    let modified_ts = doc
+                        .get_first(eng.fields.modified_ts)
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(0);
+
+                    if let Err(e) = tag_store.upsert_document(
+                        content_hash,
+                        file_path,
+                        file_type,
+                        file_size,
+                        modified_ts,
+                    ) {
+                        warn!(
+                            "Reconciliation backfill failed for {}: {}",
+                            content_hash, e
+                        );
+                    } else {
+                        backfill_count += 1;
+                    }
+                }
+                Ok(true) => {}
+                Err(e) => {
+                    warn!(
+                        "Reconciliation SQLite check failed for {}: {}",
+                        content_hash, e
+                    );
+                }
+            }
+        }
+    }
+
+    if backfill_count > 0 {
+        info!(
+            "Reconciliation backfilled {} documents to SQLite",
+            backfill_count
+        );
+    }
 
     info!("Reconciliation complete");
 }
@@ -443,7 +532,6 @@ mod tests {
         use crate::app::TagUpdate;
         use crate::search::engine::SearchEngine;
         use crate::watcher::watcher::IndexerMessage;
-        use std::path::PathBuf;
 
         let (store, _dir) = setup_tag_store();
 
