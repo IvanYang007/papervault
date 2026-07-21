@@ -1,4 +1,11 @@
-use crate::app::HighlightRect;
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct HighlightRect {
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+}
 
 /// Calculate highlight rectangles by finding search term positions in extracted text.
 /// This is a simplified approach — the real implementation uses pdfium's

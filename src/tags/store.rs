@@ -132,6 +132,44 @@ impl TagStore {
         Ok(tags)
     }
 
+    /// Batch-fetch tags for multiple document hashes in a single query.
+    /// Hashes are split into chunks of 500 to stay within SQLite's variable limit (999).
+    pub fn get_tags_for_hashes(
+        &self,
+        hashes: &[String],
+    ) -> SqlResult<std::collections::HashMap<String, Vec<Tag>>> {
+        use std::collections::HashMap;
+        let mut result = HashMap::new();
+        if hashes.is_empty() {
+            return Ok(result);
+        }
+        let conn = self.connect()?;
+        for chunk in hashes.chunks(500) {
+            let placeholders: Vec<String> = chunk.iter().enumerate().map(|(i, _)| format!("?{}", i + 1)).collect();
+            let sql = format!(
+                "SELECT dt.content_hash, t.id, t.name FROM document_tags dt JOIN tags t ON dt.tag_id = t.id WHERE dt.content_hash IN ({}) ORDER BY t.name",
+                placeholders.join(", ")
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let params: Vec<&dyn rusqlite::types::ToSql> = chunk.iter().map(|s| s as &dyn rusqlite::types::ToSql).collect();
+            let rows = stmt.query_map(params.as_slice(), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    Tag {
+                        id: row.get(1)?,
+                        name: row.get(2)?,
+                    },
+                ))
+            })?;
+            for row in rows {
+                if let Ok((hash, tag)) = row {
+                    result.entry(hash).or_default().push(tag);
+                }
+            }
+        }
+        Ok(result)
+    }
+
     #[allow(dead_code)]
     pub fn get_documents_with_tag(&self, tag_id: i64) -> SqlResult<Vec<String>> {
         let conn = self.connect()?;

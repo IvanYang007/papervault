@@ -39,10 +39,13 @@ impl PdfRenderer {
                     error!("Render error for {}: {}", request.path.display(), e);
                     // Send empty result as error indicator
                     let _ = self.result_tx.send(RenderResult {
+                        request_id: request.request_id,
+                        path: request.path.clone(),
+                        page: request.page,
+                        page_count: 0,
                         rgba_bytes: Vec::new(),
                         width: 0,
                         height: 0,
-                        highlights: Vec::new(),
                     });
                 }
             }
@@ -84,10 +87,13 @@ impl PdfRenderer {
         let pages = doc.pages();
         if pages.is_empty() {
             return Ok(RenderResult {
+                request_id: request.request_id,
+                path: request.path.clone(),
+                page: request.page,
+                page_count: 0,
                 rgba_bytes: Vec::new(),
                 width: 0,
                 height: 0,
-                highlights: Vec::new(),
             });
         }
 
@@ -123,14 +129,14 @@ impl PdfRenderer {
         // Extract RGBA bytes
         let rgba_bytes = bitmap.as_rgba_bytes();
 
-        // Find highlights (simplified — real impl uses pdfium text-find API)
-        let highlights = Vec::new();
-
         Ok(RenderResult {
+            request_id: request.request_id,
+            path: request.path.clone(),
+            page: request.page,
+            page_count: page_count as usize,
             rgba_bytes,
             width: render_width,
             height: render_height,
-            highlights,
         })
     }
 }

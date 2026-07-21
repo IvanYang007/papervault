@@ -64,6 +64,9 @@ impl Pipeline {
                             Ok(()) => {
                                 total_processed += 1;
                                 self.pending_count += 1;
+                                let _ = self.progress_tx.send(IndexerProgress::Progress {
+                                    processed: total_processed,
+                                });
                             }
                             Err(e) => {
                                 error!("Pipeline error for {}: {}", path.display(), e);
@@ -103,10 +106,6 @@ impl Pipeline {
                 }
                 self.pending_count = 0;
                 last_commit = Instant::now();
-
-                let _ = self.progress_tx.send(IndexerProgress::Indexed {
-                    total: total_processed,
-                });
             }
         }
 
@@ -118,7 +117,7 @@ impl Pipeline {
             }
         }
 
-        let _ = self.progress_tx.send(IndexerProgress::Done {
+        let _ = self.progress_tx.send(IndexerProgress::ScanComplete {
             total: total_processed,
         });
         info!("Pipeline stopped");

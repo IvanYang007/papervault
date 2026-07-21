@@ -17,9 +17,12 @@ use std::time::Instant;
 /// Messages from the indexer thread to the UI thread.
 #[derive(Debug, Clone)]
 pub enum IndexerProgress {
-    Indexed { total: usize },
+    /// A single file was processed.
+    Progress { processed: usize },
+    /// Initial scan complete; total is the final count.
+    ScanComplete { total: usize },
+    /// An error occurred processing a file.
     Error { path: PathBuf, error: String },
-    Done { total: usize },
 }
 
 /// Messages from the UI thread to the indexer thread for tag updates.
@@ -34,29 +37,22 @@ pub enum TagUpdate {
 /// Messages from the UI thread to the renderer thread.
 #[derive(Debug, Clone)]
 pub struct RenderRequest {
+    pub request_id: u64,
     pub path: PathBuf,
     pub page: usize,
-    #[allow(dead_code)]
-    pub search_terms: Vec<String>,
 }
 
 /// Messages from the renderer thread to the UI thread.
 #[derive(Debug, Clone)]
 pub struct RenderResult {
+    pub request_id: u64,
+    pub path: PathBuf,
+    #[allow(dead_code)]
+    pub page: usize,
+    pub page_count: usize,
     pub rgba_bytes: Vec<u8>,
     pub width: usize,
     pub height: usize,
-    #[allow(dead_code)]
-    pub highlights: Vec<HighlightRect>,
-}
-
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub struct HighlightRect {
-    pub x: f32,
-    pub y: f32,
-    pub w: f32,
-    pub h: f32,
 }
 
 /// Top-level application state.
@@ -71,6 +67,8 @@ pub struct PapervaultApp {
     search_results: Vec<SearchResult>,
     total_hits: usize,
     selected_result: Option<usize>,
+    /// Stable document identity — survives search query changes.
+    selected_hash: Option<String>,
     folder_picker_open: bool,
     status_message: String,
     // Preview
@@ -97,6 +95,12 @@ pub struct PapervaultApp {
     clicked_index: Option<usize>,
     // PDF page navigation
     current_page: usize,
+    /// Monotonic render request counter — used to discard stale results.
+    latest_render_request_id: u64,
+    /// Path of the currently previewed PDF — used to detect stale results.
+    current_preview_path: Option<PathBuf>,
+    /// Page count of the currently previewed PDF — last page bound.
+    current_pdf_page_count: usize,
     // Graceful shutdown: signals watcher to stop, closing the channel to indexer
     watcher_shutdown_flag: Option<Arc<AtomicBool>>,
     #[allow(dead_code)]
@@ -141,6 +145,7 @@ impl PapervaultApp {
             search_results: Vec::new(),
             total_hits: 0,
             selected_result: None,
+            selected_hash: None,
             folder_picker_open: false,
             status_message: status,
             preview_texture: None,
@@ -160,6 +165,9 @@ impl PapervaultApp {
             indexing_done: 0,
             clicked_index: None,
             current_page: 1,
+            latest_render_request_id: 0,
+            current_preview_path: None,
+            current_pdf_page_count: 0,
             watcher_shutdown_flag,
             watcher_shutdown_tx,
             last_search_instant: None,
@@ -200,35 +208,49 @@ impl PapervaultApp {
             if let Some(ref fields) = self.search_fields {
                 // Don't pass tag filters to Tantivy — Tantivy tags may be stale.
                 // Instead, post-filter using SQLite which always has the truth.
-                let limit = if self.active_tag_filters.is_empty() {
-                    50
-                } else {
-                    200 // Higher limit for post-filter headroom
-                };
-                let request = SearchRequest::new(query.clone()).with_limit(limit);
+                let request = SearchRequest::new(query.clone()).with_limit(50);
                 match crate::search::engine::search_with_reader(fields, reader, &request) {
                     Ok(mut results) => {
-                        // Post-filter by tags using SQLite (always up-to-date)
-                        if !self.active_tag_filters.is_empty() {
-                            if let Some(ref store) = self.tag_store {
-                                results.items.retain(|result| {
-                                    match store.get_tags_for_document(&result.content_hash) {
-                                        Ok(tags) => {
-                                            let names: Vec<&str> =
-                                                tags.iter().map(|t| t.name.as_str()).collect();
-                                            self.active_tag_filters
-                                                .iter()
-                                                .all(|f| names.contains(&f.as_str()))
-                                        }
-                                        Err(_) => false,
+                        // Batch-fetch tags for all results (single query, chunked by 500)
+                        if let Some(ref store) = self.tag_store {
+                            let hashes: Vec<String> = results
+                                .items
+                                .iter()
+                                .map(|r| r.content_hash.clone())
+                                .collect();
+                            if let Ok(tag_map) = store.get_tags_for_hashes(&hashes) {
+                                for item in &mut results.items {
+                                    if let Some(tags) = tag_map.get(&item.content_hash) {
+                                        item.tags =
+                                            tags.iter().map(|t| t.name.clone()).collect();
                                     }
-                                });
+                                }
                             }
-                            results.items.truncate(50);
-                            results.total_hits = results.items.len();
+                            // Post-filter by active tag filters
+                            if !self.active_tag_filters.is_empty() {
+                                results.items.retain(|result| {
+                                    self.active_tag_filters
+                                        .iter()
+                                        .all(|f| result.tags.contains(f))
+                                });
+                                results.items.truncate(50);
+                                results.total_hits = results.items.len();
+                            }
                         }
                         self.total_hits = results.total_hits;
                         self.search_results = results.items;
+                        // Remap stable hash to index after results change
+                        self.selected_result = self
+                            .selected_hash
+                            .as_ref()
+                            .and_then(|hash| {
+                                self.search_results
+                                    .iter()
+                                    .position(|r| r.content_hash == *hash)
+                            });
+                        if self.selected_result.is_none() {
+                            self.selected_hash = None;
+                        }
                     }
                     Err(e) => {
                         self.status_message = format!("Search error: {}", e);
@@ -244,7 +266,11 @@ impl PapervaultApp {
             return;
         }
         self.selected_result = Some(index);
+        self.selected_hash = Some(self.search_results[index].content_hash.clone());
         self.current_page = 1;
+        // Clear stale preview when switching documents
+        self.preview_texture = None;
+        self.current_pdf_page_count = 0;
         let is_pdf = self.search_results[index].file_type == "pdf";
         let file_path = self.search_results[index].file_path.clone();
         let file_type = self.search_results[index].file_type.clone();
@@ -254,12 +280,37 @@ impl PapervaultApp {
             self.preview_text = None;
         } else {
             self.preview_texture = None;
-            match std::fs::read_to_string(&file_path) {
-                Ok(content) => {
-                    self.preview_text = Some(content);
+            const PREVIEW_MAX_BYTES: u64 = 2 * 1024 * 1024; // 2 MB
+            match std::fs::metadata(&file_path) {
+                Ok(meta) if meta.len() > PREVIEW_MAX_BYTES => {
+                    // Read only the first 2 MB to avoid UI freeze on large files
+                    match std::fs::File::open(&file_path) {
+                        Ok(file) => {
+                            use std::io::Read;
+                            let mut reader = std::io::BufReader::new(file.take(PREVIEW_MAX_BYTES));
+                            let mut content = String::new();
+                            if reader.read_to_string(&mut content).is_ok() {
+                                content.push_str("\n\n─── Preview truncated at 2 MB ───");
+                                self.preview_text = Some(content);
+                            } else {
+                                self.preview_text =
+                                    Some("Error reading file.".to_string());
+                            }
+                        }
+                        Err(e) => {
+                            self.preview_text = Some(format!("Error reading file: {}", e));
+                        }
+                    }
                 }
-                Err(e) => {
-                    self.preview_text = Some(format!("Error reading file: {}", e));
+                _ => {
+                    match std::fs::read_to_string(&file_path) {
+                        Ok(content) => {
+                            self.preview_text = Some(content);
+                        }
+                        Err(e) => {
+                            self.preview_text = Some(format!("Error reading file: {}", e));
+                        }
+                    }
                 }
             }
         }
@@ -275,15 +326,14 @@ impl PapervaultApp {
             return;
         }
         let result = &self.search_results[selected];
+        let path = PathBuf::from(&result.file_path);
+        self.latest_render_request_id += 1;
+        self.current_preview_path = Some(path.clone());
         if let Some(ref tx) = self.render_request_tx {
             let request = RenderRequest {
-                path: PathBuf::from(&result.file_path),
+                request_id: self.latest_render_request_id,
+                path,
                 page: self.current_page,
-                search_terms: self
-                    .search_query
-                    .split_whitespace()
-                    .map(|s| s.to_string())
-                    .collect(),
             };
             let _ = tx.send(request);
         }
@@ -299,6 +349,14 @@ impl PapervaultApp {
                 let Ok(result) = rx.try_recv() else {
                     break;
                 };
+                // Discard stale results from previous requests or different documents
+                if result.request_id != self.latest_render_request_id {
+                    continue;
+                }
+                if self.current_preview_path.as_deref() != Some(&result.path) {
+                    continue;
+                }
+                self.current_pdf_page_count = result.page_count;
                 if result.width > 0 && result.height > 0 {
                     let color_image = egui::ColorImage::from_rgba_unmultiplied(
                         [result.width, result.height],
@@ -318,11 +376,10 @@ impl PapervaultApp {
                 break;
             };
             match progress {
-                IndexerProgress::Indexed { total } => {
-                    self.indexing_total = total;
-                    self.indexing_done += 1;
+                IndexerProgress::Progress { processed } => {
+                    self.indexing_done = processed;
                 }
-                IndexerProgress::Done { total } => {
+                IndexerProgress::ScanComplete { total } => {
                     self.indexing_total = total;
                     self.indexing_done = total;
                 }
@@ -359,17 +416,14 @@ impl PapervaultApp {
     }
 
     fn assign_tag_to_selected(&mut self, tag_id: i64) {
-        let Some(selected) = self.selected_result else {
+        let Some(ref content_hash) = self.selected_hash else {
             return;
         };
-        if selected >= self.search_results.len() {
-            return;
-        }
+        let content_hash = content_hash.clone();
         let Some(ref store) = self.tag_store else {
             return;
         };
 
-        let content_hash = self.search_results[selected].content_hash.clone();
         if store.assign_tag(&content_hash, tag_id).is_ok() {
             // Sync to Tantivy
             if let Some(ref tx) = self.tag_update_tx {
@@ -419,10 +473,20 @@ impl PapervaultApp {
             return;
         }
 
-        // Sort and merge overlapping spans
+        // Sort and merge overlapping spans, validating against original byte boundaries.
+        // Byte offsets from the lowercased string may not align with UTF-8 boundaries
+        // in the original snippet (e.g., Turkish İ → i̇ changes byte length).
         spans.sort_by_key(|s| s.0);
         let mut merged: Vec<(usize, usize)> = Vec::new();
         for span in spans {
+            // Validate span boundaries against the original snippet
+            if !snippet.is_char_boundary(span.0) || !snippet.is_char_boundary(span.1) {
+                tracing::debug!(
+                    "Skipping highlight span at byte offsets ({}, {}) — not char-aligned in original",
+                    span.0, span.1
+                );
+                continue;
+            }
             if let Some(last) = merged.last_mut() {
                 if span.0 <= last.1 {
                     last.1 = last.1.max(span.1);
@@ -625,11 +689,15 @@ impl eframe::App for PapervaultApp {
                     self.tag_panel_open = !self.tag_panel_open;
                 }
 
-                if self.indexing_total > 0 && self.indexing_done < self.indexing_total {
-                    ui.label(format!(
-                        "Indexing {}/{}",
-                        self.indexing_done, self.indexing_total
-                    ));
+                if self.indexing_done > 0 {
+                    if self.indexing_total > 0 {
+                        ui.label(format!(
+                            "Indexed {}/{}",
+                            self.indexing_done, self.indexing_total
+                        ));
+                    } else {
+                        ui.label(format!("Indexed {} files…", self.indexing_done));
+                    }
                 }
             });
             // Active tag filter chips
@@ -682,13 +750,19 @@ impl eframe::App for PapervaultApp {
 
                 // PDF page navigation (before preview borrow)
                 if is_pdf {
+                    let at_last_page = self.current_pdf_page_count > 0
+                        && self.current_page >= self.current_pdf_page_count;
                     ui.horizontal(|ui| {
                         if ui.button("◀ Prev").clicked() && current_page > 1 {
                             self.current_page -= 1;
                             self.request_page_render();
                         }
-                        ui.label(format!("Page {}", self.current_page));
-                        if ui.button("Next ▶").clicked() {
+                        if self.current_pdf_page_count > 0 {
+                            ui.label(format!("Page {} / {}", self.current_page, self.current_pdf_page_count));
+                        } else {
+                            ui.label(format!("Page {}", self.current_page));
+                        }
+                        if ui.add_enabled(!at_last_page, egui::Button::new("Next ▶")).clicked() {
                             self.current_page += 1;
                             self.request_page_render();
                         }
