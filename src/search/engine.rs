@@ -37,11 +37,10 @@ impl SearchEngine {
             index
         };
 
-        // Register tokenizer for text fields — critical: register under "default" AND field name
+        // Register tokenizer under the field name — Tantivy TEXT fields look up by field name
         let tokenizer = TextAnalyzer::builder(SimpleTokenizer::default())
                 .filter(LowerCaser)
                 .build();
-        index.tokenizers().register("default", tokenizer.clone());
         index.tokenizers().register("body", tokenizer);
 
         let writer = index.writer(50_000_000)?; // 50MB buffer
@@ -53,7 +52,7 @@ impl SearchEngine {
 
         let reader = index
             .reader_builder()
-            .reload_policy(ReloadPolicy::Manual)
+            .reload_policy(ReloadPolicy::OnCommitWithDelay)
             .try_into()?;
 
         Ok(Self {
@@ -73,17 +72,23 @@ impl SearchEngine {
         base.join("papervault").join("index")
     }
 
-    /// Commit pending documents and reload the reader so changes are visible.
+    /// Commit pending documents to the index.
+    /// Reader reloads automatically via OnCommitWithDelay (within milliseconds).
     pub fn commit(&mut self) -> Result<u64> {
-        let stamp = self.writer.commit()?;
-        self.reader.reload()?;
-        Ok(stamp)
+        Ok(self.writer.commit()?)
     }
 
     /// Prepare commit (called during graceful shutdown).
     pub fn prepare_commit(&mut self) -> Result<u64> {
         let prepared = self.writer.prepare_commit()?;
         Ok(prepared.commit()?)
+    }
+
+    /// Reload the reader to pick up committed changes.
+    /// Only needed when using ReloadPolicy::Manual (tests).
+    /// Production code uses OnCommitWithDelay which auto-reloads.
+    pub fn reload(&mut self) -> Result<()> {
+        Ok(self.reader.reload()?)
     }
 
     /// Run garbage collection on stale segments.
@@ -288,13 +293,12 @@ mod tests {
         let fields = SchemaFields::from_schema(&schema);
         let index = Index::create_in_dir(dir.path(), schema.clone()).unwrap();
 
-        // Register the SAME tokenizer used in production — critical for text search
+        // Register tokenizer under field name — Tantivy TEXT fields look up by field name
         let tokenizer = TextAnalyzer::builder(
                 tantivy::tokenizer::SimpleTokenizer::default()
             )
                 .filter(tantivy::tokenizer::LowerCaser)
                 .build();
-        index.tokenizers().register("default", tokenizer.clone());
         index.tokenizers().register("body", tokenizer);
 
         let writer = index.writer(50_000_000).unwrap();
@@ -304,8 +308,8 @@ mod tests {
             .try_into()
             .unwrap();
 
-        // Manual reload policy: reload after writer commit in tests
-        // (engine.commit() handles this automatically for production code)
+        // Manual reload: engine.commit() syncs via writer.commit();
+        // tests must call engine.reload() after commit for the reader to see changes
 
         let engine = SearchEngine {
             index,
@@ -349,6 +353,7 @@ mod tests {
         ).unwrap();
 
         engine.commit().unwrap();
+        engine.reload().unwrap();
 
         let results = engine.search(&SearchRequest::new("invoice".into())).unwrap();
         assert_eq!(results.total_hits, 1);
@@ -371,6 +376,7 @@ mod tests {
         ).unwrap();
 
         engine.commit().unwrap();
+        engine.reload().unwrap();
 
         let results = engine.search(&SearchRequest::new("nonexistent".into())).unwrap();
         assert_eq!(results.total_hits, 0);
@@ -393,6 +399,7 @@ mod tests {
             ).unwrap();
         }
         engine.commit().unwrap();
+        engine.reload().unwrap();
 
         let results = engine.search(
             &SearchRequest::new("common".into()).with_limit(3)
@@ -416,12 +423,14 @@ mod tests {
             &[],
         ).unwrap();
         engine.commit().unwrap();
+        engine.reload().unwrap();
 
         let results = engine.search(&SearchRequest::new("delete".into())).unwrap();
         assert_eq!(results.total_hits, 1);
 
         engine.delete_by_hash("hash_del").unwrap();
         engine.commit().unwrap();
+        engine.reload().unwrap();
 
         let results = engine.search(&SearchRequest::new("delete".into())).unwrap();
         assert_eq!(results.total_hits, 0);
@@ -444,6 +453,7 @@ mod tests {
             ).unwrap();
         }
         engine.commit().unwrap();
+        engine.reload().unwrap();
 
         // With limit 2, items are capped but total_hits is also cap (TopDocs limitation)
         // For v1, overflow is detected when total_hits == limit
