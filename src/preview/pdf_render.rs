@@ -71,13 +71,18 @@ impl PdfRenderer {
                 .unwrap_or_else(|| std::path::PathBuf::from("."));
             let dll_path = dll_dir.join("pdfium.dll");
             eprintln!(">>> attempting to bind pdfium at: {}", dll_path.display());
-            info!("Binding pdfium library: {}", dll_path.display());
-            let pdfium = pdfium_render::prelude::Pdfium::new(
-                pdfium_render::prelude::Pdfium::bind_to_library(&dll_path)
-                    .or_else(|_| pdfium_render::prelude::Pdfium::bind_to_system_library())
-                    .context("Failed to bind pdfium library")?,
-            );
-            info!("Pdfium instance created");
+            eprintln!(">>> calling bind_to_library...");
+            let bind_result = pdfium_render::prelude::Pdfium::bind_to_library(&dll_path);
+            eprintln!(">>> bind_to_library returned: {:?}", bind_result.is_ok());
+            let bindings = bind_result
+                .or_else(|_| {
+                    eprintln!(">>> bind_to_library failed, trying system library...");
+                    pdfium_render::prelude::Pdfium::bind_to_system_library()
+                })
+                .context("Failed to bind pdfium library")?;
+            eprintln!(">>> creating Pdfium instance...");
+            let pdfium = pdfium_render::prelude::Pdfium::new(bindings);
+            eprintln!(">>> Pdfium instance created OK");
             *guard = Some(pdfium);
         }
         let pdfium = guard.as_ref().expect("pdfium was just initialized");
