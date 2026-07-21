@@ -109,6 +109,8 @@ See origin document `docs/brainstorms/2026-01-15-pdf-search-viewer-requirements.
 | Logging | `tracing` + `tracing-subscriber` | Structured logging. |
 | Error handling | `anyhow` + `thiserror` | anyhow for application code, thiserror for library-level error types. Extractors return `anyhow::Result` — errors are logged, not programmatically matched. |
 | Config | `dirs-next` | Actively maintained fork of `dirs`. `data_local_dir()` for index, `config_dir()` for settings. |
+| Serialization | `serde_json` | Config file persistence. |
+| PDF text (fallback) | `lopdf` | Conditional fallback for text-position extraction if pdfium-render's FPDFText_Find* bindings are insufficient for highlight bounding boxes. |
 
 ---
 
@@ -280,10 +282,10 @@ impl Pipeline {
             return Ok(());
         }
 
-        // Step 2: Compute content hash (reads file once).
-        //          Hash is computed INCREMENTALLY during extraction
-        //          (pipe file bytes through blake3 hasher while extracting)
-        //          to avoid reading the file twice.
+        // Step 2: Extract text AND compute hash in a single file pass.
+        //          extract_and_hash pipes file bytes through both the extractor
+        //          and a blake3 hasher, avoiding a separate hash-only read.
+        //          Returns the extracted content and the content hash.
         let (extracted, content_hash) = self.extract_and_hash(&path)?;
 
         // Step 3: Check if content hash already exists in index (dedup/rename).
@@ -293,21 +295,18 @@ impl Pipeline {
             return Ok(());
         }
 
-        // Step 4: Extract text via pipeline stages.
-        let text = self.run_extractors(&path)?;
-
-        // Step 5: Re-verify hash after extraction (catches TOCTOU modification).
+        // Step 4: Re-verify hash after extraction (catches TOCTOU modification).
+        //          The extracted text from Step 2 is reused directly — no second extraction.
         //          If hash changed, retry once. If still different, log warning and skip.
         let post_hash = blake3::hash(&std::fs::read(&path)?);
         if post_hash != content_hash {
             tracing::warn!("File modified during extraction: {}", path.display());
-            // Retry once
-            let retry_text = self.run_extractors(&path)?;
-            let retry_hash = blake3::hash(&std::fs::read(&path)?);
+            // Retry once: re-extract and re-hash
+            let (retry_extracted, retry_hash) = self.extract_and_hash(&path)?;
             if retry_hash != post_hash {
                 return Err(anyhow::anyhow!("File modified during extraction after retry"));
             }
-            // Use retry results
+            extracted = retry_extracted;
         }
 
         // Step 6: Commit to Tantivy and SQLite.
@@ -460,7 +459,7 @@ User types "invoice March"
 
 **Result limit:** Default 50 results. The UI shows "50 of N matches — refine your query" if total hits exceed the limit. This prevents frame drops from rendering 10K result rows and matches the old-Evernote UX.
 
-`SearchRequest` struct is defined in U3 (not added in U9) to avoid re-signaturing the public API.
+`SearchRequest` struct is defined minimally in U3 and extended in U9 with `tag_filters` and `fuzzy` — the Rust compiler verifies all call sites are updated.
 
 ---
 
@@ -491,7 +490,7 @@ User types "invoice March"
 - **Files:**
   - `src/config.rs`
   - `src/app.rs` (modify: folder selection UI)
-- **Approach:** Store config as JSON in `dirs_next::config_dir()/papervault/config.json`. First launch: "Select folder" button via `rfd::FileDialog`. Config struct: `{ watched_folder: PathBuf }`. Load on startup, save on change.
+- **Approach:** Store config as JSON in `dirs_next::config_dir()/papervault/config.json`. First launch: "Select folder" button via egui's built-in file dialog (`rfd` not needed — egui provides a native folder picker through its viewport integration). Config struct: `{ watched_folder: PathBuf }`. Load on startup, save on change.
 - **Patterns to follow:** `dirs-next` for platform config paths, `serde_json` for persistence.
 - **Test scenarios:**
   - First launch shows folder selection UI.
@@ -508,9 +507,9 @@ User types "invoice March"
 - **Files:**
   - `src/search/schema.rs`
   - `src/search/engine.rs` — `SearchEngine::search(SearchRequest) -> SearchResults`
-  - `src/search/query.rs` — `SearchRequest { query, tag_filters, fuzzy, limit }`
+  - `src/search/query.rs` — `SearchRequest { query, limit }` (tag_filters added in U9)
   - `src/search/mod.rs`
-- **Approach:** `SearchEngine` manages `Index` lifecycle. Index directory: `dirs_next::data_local_dir()/papervault/index/`. On startup: `IndexWriter::garbage_collect_files()`. `search()` parses query into BooleanQuery, executes on UI thread, returns results with snippets via `SnippetGenerator`. Result limit: default 50.
+- **Approach:** `SearchEngine` manages `Index` lifecycle. Index directory: `dirs_next::data_local_dir()/papervault/index/`. On startup: `IndexWriter::garbage_collect_files()`. `search()` parses query into BooleanQuery, executes on UI thread, returns results with snippets via `SnippetGenerator`. Result limit: default 50. `SearchRequest` starts minimal (`query` + `limit`); `tag_filters` and `fuzzy` are added in U9 when their consumers exist.
 - **Test scenarios:**
   - `open_or_create` creates new index if none exists, opens existing one.
   - Index a document, search for a term in that document → found.
@@ -622,7 +621,7 @@ User types "invoice March"
 - **Requirements:** R10
 - **Dependencies:** U3, U8
 - **Files:**
-  - `src/search/query.rs` (modify: use `SearchRequest.tag_filters`)
+  - `src/search/query.rs` (modify: add `tag_filters: Vec<String>`, `fuzzy: bool` to `SearchRequest`)
   - `src/search/engine.rs` (modify)
 - **Approach:** `SearchRequest.tag_filters` adds `TermQuery` clauses on the Tantivy `tags` field. Tags are synced to Tantivy at index time and on tag changes. Tag lookup for display uses UI-thread SQLite connection.
 - **Test scenarios:**
@@ -815,5 +814,5 @@ _None._
 - [U10] Exact pdfium-render API surface for `FPDFText_Find*` bounding boxes — verify during U10.
 - [U7] Tantivy `delete_term` performance at 10K scale — benchmark during U7.
 - [U12] Optimal egui panel sizing for different window sizes.
-- [U2] `rfd::FileDialog` compatibility with user's Windows 11 configuration.
+- [U2] egui's built-in folder picker behavior — verify during U2.
 - [U5] Whether two `Pdfium::new()` calls in same process share internal state correctly — test during U5.
