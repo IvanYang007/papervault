@@ -693,8 +693,7 @@ impl eframe::App for PapervaultApp {
                 let tex_id = self.preview_texture.as_ref().unwrap().id();
                 let tex_size = self.preview_texture.as_ref().unwrap().size_vec2();
                 ui.image(egui::ImageSource::Texture(egui::load::SizedTexture::new(
-                    tex_id,
-                    tex_size,
+                    tex_id, tex_size,
                 )));
             } else if let Some(ref text) = self.preview_text {
                 ScrollArea::vertical().show(ui, |ui| {
@@ -733,8 +732,7 @@ impl eframe::App for PapervaultApp {
                             let _ = self.config.save();
                             self.init_search_engine();
                             self.folder_picker_open = false;
-                            self.status_message =
-                                format!("Watching: {}", self.folder_picker_input);
+                            self.status_message = format!("Watching: {}", self.folder_picker_input);
                         } else {
                             self.status_message =
                                 format!("Invalid folder: {}", self.folder_picker_input);

@@ -123,7 +123,8 @@ fn main() -> eframe::Result {
             watcher_handle = thread::Builder::new()
                 .name("watcher".into())
                 .spawn(move || {
-                    if let Err(e) = watcher_mod::start_watching(folder, watcher_tx_clone, shutdown) {
+                    if let Err(e) = watcher_mod::start_watching(folder, watcher_tx_clone, shutdown)
+                    {
                         error!("Watcher failed: {}", e);
                     }
                 })

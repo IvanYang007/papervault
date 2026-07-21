@@ -96,10 +96,7 @@ pub fn start_watching(
 }
 
 /// Emit events for all existing supported files in the folder.
-fn emit_initial_scan(
-    folder: &PathBuf,
-    tx: &Sender<IndexerMessage>,
-) -> anyhow::Result<()> {
+fn emit_initial_scan(folder: &PathBuf, tx: &Sender<IndexerMessage>) -> anyhow::Result<()> {
     let entries = match std::fs::read_dir(folder) {
         Ok(entries) => entries,
         Err(e) => {
@@ -134,6 +131,10 @@ fn emit_initial_scan(
 fn is_supported_extension(path: &PathBuf) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
-        .map(|ext| SUPPORTED_EXTENSIONS.iter().any(|ex| ex.eq_ignore_ascii_case(ext)))
+        .map(|ext| {
+            SUPPORTED_EXTENSIONS
+                .iter()
+                .any(|ex| ex.eq_ignore_ascii_case(ext))
+        })
         .unwrap_or(false)
 }

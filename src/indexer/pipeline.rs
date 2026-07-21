@@ -275,7 +275,6 @@ impl Pipeline {
 
 /// Run reconciliation on startup: ensure Tantivy and SQLite are consistent.
 /// Backfills SQLite rows for Tantivy documents that are missing them (crashes).
-#[allow(dead_code)]
 pub fn reconcile(engine: Arc<std::sync::Mutex<SearchEngine>>, tag_store: &TagStore) {
     info!("Running startup reconciliation...");
 
@@ -348,10 +347,7 @@ pub fn reconcile(engine: Arc<std::sync::Mutex<SearchEngine>>, tag_store: &TagSto
                         file_size,
                         modified_ts,
                     ) {
-                        warn!(
-                            "Reconciliation backfill failed for {}: {}",
-                            content_hash, e
-                        );
+                        warn!("Reconciliation backfill failed for {}: {}", content_hash, e);
                     } else {
                         backfill_count += 1;
                     }

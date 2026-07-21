@@ -4,7 +4,9 @@ use tantivy::directory::MmapDirectory;
 use tantivy::query::{BooleanQuery, Occur, Query, TermQuery};
 use tantivy::schema::*;
 use tantivy::tokenizer::*;
-use tantivy::{doc, Index, IndexReader, IndexWriter, ReloadPolicy, SnippetGenerator, TantivyDocument};
+use tantivy::{
+    doc, Index, IndexReader, IndexWriter, ReloadPolicy, SnippetGenerator, TantivyDocument,
+};
 
 use super::query::{SearchRequest, SearchResult, SearchResults};
 use super::schema::{build_schema, SchemaFields};
@@ -102,8 +104,6 @@ impl SearchEngine {
     pub fn search(&self, request: &SearchRequest) -> Result<SearchResults> {
         search_with_reader(&self.fields, &self.reader, request)
     }
-
-
 
     /// Index or update a document in Tantivy.
     pub fn index_document(
