@@ -242,7 +242,7 @@ pub fn search_with_reader(
     let total_hits = count_handle.extract(&mut multi_fruit);
     let top_docs = top_docs_handle.extract(&mut multi_fruit);
 
-    let mut items = Vec::new();
+    let mut items = Vec::with_capacity(request.limit);
     for (_score, doc_address) in top_docs {
         let doc: TantivyDocument = searcher.doc(doc_address)?;
 

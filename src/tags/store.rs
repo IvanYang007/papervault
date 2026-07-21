@@ -18,7 +18,9 @@ impl TagStore {
         }
 
         let conn = Connection::open(&db_path)?;
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys = ON;")?;
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys = ON;",
+        )?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS documents (
                 content_hash TEXT PRIMARY KEY,
@@ -50,7 +52,9 @@ impl TagStore {
 
     fn connect(&self) -> SqlResult<Connection> {
         let conn = Connection::open(&self.db_path)?;
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys = ON;")?;
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys = ON;",
+        )?;
         Ok(conn)
     }
 

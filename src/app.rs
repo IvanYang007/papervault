@@ -280,11 +280,15 @@ impl PapervaultApp {
     }
 
     fn assign_tag_to_selected(&mut self, tag_id: i64) {
-        let Some(selected) = self.selected_result else { return };
+        let Some(selected) = self.selected_result else {
+            return;
+        };
         if selected >= self.search_results.len() {
             return;
         }
-        let Some(ref store) = self.tag_store else { return };
+        let Some(ref store) = self.tag_store else {
+            return;
+        };
 
         let content_hash = self.search_results[selected].content_hash.clone();
         if store.assign_tag(&content_hash, tag_id).is_ok() {
