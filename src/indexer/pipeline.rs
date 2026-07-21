@@ -51,6 +51,13 @@ impl Pipeline {
 
         // Build extractor chain on this thread (avoids Send requirement on pdfium)
         let stages = stages::create_extractor_chain();
+
+        // Run reconciliation before processing any files.
+        // This was moved from the main thread so the UI starts instantly.
+        info!("Running startup reconciliation...");
+        crate::indexer::pipeline::reconcile(self.search_engine.clone(), &self.tag_store);
+        info!("Reconciliation complete.");
+
         let mut total_processed: usize = 0;
         let mut last_commit = Instant::now();
         let commit_interval = Duration::from_secs(2);

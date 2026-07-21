@@ -3,13 +3,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
-use tracing::info;
-
 use crossbeam::channel::{self, Receiver, Sender};
 
 use crate::app::{IndexerProgress, RenderRequest, RenderResult, TagUpdate};
 use crate::error::Result;
-use crate::indexer::pipeline::{self, Pipeline};
+use crate::indexer::pipeline::Pipeline;
 use crate::preview::pdf_render::PdfRenderer;
 use crate::search::engine::SearchEngine;
 use crate::search::schema::SchemaFields;
@@ -73,10 +71,8 @@ impl FolderRuntime {
         // ── Shutdown signal ──
         let watcher_shutdown = Arc::new(AtomicBool::new(false));
 
-        // ── Startup Reconciliation ──
-        info!("Running startup reconciliation...");
-        pipeline::reconcile(engine.clone(), tag_store);
-        info!("Reconciliation complete.");
+        // Startup reconciliation will run on the indexer thread
+        // before processing any files, so the UI starts instantly.
 
         // ── Background Threads ──
         // Indexer

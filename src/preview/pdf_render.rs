@@ -29,6 +29,23 @@ impl PdfRenderer {
         #[allow(clippy::arc_with_non_send_sync)]
         let pdfium: Arc<Mutex<Option<pdfium_render::prelude::Pdfium>>> = Arc::new(Mutex::new(None));
 
+        // Eagerly initialize pdfium on renderer thread startup.
+        // The first render request will be instant instead of paying init cost.
+        {
+            let dll_dir = std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+                .unwrap_or_else(|| std::path::PathBuf::from("."));
+            let dll_path = dll_dir.join("pdfium.dll");
+            let mut guard = pdfium.lock().unwrap_or_else(|e| e.into_inner());
+            if let Ok(bindings) = pdfium_render::prelude::Pdfium::bind_to_library(&dll_path)
+                .or_else(|_| pdfium_render::prelude::Pdfium::bind_to_system_library())
+            {
+                *guard = Some(pdfium_render::prelude::Pdfium::new(bindings));
+                info!("Pdfium initialized eagerly on renderer thread");
+            }
+        }
+
         while let Ok(mut request) = self.request_rx.recv() {
             // Coalesce: drain stale requests, keep only the latest
             while let Ok(newer) = self.request_rx.try_recv() {
@@ -110,8 +127,9 @@ impl PdfRenderer {
         let width = page.width().value as usize;
         let height = page.height().value as usize;
 
-        // Limit render size for performance
-        let max_dim = 2000;
+        // Apply zoom factor, then limit for performance
+        let zoom = (request.zoom as f64).clamp(0.25, 4.0);
+        let max_dim = (2000.0 * zoom) as usize;
         let (render_width, render_height) = if width > max_dim || height > max_dim {
             let scale = max_dim as f64 / width.max(height) as f64;
             (
@@ -119,7 +137,9 @@ impl PdfRenderer {
                 (height as f64 * scale) as usize,
             )
         } else {
-            (width.max(1), height.max(1))
+            let w = (width as f64 * zoom) as usize;
+            let h = (height as f64 * zoom) as usize;
+            (w.max(1), h.max(1))
         };
 
         // Render to bitmap

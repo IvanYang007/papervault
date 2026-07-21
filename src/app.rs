@@ -43,6 +43,7 @@ pub struct RenderRequest {
     pub request_id: u64,
     pub path: PathBuf,
     pub page: usize,
+    pub zoom: f32,
 }
 
 /// Messages from the renderer thread to the UI thread.
@@ -106,6 +107,8 @@ pub struct PapervaultApp {
     current_preview_path: Option<PathBuf>,
     /// Page count of the currently previewed PDF — last page bound.
     current_pdf_page_count: usize,
+    /// PDF zoom level (1.0 = 100%).
+    pdf_zoom: f32,
     // Graceful shutdown: signals watcher to stop, closing the channel to indexer
     watcher_shutdown_flag: Option<Arc<AtomicBool>>,
     #[allow(dead_code)]
@@ -185,6 +188,7 @@ impl PapervaultApp {
             latest_render_request_id: 0,
             current_preview_path: None,
             current_pdf_page_count: 0,
+            pdf_zoom: 1.0,
             watcher_shutdown_flag,
             watcher_shutdown_tx,
             last_search_instant: None,
@@ -354,6 +358,7 @@ impl PapervaultApp {
                     request_id: self.latest_render_request_id,
                     path: file_path,
                     page: 1,
+                    zoom: self.pdf_zoom,
                 });
             }
             self.preview_text = None;
@@ -413,6 +418,7 @@ impl PapervaultApp {
                 request_id: self.latest_render_request_id,
                 path,
                 page: self.current_page,
+                zoom: self.pdf_zoom,
             };
             let _ = tx.send(request);
         }
@@ -924,6 +930,16 @@ impl eframe::App for PapervaultApp {
                             self.current_page -= 1;
                             self.request_page_render();
                         }
+                        if ui.button("🔍−").clicked() && self.pdf_zoom > 0.25 {
+                            self.pdf_zoom -= 0.25;
+                            self.request_page_render();
+                        }
+                        ui.label(format!("{}%", (self.pdf_zoom * 100.0) as i32));
+                        if ui.button("🔍+").clicked() && self.pdf_zoom < 4.0 {
+                            self.pdf_zoom += 0.25;
+                            self.request_page_render();
+                        }
+
                         if self.current_pdf_page_count > 0 {
                             ui.label(format!(
                                 "Page {} / {}",
