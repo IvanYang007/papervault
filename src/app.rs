@@ -423,8 +423,6 @@ impl PapervaultApp {
 
     /// Poll for render results and indexer progress.
     fn poll_channels(&mut self, ctx: &egui::Context) {
-        if self.render_result_rx.is_none() {
-        }
         if let Some(ref rx) = self.render_result_rx {
             for _ in 0..Self::MAX_MESSAGES_PER_FRAME {
                 let result = match rx.try_recv() {
@@ -899,7 +897,10 @@ impl eframe::App for PapervaultApp {
                     ui.label("No watched folder configured.");
                     ui.label("Click 📁 Folder to get started.");
                 });
-            } else if self.selected_result.is_none() && self.search_query.is_empty() && self.browsed_file.is_none() {
+            } else if self.selected_result.is_none()
+                && self.search_query.is_empty()
+                && self.browsed_file.is_none()
+            {
                 ui.vertical_centered(|ui| {
                     ui.add_space(100.0);
                     ui.label("Type a search query to find documents.");
@@ -955,9 +956,11 @@ impl eframe::App for PapervaultApp {
                 ui.image(egui::ImageSource::Texture(egui::load::SizedTexture::new(
                     tex_id, tex_size,
                 )));
-            } else if self.browsed_file.as_ref().map_or(false, |f| {
-                f.to_lowercase().ends_with(".pdf")
-            }) {
+            } else if self
+                .browsed_file
+                .as_ref()
+                .is_some_and(|f| f.to_lowercase().ends_with(".pdf"))
+            {
                 ui.vertical_centered(|ui| {
                     ui.add_space(40.0);
                     ui.label("PDF preview not available.");
