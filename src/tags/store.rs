@@ -251,6 +251,40 @@ impl TagStore {
             Err(e) => Err(e),
         }
     }
+
+    /// List all indexed documents for the file browser.
+    pub fn list_all_documents(&self) -> SqlResult<Vec<DocumentInfo>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(
+            "SELECT file_path, file_type, file_size, modified_ts, content_hash FROM documents ORDER BY file_path",
+        )?;
+        let docs = stmt
+            .query_map([], |row| {
+                Ok(DocumentInfo {
+                    file_path: row.get(0)?,
+                    file_type: row.get(1)?,
+                    file_size: row.get(2)?,
+                    modified_ts: row.get(3)?,
+                    content_hash: row.get(4)?,
+                })
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(docs)
+    }
+}
+
+/// Lightweight document info for the file browser panel.
+#[derive(Debug, Clone)]
+pub struct DocumentInfo {
+    pub file_path: String,
+    pub file_type: String,
+    #[allow(dead_code)]
+    pub file_size: i64,
+    #[allow(dead_code)]
+    pub modified_ts: i64,
+    #[allow(dead_code)]
+    pub content_hash: String,
 }
 
 #[cfg(test)]

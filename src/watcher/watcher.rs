@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
 /// Messages sent from the watcher to the indexer thread.
 #[derive(Debug, Clone)]
@@ -80,7 +80,7 @@ pub fn start_watching(
     let mut debouncer =
         notify_debouncer_full::new_debouncer(Duration::from_millis(500), None, event_handler)?;
 
-    debouncer.watch(&folder, RecursiveMode::NonRecursive)?;
+    debouncer.watch(&folder, RecursiveMode::Recursive)?;
     info!("Watching folder: {}", folder.display());
 
     // Keep the debouncer alive until shutdown is signaled.
@@ -95,20 +95,12 @@ pub fn start_watching(
     Ok(())
 }
 
-/// Emit events for all existing supported files in the folder.
+/// Emit events for all existing supported files in the folder, recursively.
 fn emit_initial_scan(folder: &PathBuf, tx: &Sender<IndexerMessage>) -> anyhow::Result<()> {
-    let entries = match std::fs::read_dir(folder) {
-        Ok(entries) => entries,
-        Err(e) => {
-            warn!("Cannot read watched folder: {}", e);
-            return Ok(());
-        }
-    };
-
+    use walkdir::WalkDir;
     let mut count = 0u64;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_file() && is_supported_extension(&path) {
+    for entry in WalkDir::new(folder).into_iter().filter_map(|e| e.ok()) {
+        if entry.file_type().is_file() && is_supported_extension(entry.path()) {
             if let Ok(meta) = entry.metadata() {
                 let mtime = meta
                     .modified()
@@ -119,7 +111,7 @@ fn emit_initial_scan(folder: &PathBuf, tx: &Sender<IndexerMessage>) -> anyhow::R
                     })
                     .unwrap_or(0);
                 let _ = tx.send(IndexerMessage::Upsert {
-                    path,
+                    path: entry.path().to_path_buf(),
                     mtime,
                     size: meta.len(),
                 });

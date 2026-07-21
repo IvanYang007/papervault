@@ -5,6 +5,7 @@ use crate::search::query::{SearchRequest, SearchResult};
 use crate::search::schema::SchemaFields;
 use crate::tags::model::Tag;
 use crate::tags::store::TagStore;
+use crate::tags::store::DocumentInfo;
 use crate::watcher::watcher::IndexerMessage;
 use crossbeam::channel::{Receiver, Sender};
 use egui::{
@@ -118,6 +119,12 @@ pub struct PapervaultApp {
     pending_runtime: Option<Arc<Mutex<Option<FolderRuntime>>>>,
     /// Error from background folder switch thread (shared with spawned thread).
     background_error: Option<Arc<Mutex<Option<String>>>>,
+    /// Cached file list for the file browser panel.
+    file_browser_docs: Vec<DocumentInfo>,
+    /// Whether the file browser needs a refresh.
+    file_browser_dirty: bool,
+    /// Currently previewed file path (from file browser, not search).
+    browsed_file: Option<String>,
 }
 
 impl PapervaultApp {
@@ -186,6 +193,9 @@ impl PapervaultApp {
             folder_runtime,
             pending_runtime: None,
             background_error: None,
+            file_browser_docs: Vec::new(),
+            file_browser_dirty: true,
+            browsed_file: None,
         }
     }
 
@@ -349,6 +359,77 @@ impl PapervaultApp {
         self.preview_file_type = Some(file_type);
     }
 
+    /// Preview a file from the file browser (not a search result).
+    fn browse_file(&mut self, path: &str) {
+        self.browsed_file = Some(path.to_string());
+        self.selected_result = None;
+        self.selected_hash = None;
+        self.current_page = 1;
+        self.preview_texture = None;
+        self.current_pdf_page_count = 0;
+
+        let file_path = PathBuf::from(path);
+        let is_pdf = path.to_lowercase().ends_with(".pdf");
+        self.preview_file_type = Some(if is_pdf { "pdf".into() } else { "txt".into() });
+
+        if is_pdf {
+            // Create a temporary SearchResult for the render request
+            self.search_results = vec![SearchResult {
+                file_name: file_path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("")
+                    .to_string(),
+                file_path: path.to_string(),
+                file_type: "pdf".to_string(),
+                snippet: String::new(),
+                match_count: 0,
+                match_terms: Vec::new(),
+                content_hash: String::new(),
+                tags: Vec::new(),
+            }];
+            self.selected_result = Some(0);
+            self.request_page_render();
+            self.preview_text = None;
+        } else {
+            self.search_results.clear();
+            self.selected_result = None;
+            self.preview_texture = None;
+            const PREVIEW_MAX_BYTES: u64 = 2 * 1024 * 1024;
+            match std::fs::metadata(&file_path) {
+                Ok(meta) if meta.len() > PREVIEW_MAX_BYTES => {
+                    match std::fs::File::open(&file_path) {
+                        Ok(file) => {
+                            use std::io::Read;
+                            let mut reader =
+                                std::io::BufReader::new(file.take(PREVIEW_MAX_BYTES));
+                            let mut content = String::new();
+                            if reader.read_to_string(&mut content).is_ok() {
+                                content.push_str("\n\n─── Preview truncated at 2 MB ───");
+                                self.preview_text = Some(content);
+                            } else {
+                                self.preview_text =
+                                    Some("Error reading file.".to_string());
+                            }
+                        }
+                        Err(e) => {
+                            self.preview_text =
+                                Some(format!("Error reading file: {}", e));
+                        }
+                    }
+                }
+                _ => match std::fs::read_to_string(&file_path) {
+                    Ok(content) => {
+                        self.preview_text = Some(content);
+                    }
+                    Err(e) => {
+                        self.preview_text = Some(format!("Error reading file: {}", e));
+                    }
+                },
+            }
+        }
+    }
+
     /// Send a render request for the current page of the selected result.
     fn request_page_render(&mut self) {
         let Some(selected) = self.selected_result else {
@@ -410,10 +491,12 @@ impl PapervaultApp {
             match progress {
                 IndexerProgress::Progress { processed } => {
                     self.indexing_done = processed;
+                    self.file_browser_dirty = true;
                 }
                 IndexerProgress::ScanComplete { total } => {
                     self.indexing_total = total;
                     self.indexing_done = total;
+                    self.file_browser_dirty = true;
                 }
                 IndexerProgress::Error { path, error } => {
                     self.status_message = format!("Error indexing {}: {}", path.display(), error);
@@ -662,73 +745,54 @@ impl eframe::App for PapervaultApp {
                 });
         }
 
-        // ── Left panel: search results ──
-        SidePanel::left("results_panel")
-            .resizable(true)
-            .default_width(350.0)
-            .show(ctx, |ui| {
-                ui.heading("Results");
-                if self.total_hits > self.search_results.len() {
-                    ui.label(format!(
-                        "{} shown of {} matches",
-                        self.search_results.len(),
-                        self.total_hits
-                    ));
+        // ── Left panel: file browser ──
+        if self.config.watched_folder.is_some() {
+            // Refresh file list if dirty
+            if self.file_browser_dirty {
+                if let Some(ref store) = self.tag_store {
+                    if let Ok(docs) = store.list_all_documents() {
+                        self.file_browser_docs = docs;
+                    }
                 }
+                self.file_browser_dirty = false;
+            }
 
-                let mut clicked_idx = self.clicked_index.take();
-                ScrollArea::vertical().show(ui, |ui| {
-                    for (i, result) in self.search_results.iter().enumerate() {
-                        let selected = self.selected_result == Some(i);
-                        let bg = if selected {
-                            Color32::from_rgb(40, 80, 120)
-                        } else if i % 2 == 0 {
-                            Color32::from_rgb(30, 30, 35)
-                        } else {
-                            Color32::TRANSPARENT
-                        };
+            SidePanel::left("file_browser")
+                .resizable(true)
+                .default_width(280.0)
+                .show(ctx, |ui| {
+                    ui.heading("📂 Files");
+                    ui.label(format!("{} documents", self.file_browser_docs.len()));
+                    ui.separator();
 
-                        Frame::default().fill(bg).inner_margin(4.0).show(ui, |ui| {
-                            let resp = ui.add_sized(
-                                [ui.available_width(), 40.0],
-                                egui::SelectableLabel::new(
-                                    selected,
-                                    RichText::new(format!(
-                                        "{} ({})",
-                                        result.file_name, result.match_count
-                                    ))
-                                    .strong(),
-                                ),
-                            );
+                    let mut clicked_file: Option<String> = None;
+                    ScrollArea::vertical().show(ui, |ui| {
+                        for doc in &self.file_browser_docs {
+                            let file_name = std::path::Path::new(&doc.file_path)
+                                .file_name()
+                                .and_then(|n| n.to_str())
+                                .unwrap_or(&doc.file_path);
+                            let icon = match doc.file_type.as_str() {
+                                "pdf" => "📄",
+                                "txt" => "📝",
+                                "md" => "📋",
+                                _ => "📎",
+                            };
+                            let label = format!("{} {}", icon, file_name);
+                            let is_browsed = self.browsed_file.as_deref() == Some(&doc.file_path);
+                            let resp = ui.selectable_label(is_browsed, label);
                             if resp.clicked() {
-                                clicked_idx = Some(i);
+                                clicked_file = Some(doc.file_path.clone());
                             }
-
-                            // Show tags
-                            if !result.tags.is_empty() {
-                                ui.horizontal(|ui| {
-                                    for t in &result.tags {
-                                        ui.label(RichText::new(format!("🏷{}", t)).small());
-                                    }
-                                });
-                            }
-
-                            Self::render_highlighted_snippet(
-                                ui,
-                                &result.snippet,
-                                &result.match_terms,
-                            );
-                        });
+                        }
+                    });
+                    if let Some(path) = clicked_file {
+                        self.browse_file(&path);
                     }
                 });
+        }
 
-                // Handle click outside the borrow scope
-                if let Some(idx) = clicked_idx {
-                    self.select_result(idx);
-                }
-            });
-
-        // ── Center: preview ──
+        // ── Center: search + results / preview ──
         CentralPanel::default().show(ctx, |ui| {
             // Search bar
             ui.horizontal(|ui| {
@@ -777,6 +841,70 @@ impl eframe::App for PapervaultApp {
                 });
             }
             ui.separator();
+
+            // ── Search results (shown when typing) ──
+            if !self.search_query.trim().is_empty() {
+                if self.total_hits > self.search_results.len() {
+                    ui.label(format!(
+                        "{} shown of {} matches",
+                        self.search_results.len(),
+                        self.total_hits
+                    ));
+                }
+
+                let mut clicked_idx = self.clicked_index.take();
+                ScrollArea::vertical().show(ui, |ui| {
+                    for (i, result) in self.search_results.iter().enumerate() {
+                        let selected = self.selected_result == Some(i);
+                        let bg = if selected {
+                            Color32::from_rgb(40, 80, 120)
+                        } else if i % 2 == 0 {
+                            Color32::from_rgb(30, 30, 35)
+                        } else {
+                            Color32::TRANSPARENT
+                        };
+
+                        Frame::default().fill(bg).inner_margin(4.0).show(ui, |ui| {
+                            let resp = ui.add_sized(
+                                [ui.available_width(), 40.0],
+                                egui::SelectableLabel::new(
+                                    selected,
+                                    RichText::new(format!(
+                                        "{} ({})",
+                                        result.file_name, result.match_count
+                                    ))
+                                    .strong(),
+                                ),
+                            );
+                            if resp.clicked() {
+                                clicked_idx = Some(i);
+                            }
+
+                            if !result.tags.is_empty() {
+                                ui.horizontal(|ui| {
+                                    for t in &result.tags {
+                                        ui.label(RichText::new(format!("🏷{}", t)).small());
+                                    }
+                                });
+                            }
+
+                            Self::render_highlighted_snippet(
+                                ui,
+                                &result.snippet,
+                                &result.match_terms,
+                            );
+                        });
+                    }
+                });
+
+                if let Some(idx) = clicked_idx {
+                    self.select_result(idx);
+                }
+
+                ui.separator();
+            }
+
+            // ── Preview / empty states ──
 
             if self.config.watched_folder.is_some() && self.search_engine.is_none() {
                 ui.vertical_centered(|ui| {
