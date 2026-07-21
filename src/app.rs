@@ -925,6 +925,7 @@ impl eframe::App for PapervaultApp {
                 if is_pdf {
                     let at_last_page = self.current_pdf_page_count > 0
                         && self.current_page >= self.current_pdf_page_count;
+                    let mut zoom_changed = false;
                     ui.horizontal(|ui| {
                         if ui.button("◀ Prev").clicked() && current_page > 1 {
                             self.current_page -= 1;
@@ -932,12 +933,12 @@ impl eframe::App for PapervaultApp {
                         }
                         if ui.button("🔍−").clicked() && self.pdf_zoom > 0.25 {
                             self.pdf_zoom -= 0.25;
-                            self.request_page_render();
+                            zoom_changed = true;
                         }
                         ui.label(format!("{}%", (self.pdf_zoom * 100.0) as i32));
                         if ui.button("🔍+").clicked() && self.pdf_zoom < 4.0 {
                             self.pdf_zoom += 0.25;
-                            self.request_page_render();
+                            zoom_changed = true;
                         }
 
                         if self.current_pdf_page_count > 0 {
@@ -956,6 +957,9 @@ impl eframe::App for PapervaultApp {
                             self.request_page_render();
                         }
                     });
+                    if zoom_changed {
+                        self.request_page_render();
+                    }
                     ui.separator();
                 }
 
