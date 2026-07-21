@@ -4,7 +4,6 @@ use std::sync::{Arc, Mutex};
 use tracing::{error, info};
 
 use crate::app::{RenderRequest, RenderResult};
-use crate::pdfium_lock;
 
 /// Background PDF renderer.
 /// Runs on a dedicated thread, receives render requests and sends back RGBA bitmaps.
@@ -71,8 +70,6 @@ impl PdfRenderer {
                 .and_then(|p| p.parent().map(|d| d.to_path_buf()))
                 .unwrap_or_else(|| std::path::PathBuf::from("."));
             let dll_path = dll_dir.join("pdfium.dll");
-            // Serialize FPDF_InitLibrary() across threads — not reentrant
-            let _lock = pdfium_lock::INIT.lock().unwrap_or_else(|e| e.into_inner());
             let pdfium = pdfium_render::prelude::Pdfium::new(
                 pdfium_render::prelude::Pdfium::bind_to_library(&dll_path)
                     .or_else(|_| pdfium_render::prelude::Pdfium::bind_to_system_library())

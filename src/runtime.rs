@@ -8,7 +8,6 @@ use tracing::info;
 use crossbeam::channel::{self, Receiver, Sender};
 
 use crate::app::{IndexerProgress, RenderRequest, RenderResult, TagUpdate};
-use crate::pdfium_lock;
 use crate::error::Result;
 use crate::indexer::pipeline::{self, Pipeline};
 use crate::preview::pdf_render::PdfRenderer;
@@ -73,28 +72,6 @@ impl FolderRuntime {
 
         // ── Shutdown signal ──
         let watcher_shutdown = Arc::new(AtomicBool::new(false));
-
-        // ── Pre-initialize pdfium on main thread ──
-        // FPDF_InitLibrary() is not reentrant across threads, so we call it
-        // once here before spawning any worker threads. Subsequent Pdfium::new()
-        // calls from indexer/renderer threads can then proceed without contention.
-        {
-            let _lock = pdfium_lock::INIT.lock().unwrap_or_else(|e| e.into_inner());
-            let dll_dir = std::env::current_exe()
-                .ok()
-                .and_then(|p| p.parent().map(|d| d.to_path_buf()))
-                .unwrap_or_else(|| std::path::PathBuf::from("."));
-            let dll_path = dll_dir.join("pdfium.dll");
-            // Create and keep alive — dropping would call FPDF_DestroyLibrary()
-            // which tears down global state while other threads still need pdfium.
-            let pdfium = pdfium_render::prelude::Pdfium::new(
-                pdfium_render::prelude::Pdfium::bind_to_library(&dll_path)
-                    .or_else(|_| pdfium_render::prelude::Pdfium::bind_to_system_library())
-                    .expect("Failed to pre-init pdfium library"),
-            );
-            std::mem::forget(pdfium); // never drop — other threads rely on global init
-            info!("Pdfium pre-initialized on main thread");
-        }
 
         // ── Startup Reconciliation ──
         info!("Running startup reconciliation...");

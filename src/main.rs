@@ -9,10 +9,6 @@ mod app;
 mod config;
 mod error;
 mod indexer;
-/// Serializes FPDF_InitLibrary() calls across threads.
-mod pdfium_lock {
-    pub(crate) static INIT: std::sync::Mutex<()> = std::sync::Mutex::new(());
-}
 mod preview;
 mod runtime;
 mod search;
