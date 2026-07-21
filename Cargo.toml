@@ -1,0 +1,38 @@
+[package]
+name = "papervault"
+version = "0.1.0"
+edition = "2021"
+description = "Fast, lightweight PDF and text file search & viewer for Windows 11"
+
+[dependencies]
+egui = "0.30"
+eframe = "0.30"
+tantivy = "0.22"
+pdfium-render = "0.8"
+notify = { version = "7", features = ["macos_kqueue"] }
+notify-debouncer-full = "0.4"
+rusqlite = { version = "0.32", features = ["bundled"] }
+crossbeam = "0.8"
+blake3 = "1.5"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+thiserror = "2"
+dirs-next = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+lopdf = "0.34"
+chrono = "0.4"
+
+[dev-dependencies]
+tempfile = "3"
+printpdf = "0.7"
+
+## Benchmarks (requires nightly)
+## [[bench]]
+## name = "search_bench"
+## harness = false
+##
+## [[bench]]
+## name = "indexing_bench"
+## harness = false
