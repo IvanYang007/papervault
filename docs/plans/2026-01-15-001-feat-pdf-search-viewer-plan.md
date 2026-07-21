@@ -3,9 +3,11 @@ date: 2026-01-15
 status: active
 origin: docs/brainstorms/2026-01-15-pdf-search-viewer-requirements.md
 deepened:
+reviewed: 2026-01-15
+review_round: 4
 ---
 
-# feat: PDF Search & Viewer — Design Document
+# feat: PDF Search & Viewer — Design Document (v2)
 
 ## Summary
 
@@ -24,82 +26,89 @@ See origin document `docs/brainstorms/2026-01-15-pdf-search-viewer-requirements.
 ## Architecture Overview
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│                    egui Application                      │
-│  ┌──────────┐  ┌──────────────┐  ┌───────────────────┐  │
-│  │ Search   │  │ Results List │  │ Preview Pane      │  │
-│  │ Bar      │  │ (snippets)   │  │ (pdfium page      │  │
-│  │          │  │              │  │  + highlight      │  │
-│  │          │  │              │  │  overlay)         │  │
-│  └──────────┘  └──────────────┘  └───────────────────┘  │
-│                     │                                    │
-│              ┌──────┴──────┐                             │
-│              │  App State  │                             │
-│              │  (channels) │                             │
-│              └──────┬──────┘                             │
-└─────────────────────┼────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│                      egui Application                        │
+│  ┌──────────┐  ┌──────────────┐  ┌────────────────────────┐  │
+│  │ Search   │  │ Results List │  │ Preview Pane           │  │
+│  │ Bar      │  │ (snippets)   │  │ (TextureHandle from    │  │
+│  │          │  │              │  │  render thread via     │  │
+│  │          │  │              │  │  channel + highlights) │  │
+│  └──────────┘  └──────────────┘  └────────────────────────┘  │
+│                     │                                         │
+│              ┌──────┴──────┐                                  │
+│              │  App State  │                                  │
+│              │  (channels) │                                  │
+│              └──────┬──────┘                                  │
+└─────────────────────┼────────────────────────────────────────┘
                       │
-        ┌─────────────┼─────────────┐
-        ▼             ▼             ▼
-┌───────────┐  ┌────────────┐  ┌────────────┐
-│  Search   │  │  Indexer   │  │  Watcher   │
-│  Engine   │  │  Pipeline  │  │  (notify)  │
-│ (tantivy) │  │            │  │            │
-└───────────┘  └─────┬──────┘  └─────┬──────┘
-                     │               │
-              ┌──────┴──────┐        │
-              │  Extractors │        │
-              │  ┌────────┐ │        │
-              │  │ PDF    │ │        │
-              │  │(pdfium)│ │        │
-              │  ├────────┤ │        │
-              │  │ Text   │ │        │
-              │  │(direct)│ │        │
-              │  ├────────┤ │        │
-              │  │ OCR v2 │ │        │
-              │  ├────────┤ │        │
-              │  │ AI v2  │ │        │
-              │  └────────┘ │        │
-              └──────┬──────┘        │
-                     │               │
-              ┌──────┴──────┐        │
-              │   SQLite    │        │
-              │ (tags, meta)│        │
-              └─────────────┘        │
-                     │               │
-            ┌────────┴────────┐      │
-            │  File System    │◄─────┘
+        ┌─────────────┼──────────────────┐
+        ▼             ▼                  ▼
+┌───────────┐  ┌────────────┐  ┌──────────────────┐  ┌──────────┐
+│  Search   │  │  Indexer   │  │  PDF Renderer    │  │  Watcher │
+│  Engine   │  │  Pipeline  │  │  Thread          │  │ (notify- │
+│ (tantivy) │  │            │  │  (pdfium)        │  │debouncer │
+│           │  │            │  │                  │  │ -full)   │
+│  on UI    │  │            │  │  renders pages    │  │          │
+│  thread   │  │            │  │  → sends bitmaps  │  │          │
+└───────────┘  └─────┬──────┘  └──────────────────┘  └─────┬────┘
+                     │                                      │
+              ┌──────┴──────┐                               │
+              │  Extractors │                               │
+              │  ┌────────┐ │                               │
+              │  │ PDF    │ │                               │
+              │  │(pdfium)│ │                               │
+              │  ├────────┤ │                               │
+              │  │ Text   │ │                               │
+              │  │(direct)│ │                               │
+              │  ├────────┤ │                               │
+              │  │ OCR v2 │ │                               │
+              │  ├────────┤ │                               │
+              │  │ AI v2  │ │                               │
+              │  └────────┘ │                               │
+              └──────┬──────┘                               │
+                     │                                      │
+              ┌──────┴──────┐                               │
+              │   SQLite    │                               │
+              │ (WAL mode,  │                               │
+              │  2 conns,   │                               │
+              │  busy_tmo)  │                               │
+              └─────────────┘                               │
+                     │                                      │
+            ┌────────┴────────┐                             │
+            │  File System    │◄────────────────────────────┘
             │  (watched dir)  │
             └─────────────────┘
 ```
 
-**Thread model:**
+**Thread model (4 threads):**
 
 | Thread | Role |
 |--------|------|
-| **UI thread** | egui render loop, user input, search query dispatch |
+| **UI thread** | egui render loop, user input, Tantivy search queries (lock-free reader) |
 | **Indexer thread** | Runs the extraction pipeline, commits to Tantivy, writes SQLite metadata |
-| **Watcher thread** | notify event loop, enqueues files for indexing |
-| **Searcher** | Tantivy reader (lock-free), queried from UI thread — no dedicated thread needed |
+| **Renderer thread** | Owns pdfium instance, renders PDF pages to bitmaps on request, sends back via channel |
+| **Watcher thread** | `notify-debouncer-full` event loop, enqueues files for indexing |
 
-**Communication:** Crossbeam channels between UI thread and background threads. The UI sends `Search(query)` messages; the indexer sends `IndexingProgress(file, done/total)` updates if batch operations are active.
+**Communication:** Crossbeam channels between all threads. The UI thread sends `RenderRequest(page)` to renderer thread; renderer sends `RenderResult(bitmap)` back. Watcher sends `IndexerMessage` to indexer via `crossbeam::bounded(10_000)`. Indexer sends `IndexingProgress` to UI thread via `crossbeam::unbounded`. UI thread sends `TagUpdateMessage` to indexer via `crossbeam::unbounded` (low volume). Shutdown signal flows from UI thread to all background threads.
+
+**Graceful shutdown:** On app close (egui `on_close_event`), UI thread sends shutdown signal to all background threads, waits for each to flush and acknowledge, then exits. Indexer commits final batch before stopping. See [Graceful Shutdown](#graceful-shutdown) below.
 
 ---
 
 ## Crate Selection
 
-| Component | Crate | Version (approx) | Rationale |
-|-----------|-------|-------------------|-----------|
-| GUI | `egui` + `eframe` | 0.30+ | Pure Rust, fast, good for data-dense UIs. Default wgpu backend. |
-| Search index | `tantivy` | 0.22+ | Rust-native full-text search, lock-free readers, incremental commits. |
-| PDF text/rendering | `pdfium-render` | 0.8+ | Rust bindings to Chromium's pdfium. Single engine for both extraction and rendering. |
-| File watching | `notify` | 7.0+ | Cross-platform filesystem events. Uses ReadDirectoryChangesW on Windows. |
-| Metadata/tags | `rusqlite` | 0.32+ | SQLite for tag storage. Lightweight, embeddable, zero-config. |
-| Channels | `crossbeam` | 0.8+ | MPMC channels for UI ↔ background thread communication. |
-| Content hashing | `blake3` | 1.5+ | Fast content hash for detecting file changes and stable document identity. |
-| Logging | `tracing` + `tracing-subscriber` | 0.1+/0.3+ | Structured logging. |
-| Error handling | `anyhow` + `thiserror` | latest | anyhow for application code, thiserror for library-level error types. |
-| Config | `dirs` | 5.0+ | Platform-appropriate config/data directories. |
+| Component | Crate | Rationale |
+|-----------|-------|-----------|
+| GUI | `egui` + `eframe` | Pure Rust, fast, good for data-dense UIs. Default wgpu backend. |
+| Search index | `tantivy` | Rust-native full-text search, lock-free readers, incremental commits. |
+| PDF text/rendering | `pdfium-render` | Rust bindings to Chromium's pdfium. Single engine for both extraction and rendering. |
+| File watching | `notify` + `notify-debouncer-full` | `notify-debouncer-full` handles event dedup, rename tracking, and backpressure. Avoids fragile manual debounce implementation. |
+| Metadata/tags | `rusqlite` | SQLite for tag storage. WAL mode for concurrent reads+writes. |
+| Channels | `crossbeam` | MPMC channels for UI ↔ background thread communication. |
+| Content hashing | `blake3` | Fast content hash for detecting file changes and stable document identity. Unkeyed — suitable for dedup, not for adversarial contexts. |
+| Logging | `tracing` + `tracing-subscriber` | Structured logging. |
+| Error handling | `anyhow` + `thiserror` | anyhow for application code, thiserror for library-level error types. Extractors return `anyhow::Result` — errors are logged, not programmatically matched. |
+| Config | `dirs-next` | Actively maintained fork of `dirs`. `data_local_dir()` for index, `config_dir()` for settings. |
 
 ---
 
@@ -113,28 +122,33 @@ Field               Type        Stored  Indexed  Fast
 doc_id              Str          yes     yes      no
 file_path           Str          yes     no       no   (display only)
 file_name           Str          yes     yes      no   (searchable filename)
-body                Text         no      yes      yes  (full-text content)
+body                Text         yes     yes      no   (full-text — STORED + INDEXED with positions for SnippetGenerator, NOT fast)
 file_type           Str          yes     yes      no   ("pdf" | "txt" | "md" | "log")
 modified_ts         Date         yes     no       no   (for sorting)
-content_hash        Str          yes     yes      no   (stable ID)
+content_hash        Str          yes     yes      no   (Stored + Indexed as Str — required for IndexWriter::delete_term)
 tags                Str (multi)  yes     yes      no   (multi-valued for tag filtering)
 ```
 
 Key decisions:
 - `doc_id = content_hash + file_type` — stable even if file is renamed.
-- `body` is not stored (re-extract from file for preview). This keeps the index small.
-- `tags` are denormalized into Tantivy for fast filtering without a SQLite join during search.
-- `fast` field (`body`) enables sub-200ms search at 10K scale.
+- `body` is `STORED` + `INDEXED` with `TEXT` options (includes term positions, required for `SnippetGenerator`). Stored text enables contextual snippets around matched terms. Index size impact: ~500MB of body text at 10K documents (50KB avg per PDF) — acceptable on modern SSDs. `body` is NOT `FAST` — `FAST` on text fields enables columnar access (useful for u64/f64/date, not text search) and adds ZSTD compression overhead with zero search benefit.
+- `tags` are denormalized into Tantivy for fast filtering without a SQLite round-trip during search. Tag changes on the UI thread are synced to Tantivy via a dedicated UI→indexer channel (see Tag Synchronization below).
+- `content_hash` is `Stored` + `Indexed` as `Str` (not `Text`). `IndexWriter::delete_term` requires an indexed field to locate documents — without INDEXED, `delete_term` silently becomes a no-op. A `Str` field creates a minimal inverted index (one 64-char hex string per document, <1MB overhead at 10K scale).
 
 ### SQLite Schema (tags and metadata)
 
 ```sql
+PRAGMA journal_mode=WAL;
+PRAGMA busy_timeout=5000;
+
 CREATE TABLE documents (
     content_hash TEXT PRIMARY KEY,  -- blake3 hex
     file_path   TEXT NOT NULL,      -- current path
     file_type   TEXT NOT NULL,
-    file_size   INTEGER,
-    indexed_at  TEXT NOT NULL       -- ISO 8601
+    file_size   INTEGER NOT NULL,
+    modified_ts INTEGER NOT NULL,   -- Unix timestamp
+    indexed_at  TEXT NOT NULL,      -- ISO 8601
+    last_error  TEXT                -- NULL = ok, otherwise last extraction error
 );
 
 CREATE TABLE tags (
@@ -143,13 +157,13 @@ CREATE TABLE tags (
 );
 
 CREATE TABLE document_tags (
-    content_hash TEXT NOT NULL REFERENCES documents(content_hash),
-    tag_id      INTEGER NOT NULL REFERENCES tags(id),
+    content_hash TEXT NOT NULL REFERENCES documents(content_hash) ON DELETE CASCADE,
+    tag_id      INTEGER NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
     PRIMARY KEY (content_hash, tag_id)
 );
 ```
 
-Future AI integration point: `document_tags` is a simple junction table. An AI model can INSERT/UPDATE/DELETE from `document_tags` with no structural changes.
+**SQLite concurrency strategy:** Two separate `rusqlite::Connection` instances — one on the indexer thread (writes to `documents`), one on the UI thread (`TagStore` reads + tag CRUD). WAL mode allows concurrent readers and one writer without `SQLITE_BUSY`. `busy_timeout=5000` provides a safety net.
 
 ---
 
@@ -163,25 +177,25 @@ src/
 │   ├── mod.rs
 │   ├── engine.rs            # Tantivy index open/write/search
 │   ├── schema.rs            # Tantivy schema definition
-│   └── query.rs             # Query builder (phrase, fuzzy, tag filters)
+│   └── query.rs             # Query builder + SearchRequest struct
 ├── indexer/
 │   ├── mod.rs
-│   ├── pipeline.rs          # Pipeline orchestrator (stage runner)
+│   ├── pipeline.rs          # Pipeline orchestrator (stage runner + reconciliation)
 │   ├── extractors/
-│   │   ├── mod.rs           # Extractor trait definition
+│   │   ├── mod.rs           # Extractor trait + ExtractedContent
 │   │   ├── pdf.rs           # pdfium-based PDF text extraction
 │   │   └── text.rs          # Plain text / .md / .log extraction
 │   └── stages.rs            # Concrete stage chain assembly
 ├── watcher/
 │   ├── mod.rs
-│   └── watcher.rs           # notify event loop, file discovery
+│   └── watcher.rs           # notify-debouncer-full event loop
 ├── tags/
 │   ├── mod.rs
 │   ├── store.rs             # SQLite CRUD for tags
 │   └── model.rs             # Tag, DocumentTag structs
 ├── preview/
 │   ├── mod.rs
-│   ├── pdf_render.rs        # pdfium page → egui texture
+│   ├── pdf_render.rs        # Render thread: pdfium page → bitmap → channel
 │   └── highlight.rs         # Search term highlight overlay
 ├── config.rs                # Watched folder path, app settings
 └── error.rs                 # Error types (thiserror)
@@ -193,38 +207,53 @@ src/
 
 ### UI Thread (main)
 - Runs `eframe::run_native` event loop.
-- On each frame: checks channel for new search results, applies to UI state.
-- Dispatches search queries via channel to search engine (Tantivy reader is cheap, could run on UI thread, but channel decoupling is cleaner).
+- Tantivy `Searcher` runs directly on UI thread — lock-free MVCC reader, queries complete in microseconds.
+- Displays results, manages texture handles from renderer thread.
+- Sends `RenderRequest` to renderer thread via channel; receives `RenderResult` with bitmap bytes.
 
-**Decision: Run Tantivy search directly on UI thread.** Tantivy's `Searcher` is lock-free and a query against 10K docs completes in microseconds. A channel would add latency for no benefit. Background indexing writes to a separate `IndexWriter` — Tantivy's MVCC ensures readers see a consistent snapshot.
+### Indexer Thread
+- Receives file paths from watcher thread via `crossbeam::bounded(10_000)`.
+- Runs pipeline: fast-path metadata check → extract text → re-hash to verify → commit to Tantivy → update SQLite.
+- Commits to Tantivy every 10 documents or every 2 seconds, whichever comes first, so incremental results appear during batch indexing.
+- Sends `IndexingProgress` events to UI thread via `crossbeam::unbounded`.
+- On shutdown signal: commits any pending documents, closes IndexWriter, acknowledges.
 
-### Indexer Thread (spawned once, runs for app lifetime)
-- Receives file paths from watcher thread via `crossbeam::unbounded`.
-- Runs pipeline: extract text → commit to Tantivy → update SQLite.
-- Sends progress events to UI thread via `crossbeam::unbounded`.
-- Shuts down on drop of sender.
+### Renderer Thread
+- Owns a dedicated `Pdfium` instance (no sharing needed — one `Pdfium` per thread).
+- Receives `RenderRequest { path, page, search_terms }` from UI thread.
+- Opens PDF, renders page to pre-allocated reusable bitmap buffer, finds text positions for highlights.
+- Sends `RenderResult { rgba_bytes, width, height, highlights: Vec<Rect> }` back to UI thread.
+- Caches open `PdfDocument` handles (LRU, max 5 documents) for fast page-flipping.
+- pdfium is lazy-initialized: `Pdfium::new()` is called on first render request, not at app startup.
 
-### Watcher Thread (spawned once, runs for app lifetime)
-- Runs `notify::Watcher` event loop.
-- Deduplicates rapid-fire events (debounce 500ms per path).
-- Sends `PathBuf` to indexer thread.
+### Watcher Thread
+- Uses `notify-debouncer-full` with 500ms timeout.
+- Handles event deduplication, rename tracking, and backpressure automatically.
+- For deletions: skips debounce, sends immediately.
+- Sends `PathBuf` + metadata `(modified_ts, file_size)` to indexer thread.
 
-### Thread Safety
-- Tantivy: `Index` is `Send + Sync`. `IndexWriter` lives on indexer thread. `IndexReader` created on UI thread.
-- SQLite: `rusqlite::Connection` is `Send` but not `Sync`. Each thread gets its own connection, or wrap in `Mutex<Connection>` for the indexer thread.
-- pdfium: `Pdfium` is `Send` but not `Sync`. One instance on indexer thread for extraction, one on UI thread for rendering (or share via `Arc<Mutex<Pdfium>>` — decision deferred to implementation).
+### Graceful Shutdown
+
+On app close:
+1. UI thread receives close event via egui.
+2. Sends shutdown signal to watcher, indexer, and renderer threads.
+3. Watcher stops immediately.
+4. Indexer commits any pending Tantivy documents, calls `IndexWriter::prepare_commit()`, drops `IndexWriter`.
+5. Renderer drops cached `PdfDocument` handles, drops `Pdfium`.
+6. UI thread waits for all threads to acknowledge (with 5-second timeout, then force-exits).
+7. On next startup: `garbage_collect_files()` runs to clean stale segments from any prior unclean shutdown.
 
 ---
 
 ## Indexing Pipeline Design
 
 ```rust
-/// Each extractor takes a file path and returns extracted text + metadata.
-trait Extractor: Send + Sync {
-    /// Returns None if this extractor cannot handle this file type.
-    fn can_handle(&self, path: &Path) -> bool;
-    /// Extracts text content. Returns error on extraction failure (not on unsupported files).
-    fn extract(&self, path: &Path) -> Result<ExtractedContent>;
+/// Single-method extractor — returns Ok(None) for unsupported files.
+trait Extractor: Send {
+    /// Attempt text extraction. Returns Ok(None) if this extractor
+    /// cannot handle this file type (not an error — try next extractor).
+    /// Returns Err only on genuine extraction failures.
+    fn extract(&self, path: &Path) -> Result<Option<ExtractedContent>>;
 }
 
 struct ExtractedContent {
@@ -236,58 +265,156 @@ struct ExtractedContent {
 struct Pipeline {
     stages: Vec<Box<dyn Extractor>>,
     index_writer: IndexWriter,
-    db: Connection,
+    db: Connection,             // indexer-owned SQLite connection
 }
+```
 
+### Pipeline Process Flow
+
+```rust
 impl Pipeline {
-    fn process(&mut self, path: PathBuf) -> Result<()> {
-        let content_hash = blake3_hash(&path)?;
-        // Check if already indexed with same hash → skip
-        if self.already_indexed(&content_hash, &path)? {
+    fn process(&mut self, path: PathBuf, mtime: u64, size: u64) -> Result<()> {
+        // Step 1: Fast-path — check metadata (timestamp + size) in SQLite.
+        //          Avoids reading/hashing file if nothing changed. <1ms.
+        if self.already_indexed_by_metadata(&path, mtime, size)? {
             return Ok(());
         }
-        let extracted = self.run_extractors(&path)?;
-        self.commit_to_tantivy(&path, &content_hash, &extracted)?;
-        self.update_sqlite(&path, &content_hash, &extracted)?;
+
+        // Step 2: Compute content hash (reads file once).
+        //          Hash is computed INCREMENTALLY during extraction
+        //          (pipe file bytes through blake3 hasher while extracting)
+        //          to avoid reading the file twice.
+        let (extracted, content_hash) = self.extract_and_hash(&path)?;
+
+        // Step 3: Check if content hash already exists in index (dedup/rename).
+        if self.already_indexed_by_hash(&content_hash)? {
+            // Same content, different path — update path in SQLite, skip re-index.
+            self.update_path(&content_hash, &path)?;
+            return Ok(());
+        }
+
+        // Step 4: Extract text via pipeline stages.
+        let text = self.run_extractors(&path)?;
+
+        // Step 5: Re-verify hash after extraction (catches TOCTOU modification).
+        //          If hash changed, retry once. If still different, log warning and skip.
+        let post_hash = blake3::hash(&std::fs::read(&path)?);
+        if post_hash != content_hash {
+            tracing::warn!("File modified during extraction: {}", path.display());
+            // Retry once
+            let retry_text = self.run_extractors(&path)?;
+            let retry_hash = blake3::hash(&std::fs::read(&path)?);
+            if retry_hash != post_hash {
+                return Err(anyhow::anyhow!("File modified during extraction after retry"));
+            }
+            // Use retry results
+        }
+
+        // Step 6: Commit to Tantivy and SQLite.
+        //          Write order: SQLite FIRST, then Tantivy.
+        //          Rationale: an orphan in SQLite is harmless and can be cleaned up
+        //          on the next index pass. An orphan in Tantivy with no SQLite row
+        //          breaks tag referential integrity.
+        self.update_sqlite(&path, &content_hash, &text)?;
+        self.commit_to_tantivy(&path, &content_hash, &text)?;
+
         Ok(())
     }
 }
 ```
 
-**v2 extension points:**
-- Add `OcrExtractor` that runs on image-based PDFs (runs before or after text extraction).
-- Add `AiTagExtractor` that calls a local model and writes to `document_tags`.
-- Both are new `impl Extractor` structs added to `stages` vector — no pipeline code changes.
+**Commit cadence:** `commit_to_tantivy` calls `IndexWriter::commit()` every 10 documents or every 2 seconds (whichever comes first). Intermediate documents are buffered in `IndexWriter` memory (which is crash-safe for Tantivy's MVCC). This ensures incremental visibility during batch indexing.
+
+**Deletion flow:** The watcher→indexer channel uses a typed message enum:
+
+```rust
+enum IndexerMessage {
+    Upsert { path: PathBuf, mtime: u64, size: u64 },
+    Delete { path: PathBuf },
+}
+```
+
+On `Delete`: pipeline looks up `content_hash` from SQLite by path, calls `IndexWriter::delete_term(Term::from_field_text(content_hash, &content_hash))` using the indexed `content_hash` field (not `doc_id` — `doc_id = hash + file_type` and won't match with the hash alone), commits, and removes the SQLite row. Batch deletions can be committed together.
+
+**Tag synchronization:** A dedicated channel carries tag updates from the UI thread to the indexer thread:
+
+```rust
+enum TagUpdateMessage {
+    UpdateDocumentTags { content_hash: String, tags: Vec<String> },
+}
+```
+
+The indexer thread processes these by: (1) look up current Tantivy document by `content_hash`, (2) call `IndexWriter::delete_term` to remove it, (3) re-insert with updated `tags` field, (4) commit. This ensures tag-filtered search results are always current.
+
+**Error recovery:** Failed files are logged with their error to SQLite (`documents.last_error` column). On the next file event, if the `(path, mtime, size)` changed since the failed attempt, the file is retried. The UI shows "N files with indexing errors" with a viewable list.
+
+### Startup Reconciliation
+
+On app startup, before the watcher begins processing events:
+
+1. Open Tantivy index and SQLite.
+2. Run `IndexWriter::garbage_collect_files()` to clean stale segments.
+3. Iterate all `doc_id`s in Tantivy. For each:
+   - If missing from SQLite `documents`: backfill a SQLite row (metadata from Tantivy stored fields).
+   - If present in SQLite but file no longer exists on disk: remove from both Tantivy and SQLite.
+   - If file exists but `mtime` or `size` changed: mark for re-indexing (enqueue to pipeline).
+4. Remove SQLite rows with no corresponding Tantivy document.
+
+This ensures Tantivy and SQLite are consistent regardless of prior crashes.
+
+---
+
+## File Watcher Strategy
+
+Use `notify-debouncer-full` (not manual debounce). It provides:
+
+- Filesystem event deduplication by file ID (inode/handle), not just path.
+- Rename tracking (emits both old and new paths).
+- Event kind coalescing (Create+Write → single event).
+- Backpressure handling for high-frequency event storms.
+
+Configuration: 500ms debounce timeout. Delete events bypass debounce.
+
+For scanner workflows: if the scanner writes slowly (>500ms gaps), the user should configure the scanner to write to a temp directory and atomically move completed files into the watched folder. Document this in user-facing help.
+
+On each event, the watcher emits `(PathBuf, modified_ts, file_size)` tuples to enable the pipeline's metadata fast-path.
 
 ---
 
 ## PDF Rendering Strategy
 
-pdfium renders a page to a bitmap (`FPDFBitmap`). The flow for preview:
+PDF rendering runs on a **dedicated background thread** to avoid blocking the egui UI thread.
 
-1. User clicks a search result.
-2. UI thread uses `pdfium-render` to open the PDF and render the page containing the first match.
-3. Bitmap is converted to `egui::ColorImage` → `egui::TextureHandle`.
-4. Texture is displayed in an `egui::Image` widget inside a scroll area.
-5. Search term highlights: pdfium provides `FPDFText_FindStart` / `FPDFText_GetCharBox` which returns character bounding boxes. Map those boxes to pixel coordinates on the rendered bitmap, then draw colored rectangles via egui painter on top of the image.
+### Flow
 
-**Memory:** One rendered page at a time. Textures are cached per page (LRU, max 10 pages) for fast page flipping.
+```
+UI click → send RenderRequest { path, page, search_terms } via channel
+  → Render thread:
+      1. Open PDF (or reuse cached PdfDocument handle, LRU max 5)
+      2. Render page to pre-allocated reusable PdfBitmap buffer
+         (PdfBitmap::new_from_bytes() with reused allocation — no per-frame allocation)
+      3. Find text positions for search terms via pdfium text-find API
+      4. Map character boxes to pixel coordinates for highlight overlays
+      5. Send RenderResult { rgba_bytes, width, height, highlights } back
+  → UI thread:
+      1. Create egui::ColorImage from rgba_bytes
+      2. Upload as TextureHandle (fast, GPU operation)
+      3. Draw highlights as semi-transparent colored rectangles via egui::Painter
+```
 
-**Risk:** pdfium-render's API surface may not expose all the text-find primitives needed for highlight bounding boxes. Mitigation: if pdfium-render is insufficient, fall back to re-extracting text with position info via `lopdf` for the currently-viewed page only, then manual text search + coordinate mapping.
+### Memory
 
----
+- **Bitmap buffer:** One pre-allocated RGBA buffer on the renderer thread, reused across renders. Size: `preview_width × preview_height × 4` bytes, typical ~8–30MB depending on monitor resolution.
+- **Texture cache:** Byte-budgeted LRU cache on the UI thread (default budget: 200MB). Eviction explicitly calls `ctx.tex_manager().write().forget(&texture_id)` to free GPU memory. At a typical 1440p monitor with the preview pane at ~1200px wide, this caches 3–5 pages.
+- **Document handle cache:** LRU cache of open `PdfDocument` handles (max 5) on the renderer thread. Combined with texture cache, page-flipping within a recently-viewed document is instant.
 
-## File Watcher Debounce Strategy
+### Highlight Bounding Boxes
 
-Windows `notify` can fire multiple events for a single file operation (e.g., Create → Write → Write). Strategy:
+pdfium's `FPDFText_Find*` API provides character bounding boxes. If pdfium-render's binding does not expose this API sufficiently, fall back to: extract text with position info via `lopdf` for the currently-viewed page only, then manual search + coordinate mapping.
 
-1. Watcher thread receives raw events.
-2. Per-path debounce: on first event for path P, start a 500ms timer.
-3. If another event arrives for P within 500ms, reset the timer.
-4. When timer expires, enqueue P to the indexer thread.
-5. Special case: `Remove` events skip the timer and are processed immediately (with index deletion).
+### pdfium Lazy Initialization
 
-This prevents indexing the same file 3 times when a scanner writes it.
+`Pdfium::new()` is called on the renderer thread only when the first `RenderRequest` arrives — not at app startup. Cold startup (first launch after reboot) is dominated by pdfium init (400–800ms for DLL load + V8 JS engine + font tables). With lazy init, the UI becomes responsive in <200ms (egui window + Tantivy index open + SQLite). The user sees a brief "Loading PDF engine..." spinner on first preview click. Warm startup (pdfium.dll in filesystem cache): <500ms total.
 
 ---
 
@@ -298,37 +425,42 @@ User types "invoice March"
     │
     ▼
 ┌─────────────────────────────┐
-│ Query Parser                │
-│ - Split terms               │
-│ - Build Tantivy query:      │
-│   BooleanQuery {            │
-│     MUST: body:"invoice"    │
-│     MUST: body:"March"      │
-│     (optional: fuzzy if     │
-│      no results)            │
-│   }                         │
-│ - Apply tag filters:        │
-│   TermQuery on tags field   │
+│ SearchRequest               │
+│ { query, tag_filters,       │
+│   fuzzy: false, limit: 50 } │
 └────────────┬────────────────┘
              ▼
 ┌─────────────────────────────┐
 │ Tantivy Searcher            │
-│ - Lock-free read            │
+│ - Lock-free read (UI thread)│
 │ - BM25 scoring              │
-│ - Returns TopDocs           │
+│ - BooleanQuery AND terms    │
+│ - TermQuery for tag filters │
+│ - Returns TopDocs (max 50)  │
+└────────────┬────────────────┘
+             ▼
+┌─────────────────────────────┐
+│ SnippetGenerator            │
+│ - Extract snippets with     │
+│   highlighted terms         │
+│   (requires TEXT positions) │
 └────────────┬────────────────┘
              ▼
 ┌─────────────────────────────┐
 │ Result Formatter            │
-│ - Extract snippets with     │
-│   highlighted terms         │
-│ - Format: filename,         │
-│   snippet, match count,     │
-│   file type icon            │
+│ - Truncate to limit (50)    │
+│ - Show "50 of 5,234" if     │
+│   total hits exceed limit   │
 └────────────┬────────────────┘
              ▼
        UI Results List
 ```
+
+**Search runs on UI thread.** Tantivy's `Searcher` is lock-free (MVCC snapshot), and BM25 scoring over 10K docs with a 2–3 term AND query completes in <1ms. Snippet generation adds ~1ms. A channel round-trip would add latency for no benefit.
+
+**Result limit:** Default 50 results. The UI shows "50 of N matches — refine your query" if total hits exceed the limit. This prevents frame drops from rendering 10K result rows and matches the old-Evernote UX.
+
+`SearchRequest` struct is defined in U3 (not added in U9) to avoid re-signaturing the public API.
 
 ---
 
@@ -341,13 +473,13 @@ User types "invoice March"
 - **Dependencies:** None
 - **Files:**
   - `Cargo.toml`
-  - `src/main.rs`
-  - `src/app.rs`
+  - `src/main.rs` — includes panic hook + tracing init
+  - `src/app.rs` — `PapervaultApp` struct with placeholder UI
   - `src/error.rs`
-- **Approach:** Create a Cargo binary crate. Add all dependencies from the crate selection table. `main.rs` launches an `eframe::run_native` with a basic `PapervaultApp` struct. The window shows a placeholder search bar and "No folder configured" message.
-- **Patterns to follow:** Standard egui `eframe` template from egui docs.
+- **Approach:** Create a Cargo binary crate. Add all dependencies from the crate selection table. Set panic hook in `main.rs`: log panics via `tracing::error!` and write to `crash.log`. `main.rs` launches `eframe::run_native`. Placeholder window shows "No folder configured" message.
+- **Patterns to follow:** Standard egui `eframe` template.
 - **Test scenarios:**
-  - App compiles and launches, displays an empty window with title "Papervault".
+  - App compiles and launches, displays a window with title "Papervault".
   - `cargo build --release` succeeds on Windows.
 - **Test expectation: none — scaffolding, verified by `cargo build`.**
 
@@ -359,53 +491,53 @@ User types "invoice March"
 - **Files:**
   - `src/config.rs`
   - `src/app.rs` (modify: folder selection UI)
-- **Approach:** Store config as JSON in `dirs::config_dir()/papervault/config.json`. On first launch, show a "Select folder" button that opens `rfd::FileDialog` (native folder picker). Validate the path exists and is readable. Config struct: `{ watched_folder: PathBuf }`. Load on startup, save on change.
-- **Patterns to follow:** `dirs` crate for platform config paths, `serde_json` for persistence.
+- **Approach:** Store config as JSON in `dirs_next::config_dir()/papervault/config.json`. First launch: "Select folder" button via `rfd::FileDialog`. Config struct: `{ watched_folder: PathBuf }`. Load on startup, save on change.
+- **Patterns to follow:** `dirs-next` for platform config paths, `serde_json` for persistence.
 - **Test scenarios:**
   - First launch shows folder selection UI.
   - After selecting a folder, the path is displayed and persists across restarts.
   - Changing the watched folder updates the config file.
-  - Invalid folder path shows an error message, does not crash.
-- **Verification:** Select a folder through the UI, restart the app, confirm the folder path is remembered.
+  - Invalid folder path shows an error message, no crash.
+- **Verification:** Select a folder through the UI, restart app, confirm folder path is remembered.
 
 ### U3. Tantivy Index: Schema, Open, and Search
 
-- **Goal:** Define the Tantivy schema, create/open the index on disk, and implement basic full-text search.
+- **Goal:** Define the Tantivy schema (body STORED+INDEXED for SnippetGenerator, content_hash INDEXED for delete_term), create/open the index, and implement full-text search with `SearchRequest`.
 - **Requirements:** R1, R2
 - **Dependencies:** U1
 - **Files:**
   - `src/search/schema.rs`
-  - `src/search/engine.rs`
-  - `src/search/query.rs`
+  - `src/search/engine.rs` — `SearchEngine::search(SearchRequest) -> SearchResults`
+  - `src/search/query.rs` — `SearchRequest { query, tag_filters, fuzzy, limit }`
   - `src/search/mod.rs`
-- **Approach:** Define the Tantivy schema as specified in the data model section. `SearchEngine` struct manages `Index` lifecycle (open or create). `search(&self, query: &str) -> Vec<SearchResult>` parses the query string into a Tantivy `Query`, executes it, and formats results with snippets. Use Tantivy's `SnippetGenerator` for highlighted snippets. Index directory: `dirs::data_dir()/papervault/index/`.
-- **Patterns to follow:** Tantivy's official examples for schema definition and query building.
+- **Approach:** `SearchEngine` manages `Index` lifecycle. Index directory: `dirs_next::data_local_dir()/papervault/index/`. On startup: `IndexWriter::garbage_collect_files()`. `search()` parses query into BooleanQuery, executes on UI thread, returns results with snippets via `SnippetGenerator`. Result limit: default 50.
 - **Test scenarios:**
-  - `SearchEngine::open_or_create` creates a new index if none exists, opens existing one.
-  - Indexing a document with known text, then searching for a term in that text returns the document.
-  - Search for a term not in any document returns empty results.
-  - Search results include filename, snippet with highlighted term, and match count.
-  - Multiple terms are AND-combined (searching "invoice March" matches only documents with both).
-  - Search completes in under 50ms with 10,000 documents in the index.
-- **Verification:** Integration test: index 5 documents with known content, search for specific terms, verify correct results with snippets.
+  - `open_or_create` creates new index if none exists, opens existing one.
+  - Index a document, search for a term in that document → found.
+  - Search for absent term → empty results.
+  - Results include filename, highlight snippet, match count.
+  - Multiple terms AND-combined.
+  - Search with `limit: 10` returns max 10 results.
+  - Total hits > limit returns overflow count.
+  - Search completes in <1ms with 10K docs indexed.
+- **Verification:** Integration test: index 5 documents, search, verify results.
 
-### U4. File Watcher with Debounce
+### U4. File Watcher with notify-debouncer-full
 
-- **Goal:** Watch the configured folder for new, modified, and deleted files, with debounced event delivery.
+- **Goal:** Watch the configured folder using `notify-debouncer-full`.
 - **Requirements:** R6, R8, R12
 - **Dependencies:** U2
 - **Files:**
   - `src/watcher/watcher.rs`
   - `src/watcher/mod.rs`
-- **Approach:** Use `notify::recommended_watcher`. On `EventKind::Create` or `EventKind::Modify`, debounce per-path with a 500ms timer (use `std::time::Instant` tracking in a `HashMap<PathBuf, Instant>`). On timer expiry, send the path through a `crossbeam::Sender<PathBuf>` to the indexer. On `EventKind::Remove`, skip debounce and send immediately with a `FileEvent::Deleted` variant. Filter events to only supported extensions (pdf, txt, md, log).
-- **Patterns to follow:** `notify` crate examples.
+- **Approach:** Use `notify-debouncer-full` with 500ms timeout. No manual debounce hashmap. Filter to supported extensions. Emit `(PathBuf, modified_ts, file_size)` tuples. Delete events bypass debounce. Send via `crossbeam::bounded(10_000)` to indexer. On initial startup, emit events for all existing files in the folder (initial scan).
 - **Test scenarios:**
-  - Creating a .pdf file in the watched folder sends a `FileEvent::Created` after 500ms debounce.
-  - Rapid writes to same file within 500ms produce a single event.
-  - Deleting a file sends a `FileEvent::Deleted` with no debounce delay.
-  - Creating an unsupported file (.exe, .jpg) does not trigger an event.
-  - Watcher emits events for files already present at startup (initial scan).
-- **Verification:** Unit test with a temp directory: create/modify/delete files, assert events arrive with correct debounce behavior.
+  - Creating a .pdf sends a single event after 500ms debounce.
+  - Rapid writes to same file produce a single event.
+  - Deleting a file sends immediate delete event.
+  - Unsupported file (.exe, .jpg) produces no event.
+  - Initial scan emits events for existing files.
+- **Verification:** Unit test with temp directory.
 
 ### U5. PDF Text Extraction via pdfium
 
@@ -413,17 +545,18 @@ User types "invoice March"
 - **Requirements:** R7, R11
 - **Dependencies:** U1
 - **Files:**
-  - `src/indexer/extractors/mod.rs` (Extractor trait)
-  - `src/indexer/extractors/pdf.rs`
-- **Approach:** Implement the `Extractor` trait for PDF files. Use `pdfium-render` to open the PDF, iterate pages, call `page.text().all()` to extract text. Return `ExtractedContent { text, title, page_count }`. Handle errors gracefully: return `Err` for corrupt PDFs, password-protected PDFs, and PDFs with no extractable text. Log warnings, do not crash.
-- **Patterns to follow:** pdfium-render crate examples for text extraction.
+  - `src/indexer/extractors/mod.rs` — `Extractor` trait (single-method: `extract → Ok(None)` for unsupported)
+  - `src/indexer/extractors/pdf.rs` — `PdfExtractor` holds its own `Pdfium` instance (no Sync needed, trait is Send only)
+- **Approach:** `PdfExtractor` creates one `Pdfium::new()` at construction (reused for all extractions). `extract()` opens PDF, iterates pages, calls `page.text().all()`. Returns `Ok(None)` for non-PDF files. Returns `Err` for corrupt/locked PDFs. Handles empty PDFs (page_count=0) gracefully.
 - **Test scenarios:**
-  - Extract text from a searchable PDF with known content and verify the text is present.
-  - PDF with no text layer returns an empty string (not an error — the file is indexed with empty body).
-  - Corrupt PDF returns an `Err`, does not crash.
-  - Password-protected PDF returns an `Err`.
-  - Multi-page PDF extracts text from all pages.
-- **Verification:** Unit test with fixture PDFs (one searchable, one corrupt, one password-protected).
+  - Extract text from searchable PDF → known text present.
+  - PDF with no text layer → returns `Ok(Some(ExtractedContent { text: "" }))`.
+  - Corrupt PDF → `Err`.
+  - Password-protected PDF → `Err`.
+  - Empty PDF (0 pages) → `Ok(Some(ExtractedContent { text: "", page_count: Some(0) }))`.
+  - Multi-page PDF → text from all pages.
+  - PDF with mixed text+images → text extracted, images ignored.
+- **Verification:** Unit tests with fixture PDFs.
 
 ### U6. Text File Extraction
 
@@ -431,139 +564,140 @@ User types "invoice March"
 - **Requirements:** R7, R11
 - **Dependencies:** U1
 - **Files:**
-  - `src/indexer/extractors/text.rs`
-- **Approach:** Implement the `Extractor` trait. Read file as UTF-8 string. For .md files, strip markdown syntax or keep raw — decision: keep raw text (simpler, searchable either way). For very large files (>100MB), read only the first 10MB to avoid memory issues.
-- **Patterns to follow:** Standard `std::fs::read_to_string` with UTF-8 error handling.
+  - `src/indexer/extractors/text.rs` — `TextExtractor`
+- **Approach:** Read file as UTF-8. Non-UTF-8: attempt lossy decode (`String::from_utf8_lossy`), log warning. Markdown: keep raw text (markdown syntax indexed — acceptable for v1; strip syntax in deferred improvement). Files >100MB: read first 10MB only. Returns `Ok(None)` for non-text extensions.
 - **Test scenarios:**
-  - Extract text from a .txt file and verify content matches.
-  - Extract text from a .md file with markdown formatting — raw text is extracted.
-  - Non-UTF-8 file returns an `Err`.
-  - Empty file returns empty string.
-- **Verification:** Unit test with fixture text files.
+  - Extract .txt → content matches.
+  - Extract .md → raw markdown extracted.
+  - Non-UTF-8 file → lossy decode, log warning.
+  - Empty file → empty string.
+  - >100MB file → first 10MB extracted.
+- **Verification:** Unit tests with fixture text files.
 
 ### U7. Indexing Pipeline Orchestrator
 
-- **Goal:** Wire the watcher, extractors, and Tantivy indexer together into a coherent pipeline.
+- **Goal:** Wire watcher, extractors, and Tantivy indexer with atomicity, error recovery, and reconciliation.
 - **Requirements:** R7, R8, R12
 - **Dependencies:** U3, U4, U5, U6
 - **Files:**
-  - `src/indexer/pipeline.rs`
+  - `src/indexer/pipeline.rs` — full `Pipeline` with process, reconcile, shutdown
   - `src/indexer/stages.rs`
   - `src/indexer/mod.rs`
-- **Approach:** The `Pipeline` struct receives `PathBuf` events from the watcher channel. For each event: compute blake3 hash → check if already indexed with same hash (skip if unchanged) → run extractors → commit document to Tantivy → update SQLite. For `FileEvent::Deleted`: delete from Tantivy by `doc_id` and remove from SQLite. Pipeline runs on its own thread. Sends `PipelineEvent::Indexed(path)` or `PipelineEvent::Error(path, error)` to UI thread.
-- **Patterns to follow:** Tantivy `IndexWriter::delete_term` for deletion.
+- **Approach:** Implements the complete `Pipeline::process()` flow from the design section above, including: metadata fast-path → extract-and-hash (single pass) → dedup check → extract text → post-extract hash verification → SQLite write first, Tantivy write second → commit every 10 docs or 2s. Includes `reconcile()` for startup consistency check. Includes `shutdown()` for graceful IndexWriter commit. Failed files recorded in `documents.last_error`.
 - **Test scenarios:**
-  - A new file through the pipeline is searchable via U3's search engine.
-  - Modifying a file (same path, different content) updates the index with new content.
-  - Renaming a file (same content, different path) does not re-index — detected by content hash.
-  - Deleting a file removes it from search results.
-  - Adding 200 files in quick succession indexes all of them without data races.
-- **Verification:** Integration test: mock watcher sends events to pipeline, verify Tantivy index state via search.
+  - New file through pipeline → searchable.
+  - Modified file (same path, different content) → re-indexed.
+  - Renamed file (same content) → metadata fast-path skips re-index.
+  - Deleted file → removed from both Tantivy and SQLite.
+  - 200 files in quick succession → all indexed, no data races, incremental commits visible.
+  - File modified during extraction → TOCTOU detection fires, retry once.
+  - Corrupt PDF → error logged to `last_error`, pipeline continues with next file.
+  - Crash recovery: kill process mid-index, restart, `reconcile()` cleans up orphans.
+  - Shutdown signal: pending documents committed before exit.
+- **Verification:** Integration tests with temp dirs and controlled crash scenarios.
 
 ### U8. SQLite Tag Storage
 
-- **Goal:** Implement the tag storage layer — create, list, assign, and unassign tags.
+- **Goal:** Tag storage with WAL mode, two connections.
 - **Requirements:** R9, R10
-- **Dependencies:** U7 (needs documents table to exist)
+- **Dependencies:** U7 (documents table must exist)
 - **Files:**
-  - `src/tags/store.rs`
+  - `src/tags/store.rs` — `TagStore` with UI-thread connection
   - `src/tags/model.rs`
   - `src/tags/mod.rs`
-- **Approach:** `TagStore` struct wraps a `rusqlite::Connection`. On initialization, runs `CREATE TABLE IF NOT EXISTS` for the three tables. Provides methods: `create_tag(name)`, `list_tags()`, `assign_tag(content_hash, tag_id)`, `remove_tag(content_hash, tag_id)`, `get_tags_for_document(content_hash)`, `get_documents_with_tag(tag_id)`. Uses prepared statements. Errors are `thiserror` variants.
-- **Patterns to follow:** rusqlite best practices — prepared statements, single connection behind `Mutex` for the indexer thread, or connection-per-thread for read operations.
+- **Approach:** `TagStore` opens its own `rusqlite::Connection` (separate from indexer thread's connection). WAL mode enabled on first open. Methods: `create_tag`, `list_tags`, `assign_tag`, `remove_tag`, `get_tags_for_document`. Indexer thread's connection handles `documents` table writes. `ON DELETE CASCADE` ensures tag assignments are cleaned up when documents or tags are deleted.
 - **Test scenarios:**
-  - Create a tag, list tags, verify it appears.
-  - Assign a tag to a document, retrieve tags for that document, verify.
-  - Assign multiple tags, retrieve all, verify.
-  - Remove a tag assignment, verify it's gone.
-  - Deleting a tag cascades to remove all `document_tags` entries.
-  - Duplicate tag name returns an error.
-- **Verification:** Unit test with in-memory SQLite database.
+  - Create tag → appears in list.
+  - Assign tag to document → retrieved.
+  - Multiple tags → all retrieved.
+  - Remove assignment → gone.
+  - Delete tag → cascades to `document_tags`.
+  - Duplicate tag name → error.
+  - Concurrent read (UI) during indexer write → no SQLITE_BUSY (WAL mode).
+- **Verification:** Unit tests with in-memory SQLite.
 
 ### U9. Tag Filtering in Search
 
-- **Goal:** Allow search results to be filtered by tags.
+- **Goal:** Search results filterable by tags.
 - **Requirements:** R10
 - **Dependencies:** U3, U8
 - **Files:**
-  - `src/search/query.rs` (modify)
+  - `src/search/query.rs` (modify: use `SearchRequest.tag_filters`)
   - `src/search/engine.rs` (modify)
-- **Approach:** Add `tag_filter: Option<Vec<String>>` parameter to `SearchEngine::search`. When present, add `TermQuery` clauses on the `tags` field to the BooleanQuery. Tags are denormalized into Tantivy at index time (added to the Tantivy document's `tags` field). When tags change in SQLite, the Tantivy document is updated to keep them in sync.
+- **Approach:** `SearchRequest.tag_filters` adds `TermQuery` clauses on the Tantivy `tags` field. Tags are synced to Tantivy at index time and on tag changes. Tag lookup for display uses UI-thread SQLite connection.
 - **Test scenarios:**
-  - Search with tag filter returns only documents with that tag.
-  - Search with multiple tag filters returns only documents with all tags.
-  - Search with no tag filter returns all matching documents regardless of tags.
-  - Updating a document's tags in SQLite is reflected in search results.
-- **Verification:** Integration test: tag documents, search with tag filter, verify filtered results.
+  - Search + tag filter → only tagged documents.
+  - Multiple tag filters → AND semantics.
+  - No tag filter → all documents.
+  - Tag change reflected in next search.
+- **Verification:** Integration test.
 
-### U10. PDF Preview Pane
+### U10. PDF Preview via Render Thread
 
-- **Goal:** Render PDF pages in the preview pane with search term highlights.
+- **Goal:** Render PDF pages on a dedicated background thread, display as egui textures with highlights.
 - **Requirements:** R3, R4, R5
-- **Dependencies:** U1 (needs egui app structure)
+- **Dependencies:** U1, U3
 - **Files:**
-  - `src/preview/pdf_render.rs`
-  - `src/preview/highlight.rs`
+  - `src/preview/pdf_render.rs` — `PdfRenderer` actor with render loop
+  - `src/preview/highlight.rs` — overlay rect calculation
   - `src/preview/mod.rs`
-  - `src/app.rs` (modify: add preview panel)
-- **Approach:** When a search result is clicked, `PdfPreview` opens the PDF with pdfium-render. Finds the first page with a match (using the same text extraction as U5). Renders the page to a `FPDFBitmap`, converts to `egui::ColorImage`, uploads as `egui::TextureHandle`. For highlights: use pdfium's text-find API (`FPDFTextFind*`) to get character bounding boxes, map to texture coordinates, draw semi-transparent colored rectangles via `egui::Painter`. Page navigation buttons call `render_page(n+1)` / `render_page(n-1)`. Texture cache uses LRU eviction (max 10 pages).
-- **Patterns to follow:** egui texture upload example in egui docs.
+  - `src/app.rs` (modify)
+- **Approach:** `PdfRenderer` runs on dedicated thread. Receives `RenderRequest` via channel, renders to reusable `PdfBitmap` buffer (`PdfBitmap::new_from_bytes()`), finds text positions, sends `RenderResult` back. UI thread uploads bitmap as `TextureHandle`. Byte-budgeted LRU texture cache (default 200MB). `PdfDocument` handle cache (LRU max 5). On eviction: `ctx.tex_manager().write().forget(&texture_id)`. pdfium lazy-init: first render request triggers `Pdfium::new()` with "Loading PDF engine..." spinner on UI.
 - **Test scenarios:**
-  - Clicking a search result renders the first page with a match.
-  - Search terms are highlighted with colored overlays on the rendered page.
-  - "Next page" renders the next page; "Previous page" renders the previous page.
-  - Navigating past the last/first page is handled (buttons disabled or wrap).
-  - Switching between search results updates the preview correctly.
-  - Large PDF pages are scaled to fit the preview pane width.
-- **Verification:** Manual testing with real PDFs (visual verification). Automated: verify that `pdfium-render` successfully opens and renders a page bitmap from fixture PDFs.
+  - Click result → preview shows first match page.
+  - Search terms highlighted on rendered page.
+  - Next/Previous page navigation.
+  - Boundary: first/last page handled.
+  - Switching results updates preview.
+  - Large page scaled to fit preview pane.
+  - Texture eviction frees GPU memory.
+  - Cold start: "Loading PDF engine..." shown, then preview renders.
+- **Verification:** Manual visual verification. Automated: `PdfRenderer` produces correct RGBA bytes from fixture PDFs.
 
 ### U11. Text File Preview
 
-- **Goal:** Display text file content in the preview pane with search term highlights.
+- **Goal:** Display text content in preview pane with highlights.
 - **Requirements:** R3, R4, R11
 - **Dependencies:** U1
 - **Files:**
-  - `src/preview/mod.rs` (modify: add text preview variant)
+  - `src/preview/mod.rs` (modify)
   - `src/app.rs` (modify)
-- **Approach:** Read the text file, display content in an `egui::TextEdit` (read-only) or a `ScrollArea` with `Label` widgets. Search term highlighting: scan text for matches, render matched spans with a background color using egui's rich text (`egui::RichText` with `background_color`).
+- **Approach:** Read file, display in read-only `TextEdit` or `ScrollArea`. Search term highlights via `egui::RichText` with `background_color`.
 - **Test scenarios:**
-  - Clicking a .txt search result shows file content in the preview pane.
-  - Search terms are highlighted in the previewed text.
-  - .md and .log files render as plain text with highlights.
-  - Large files render in a scrollable area.
-- **Verification:** Integration test with fixture text files.
+  - .txt, .md, .log show content with highlights.
+  - Large file → scrollable.
+- **Verification:** Integration test with fixture files.
 
-### U12. UI Assembly — Search Bar, Results List, and Layout
+### U12. UI Assembly — Layout, Search Bar, Results List
 
-- **Goal:** Build the full three-panel UI layout and integrate all subsystems.
+- **Goal:** Full three-panel UI with all subsystems integrated.
 - **Requirements:** R1, R2, R3, R4, R5
 - **Dependencies:** U2, U3, U4, U7, U10, U11
 - **Files:**
-  - `src/app.rs` (major rewrite from placeholder)
-- **Approach:** `PapervaultApp` holds all state. Layout uses `egui::TopBottomPanel` for search bar, `egui::SidePanel` for results list, `egui::CentralPanel` for preview pane. Search bar: `TextEdit::singleline` that calls `search_engine.search()` on each keystroke. Results list: `ScrollArea` with selectable rows showing filename + snippet. Preview pane: delegates to `PdfPreview` or `TextPreview` based on file type. State transitions: `Idle → Searching → ResultsShown → Previewing`.
-- **Patterns to follow:** egui demo app patterns for panels and layouts.
+  - `src/app.rs` (major rewrite)
+- **Approach:** `TopBottomPanel` (search bar), `SidePanel` (results list), `CentralPanel` (preview). Search-as-you-type via `TextEdit::singleline`. Results: selectable rows with filename + snippet. Shows "N of M matches" overflow indicator. Indexing progress indicator from `IndexingProgress` channel events. "N files with errors" badge linking to error list.
 - **Test scenarios:**
-  - Typing in the search bar updates results list in real-time.
-  - Clicking a result shows the file in the preview pane.
-  - Resizing the window maintains the three-panel layout proportionally.
-  - Empty state: no folder configured shows setup prompt.
-  - Empty state: folder configured but no results shows "No documents found."
-- **Verification:** Visual verification. Can be partially automated with egui's test harness for layout assertions.
+  - Type → results update in real-time.
+  - Click result → preview updates.
+  - Window resize preserves panel layout.
+  - Empty state: no folder → prompt.
+  - Empty state: no results → "No documents found."
+- **Verification:** Visual + egui test harness for layout assertions.
 
 ### U13. Tag UI
 
-- **Goal:** Provide a tag panel for creating tags and assigning them to documents.
+- **Goal:** Tag panel for creating/assigning tags.
 - **Requirements:** R9
 - **Dependencies:** U8, U12
 - **Files:**
-  - `src/app.rs` (modify: add tag panel)
-- **Approach:** Add a collapsible tag panel (sidebar). Shows list of all tags with checkboxes for filtering. Below the preview pane or as an overlay: "Add tag" button that shows a dropdown/combobox with existing tags plus a "Create new tag..." option. When a document is selected in the results list, its current tags are shown. Tag changes call `TagStore` methods and trigger a Tantivy document update for the tags field.
+  - `src/app.rs` (modify)
+- **Approach:** Collapsible tag sidebar. Tag list with filter checkboxes. "Add tag" button with existing-tag dropdown + "Create new" option. Selected document's tags shown below preview. Changes call `TagStore` and update Tantivy tags field.
 - **Test scenarios:**
-  - Creating a new tag adds it to the tag list.
-  - Assigning a tag to the selected document persists across app restart.
-  - Removing a tag from a document updates immediately.
+  - Create tag → appears in list.
+  - Assign tag → persists across restart.
+  - Remove tag → immediate update.
   - Tag filter checkboxes filter search results.
-- **Verification:** Manual testing primarily. Automated: verify SQLite state after tag operations through the store layer.
+- **Verification:** Manual + SQLite state verification.
 
 ---
 
@@ -571,24 +705,37 @@ User types "invoice March"
 
 | Layer | Tool | Scope |
 |-------|------|-------|
-| Unit tests | `cargo test` (standard) | Extractor correctness, SQLite operations, query building, debounce logic |
-| Integration tests | `cargo test` with temp dirs | Pipeline end-to-end, Tantivy search correctness, file watcher events |
+| Unit tests | `cargo test` | Extractor correctness, SQLite ops, query building, pipeline stages |
+| Integration tests | `cargo test` with temp dirs | Pipeline end-to-end, search correctness, watcher events, crash recovery |
+| Stress/bench | `cargo bench` or dedicated test | 10K document indexing, search latency during indexing, memory at steady state |
 | Visual tests | Manual | PDF rendering quality, highlight positioning, UI layout |
 
-Test fixtures live in `tests/fixtures/`:
-- `sample_searchable.pdf` — a single-page PDF with known text
-- `sample_multipage.pdf` — a multi-page PDF
-- `sample_corrupt.pdf` — a truncated/broken PDF
-- `sample.txt`, `sample.md`, `sample.log` — text files with known content
+### Test Fixtures (`tests/fixtures/`)
+
+| Fixture | Purpose |
+|---------|---------|
+| `sample_searchable.pdf` | Single-page PDF with known text |
+| `sample_multipage.pdf` | Multi-page PDF (3+ pages) |
+| `sample_corrupt.pdf` | Truncated/broken PDF |
+| `sample_password.pdf` | Password-protected PDF |
+| `sample_empty.pdf` | Valid PDF with 0 pages |
+| `sample_mixed.pdf` | PDF with text + embedded images |
+| `sample.txt` | UTF-8 text file |
+| `sample_non_utf8.txt` | Non-UTF-8 encoded text |
+| `sample.md` | Markdown with formatting |
+| `sample_large.txt` | >100MB text file (or generated in test) |
+| `sample.log` | Log-style text |
+| `crashed_index/` | Tantivy index directory from a killed process (for recovery tests) |
 
 ---
 
 ## System-Wide Impact
 
-- **Disk usage:** Tantivy index for 10,000 documents with extracted text (not stored) ≈ 50–200MB. SQLite database ≈ 1–5MB. pdfium.dll ≈ 5MB.
-- **Memory:** egui + Tantivy reader + pdfium ≈ 50–100MB at steady state. Texture cache adds ~50MB for 10 rendered pages at screen resolution.
-- **CPU:** Idle: near-zero. Indexing burst: 1–2 cores at 100% for PDF text extraction (pdfium). Search: negligible (BM25 over 10K docs is microseconds).
-- **Startup time:** Opening existing Tantivy index + SQLite + pdfium init < 1 second.
+- **Disk:** Tantivy index: 200–700MB (body text stored for snippets). SQLite: 1–5MB. pdfium.dll: ~5MB.
+- **Memory:** UI thread: 20–40MB (egui + Tantivy reader). Indexer thread: 30–50MB (pdfium + extraction buffers). Renderer thread: 30–50MB (pdfium + bitmap buffer + document handle cache). Texture cache: up to 200MB (byte-budgeted). Total steady state: ~100–150MB; peak with full texture cache: ~300MB.
+- **CPU:** Idle: near-zero. Indexing: 1–2 cores. Search: negligible. PDF rendering: 1 core briefly.
+- **Startup (cold):** egui window + Tantivy index open + SQLite < 200ms. pdfium lazy-init on first preview: +400–800ms.
+- **Startup (warm):** < 500ms total (pdfium.dll cached by OS).
 
 ---
 
@@ -596,25 +743,31 @@ Test fixtures live in `tests/fixtures/`:
 
 | Risk | Severity | Likelihood | Mitigation |
 |------|----------|------------|------------|
-| pdfium-render API insufficient for highlight bounding boxes | High | Medium | Fallback: use `lopdf` for the currently-viewed page only to extract text positions |
-| pdfium.dll not found on some Windows installs | High | Low | Bundle pdfium.dll with the release binary; pdfium-render supports bundled DLLs |
-| Tantivy index corruption on unexpected shutdown | Medium | Low | Tantivy is crash-resistant by design; add `IndexWriter::garbage_collect_files` on startup |
-| UI freeze during indexing of large PDF batch | Medium | Medium | Text extraction and Tantivy commit run on background thread; UI only receives results via channel |
-| egui texture upload latency for PDF page rendering | Medium | Medium | Pre-render next page in background when user is idle; keep texture cache |
+| pdfium text-find API insufficient for highlight boxes | High | Medium | Fallback: `lopdf` for current page text positions |
+| pdfium.dll not found on some Windows installs | High | Low | Bundle pdfium.dll with release binary |
+| Tantivy index corruption on unexpected shutdown | Medium | Low | `prepare_commit()` on shutdown, `garbage_collect_files()` on startup |
+| Tantivy+SQLite inconsistency after crash | Medium | Medium | Startup reconciliation step, write SQLite first |
+| UI freeze during indexing | Low | Low | All extraction and commit on background threads |
+| Texture cache memory pressure | Medium | Low | Byte-budgeted LRU with explicit GPU memory release |
+| pdfium cold-start latency | Low | Medium | Lazy-init with loading spinner |
+| TOCTOU modification during indexing | Low | Medium | Post-extraction hash verification + retry |
+| Scanner partial-file indexing | Medium | Medium | Document temp-dir-then-move workflow; write-lock check as secondary defense |
 
 ---
 
 ## Scope Boundaries
 
 ### Deferred for later
-- OCR for scanned/image-based PDFs (v2)
-- AI auto-tagging (v2)
+- OCR for scanned/image-based PDFs (v2 — add `OcrExtractor` to pipeline stages)
+- AI auto-tagging (v2 — add `AiTagExtractor` to pipeline stages)
 - Multi-folder watching
 - Dark mode
 - Keyboard shortcuts
+- Markdown syntax stripping for cleaner snippets
+- Parallel extraction for batch indexing
 
 ### Deferred to Follow-Up Work
-- Installer/packaging (MSIX or NSIS) — manual `cargo build` for v1
+- Installer/packaging (MSIX or NSIS)
 - Auto-start with Windows
 - System tray integration
 
@@ -628,21 +781,26 @@ Test fixtures live in `tests/fixtures/`:
 
 ## Key Technical Decisions
 
-- **Tantivy search on UI thread, not background channel.** Rationale: Tantivy's `Searcher` is lock-free and queries complete in microseconds. A channel round-trip adds latency with no benefit.
-- **Content hash as stable document identity.** Using blake3 hash instead of file path means renames and moves don't cause re-indexing or broken tag associations.
-- **Tags denormalized into Tantivy.** Tag filters are applied as Tantivy query clauses rather than a separate SQLite filter step. This keeps search fast and unified. SQLite is the source of truth; Tantivy is updated on tag changes.
-- **pdfium for both extraction and rendering.** Single native dependency, single PDF parsing code path, consistent behavior between extracted text and rendered pages.
-- **Index directory in AppData, not the watched folder.** Keeps the watched folder clean (no hidden index files) and avoids accidentally indexing the index.
-- **Pipeline extractor trait.** Pluggable stages cost ~50 lines of abstraction now and save a rewrite when OCR and AI tagging arrive. This was a stated primary motivation for building the tool.
+- **SQLite write before Tantivy.** SQLite is written first, then Tantivy. If crash occurs between them, an orphaned SQLite row is harmless (cleaned up on next reconciliation). An orphaned Tantivy document would break tag referential integrity.
+- **Single-method Extractor trait.** `extract() -> Result<Option<ExtractedContent>>` — `Ok(None)` means "unsupported file type, try next extractor." Statically prevents the two-step `can_handle`/`extract` anti-pattern.
+- **Dedicated PDF render thread, not UI thread.** pdfium page rendering takes 50–500ms. Running on UI thread would freeze the egui render loop. Background thread → channel → UI thread texture upload is fast.
+- **`notify-debouncer-full` over manual debounce.** Handles inode-based dedup, rename tracking, and backpressure. Avoids ~100 lines of subtle edge-case code.
+- **pdfium lazy-init.** Defers 400–800ms cold-start cost until first preview click. UI responsive in <200ms.
+- **Content hash as stable document identity.** blake3 hash instead of file path means renames/moves don't cause re-indexing or broken tag associations.
+- **Tags denormalized into Tantivy.** Tag filters applied as Tantivy query clauses for fast unified search.
+- **Byte-budgeted texture cache.** Replaces fixed page-count LRU to handle varying monitor resolutions.
+- **`SearchRequest` struct from U3.** Avoids re-signaturing `SearchEngine::search` when tag filters are added in U9.
 
 ---
 
 ## Dependencies / Assumptions
 
-- pdfium-render crate is well-maintained and supports the text-find API needed for highlight bounding boxes.
-- notify crate's Windows backend (ReadDirectoryChangesW) reliably detects file changes on the user's system.
-- The user's scanner produces PDFs with extractable text layers — OCR-only PDFs will not be searchable in v1.
-- Single-threaded indexing is sufficient for the user's usage pattern (typically adding one scanned file at a time).
+- pdfium-render exposes sufficient text-find API for highlight bounding boxes. If not, `lopdf` fallback exists.
+- `notify-debouncer-full`'s Windows backend (ReadDirectoryChangesW) is reliable on the user's system.
+- Scanner produces PDFs with extractable text layers — OCR-only PDFs require v2.
+- Two `rusqlite::Connection` instances in WAL mode work correctly (standard SQLite pattern, well-tested).
+- `dirs-next` and `notify-debouncer-full` are available on crates.io and compatible with the target Rust toolchain.
+- Two `Pdfium::new()` calls in the same process (indexer + renderer threads) work correctly. If not, use `Arc<Pdfium>` shared via a dedicated manager thread.
 
 ---
 
@@ -654,7 +812,8 @@ _None._
 
 ### Deferred to Implementation
 
-- [U10] Exact pdfium API for getting character bounding boxes with `FPDFText_Find*` — verify during U10 implementation.
-- [U7] Whether Tantivy `IndexWriter::delete_term` performance is acceptable for batch deletes at 10K scale.
-- [U12] Optimal egui panel sizing strategy for different window sizes.
-- [U2] Whether `rfd::FileDialog` works reliably on the user's specific Windows 11 configuration.
+- [U10] Exact pdfium-render API surface for `FPDFText_Find*` bounding boxes — verify during U10.
+- [U7] Tantivy `delete_term` performance at 10K scale — benchmark during U7.
+- [U12] Optimal egui panel sizing for different window sizes.
+- [U2] `rfd::FileDialog` compatibility with user's Windows 11 configuration.
+- [U5] Whether two `Pdfium::new()` calls in same process share internal state correctly — test during U5.
