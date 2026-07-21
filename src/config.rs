@@ -33,14 +33,17 @@ impl Config {
         }
     }
 
-    /// Save config to disk.
+    /// Save config to disk atomically (write to tmp, rename over final).
     pub fn save(&self) -> std::io::Result<()> {
         let path = Self::config_path();
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let contents = serde_json::to_string_pretty(self)?;
-        std::fs::write(&path, contents)
+        // Write to temp file first, then rename atomically (NTFS same-volume guarantee)
+        let tmp_path = path.with_extension("json.tmp");
+        std::fs::write(&tmp_path, contents)?;
+        std::fs::rename(&tmp_path, &path)
     }
 }
 

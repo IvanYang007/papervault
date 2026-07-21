@@ -3,6 +3,8 @@ name = "papervault"
 version = "0.1.0"
 edition = "2021"
 description = "Fast, lightweight PDF and text file search & viewer for Windows 11"
+license = "MIT"
+repository = "https://github.com/IvanYang007/papervault"
 
 [dependencies]
 egui = "0.30"
