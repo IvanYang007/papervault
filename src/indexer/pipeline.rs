@@ -160,6 +160,7 @@ impl Pipeline {
             .tag_store
             .already_indexed_by_metadata(&path_str, size, mtime)?
         {
+            debug!("Skipping {} (unchanged metadata)", path_str);
             return Ok(());
         }
 
