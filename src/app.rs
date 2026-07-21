@@ -114,6 +114,8 @@ pub struct PapervaultApp {
     pending_search: Option<String>,
     /// Request search input focus on the next frame (first-launch UX).
     focus_search_next_frame: bool,
+    /// Folder path queued for switch — started when old runtime finishes.
+    pending_runtime: Option<Arc<Mutex<Option<FolderRuntime>>>>,
 }
 
 impl PapervaultApp {
@@ -180,11 +182,13 @@ impl PapervaultApp {
             pending_search: None,
             focus_search_next_frame: true,
             folder_runtime,
+            pending_runtime: None,
         }
     }
 
     /// Start the full folder runtime: opens engine, spawns indexer/watcher/renderer,
     /// runs reconciliation, and begins watching for file changes.
+    #[allow(dead_code)]
     fn start_folder_runtime(&mut self, folder: &Path) {
         let Some(ref tag_store) = self.tag_store else {
             self.status_message = "Tag store not available — cannot index.".to_string();
@@ -557,6 +561,31 @@ impl eframe::App for PapervaultApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_channels(ctx);
 
+        // Check if a background folder switch has completed
+        let pending = self.pending_runtime.clone();
+        if let Some(pending) = pending {
+            if let Ok(mut guard) = pending.lock() {
+                if let Some(new_rt) = guard.take() {
+                    // Background thread finished — wire up the new runtime
+                    self.search_reader = Some(new_rt.search_reader.clone());
+                    self.search_fields = Some(new_rt.search_fields.clone());
+                    self.search_engine = Some(new_rt.search_engine.clone());
+                    self.indexer_progress_rx = new_rt.progress_rx.clone();
+                    self.tag_update_tx = new_rt.tag_tx.clone();
+                    self.render_request_tx = Some(new_rt.render_tx.clone());
+                    self.render_result_rx = Some(new_rt.render_result_rx.clone());
+                    self.watcher_shutdown_flag = Some(new_rt.watcher_shutdown());
+                    self.watcher_shutdown_tx = new_rt.watcher_shutdown_tx();
+                    self.folder_runtime = Some(new_rt);
+                    self.pending_runtime = None;
+                    if let Some(ref folder) = self.config.watched_folder {
+                        self.status_message =
+                            format!("Watching: {}", folder.display());
+                    }
+                }
+            }
+        }
+
         // Pre-compute whether the search query is non-empty (avoids redundant trim scans)
         let has_search_query = !self.search_query.trim().is_empty();
 
@@ -841,17 +870,37 @@ impl eframe::App for PapervaultApp {
                     if ui.button("Set Folder").clicked() {
                         let path = PathBuf::from(&self.folder_picker_input);
                         if path.exists() && path.is_dir() {
-                            // Stop old runtime on a background thread to avoid
-                            // blocking the UI during indexer join + commit.
-                            if let Some(rt) = self.folder_runtime.take() {
-                                std::thread::spawn(move || {
+                            // Stop old runtime + start new one on background thread.
+                            // Joining the indexer blocks on Tantivy commit (seconds),
+                            // and the old runtime must finish before the new one can
+                            // open the same index directory (file lock).
+                            let old_runtime = self.folder_runtime.take();
+                            let new_folder = path.clone();
+                            let tag_store = self.tag_store.clone();
+                            self.pending_runtime =
+                                Some(Arc::new(Mutex::new(None)));
+                            let pending = self
+                                .pending_runtime
+                                .as_ref()
+                                .cloned()
+                                .expect("pending_runtime just set");
+                            std::thread::spawn(move || {
+                                if let Some(rt) = old_runtime {
                                     let _ = rt.stop();
-                                });
-                            }
-                            self.config.watched_folder = Some(path.clone());
+                                }
+                                // Old engine released — start new runtime
+                                if let Some(ref ts) = tag_store {
+                                    if let Ok(new_rt) =
+                                        FolderRuntime::start(&new_folder, ts)
+                                    {
+                                        *pending.lock().unwrap() = Some(new_rt);
+                                    }
+                                }
+                            });
+                            self.config.watched_folder = Some(path);
                             let _ = self.config.save();
-                            self.start_folder_runtime(&path);
                             self.folder_picker_open = false;
+                            self.status_message = "Switching folder...".to_string();
                         } else {
                             self.status_message =
                                 format!("Invalid folder: {}", self.folder_picker_input);
