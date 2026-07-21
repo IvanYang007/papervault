@@ -11,14 +11,16 @@ pub struct PdfExtractor {
 impl PdfExtractor {
     /// Create a new PDF extractor with its own pdfium instance.
     pub fn new() -> Result<Self> {
+        let dll_dir = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        let dll_path = dll_dir.join("pdfium.dll");
         let pdfium = pdfium_render::prelude::Pdfium::new(
-            pdfium_render::prelude::Pdfium::bind_to_library(
-                pdfium_render::prelude::Pdfium::pdfium_platform_library_name(),
-            )
-            .or_else(|_| pdfium_render::prelude::Pdfium::bind_to_system_library())
-            .context("Failed to bind pdfium library")?,
+            pdfium_render::prelude::Pdfium::bind_to_library(&dll_path)
+                .or_else(|_| pdfium_render::prelude::Pdfium::bind_to_system_library())
+                .context("Failed to bind pdfium library")?,
         );
-
         Ok(Self { pdfium })
     }
 }

@@ -72,16 +72,11 @@ impl PdfRenderer {
             let dll_path = dll_dir.join("pdfium.dll");
             eprintln!(">>> attempting to bind pdfium at: {}", dll_path.display());
             eprintln!(">>> calling bind_to_library...");
-            let bind_result = pdfium_render::prelude::Pdfium::bind_to_library(&dll_path);
-            eprintln!(">>> bind_to_library returned: {:?}", bind_result.is_ok());
-            let bindings = bind_result
-                .or_else(|_| {
-                    eprintln!(">>> bind_to_library failed, trying system library...");
-                    pdfium_render::prelude::Pdfium::bind_to_system_library()
-                })
-                .context("Failed to bind pdfium library")?;
-            eprintln!(">>> creating Pdfium instance...");
-            let pdfium = pdfium_render::prelude::Pdfium::new(bindings);
+            let pdfium = pdfium_render::prelude::Pdfium::new(
+                pdfium_render::prelude::Pdfium::bind_to_library(&dll_path)
+                    .or_else(|_| pdfium_render::prelude::Pdfium::bind_to_system_library())
+                    .context("Failed to bind pdfium library")?,
+            );
             eprintln!(">>> Pdfium instance created OK");
             *guard = Some(pdfium);
         }
