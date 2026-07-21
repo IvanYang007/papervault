@@ -1,11 +1,7 @@
 #![windows_subsystem = "windows"]
 
-use crossbeam::channel;
-
 use std::panic;
-use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, Mutex};
-use std::thread;
+
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
@@ -14,16 +10,14 @@ mod config;
 mod error;
 mod indexer;
 mod preview;
+mod runtime;
 mod search;
 mod tags;
 mod watcher;
 
-use app::{IndexerProgress, PapervaultApp, RenderRequest, RenderResult, TagUpdate};
-use indexer::pipeline;
-use preview::pdf_render::PdfRenderer;
-use search::engine::SearchEngine;
+use app::PapervaultApp;
+use runtime::FolderRuntime;
 use tags::store::TagStore;
-use watcher::watcher as watcher_mod;
 
 fn main() -> eframe::Result {
     // Initialize tracing
@@ -54,28 +48,30 @@ fn main() -> eframe::Result {
         eprintln!("FATAL: {}", msg);
     }));
 
-    // ── Channels ──
-    // Watcher → Indexer
-    let (watcher_tx, watcher_rx) = channel::bounded::<watcher_mod::IndexerMessage>(10_000);
-    // Indexer → UI (progress)
-    let (progress_tx, progress_rx) = channel::unbounded::<IndexerProgress>();
-    // UI → Indexer (tag updates)
-    let (tag_tx, tag_rx) = channel::unbounded::<TagUpdate>();
-    // UI → Renderer
-    let (render_tx, render_rx) = channel::unbounded::<RenderRequest>();
-    // Renderer → UI
-    let (render_result_tx, render_result_rx) = channel::unbounded::<RenderResult>();
-
-    // ── Search Engine ──
+    // ── Configuration ──
     let config = config::Config::load();
-    let search_engine = if let Some(ref folder) = config.watched_folder {
-        match SearchEngine::open_or_create(folder) {
-            Ok(engine) => {
-                info!("Search engine initialized for: {}", folder.display());
-                Some(Arc::new(Mutex::new(engine)))
+
+    // ── Tag Store ──
+    let tag_store = match TagStore::open_or_create() {
+        Ok(ts) => Some(ts),
+        Err(e) => {
+            error!("Failed to open tag store: {}", e);
+            None
+        }
+    };
+    let tag_store_for_app = tag_store.clone();
+
+    // ── Folder Runtime (starts indexer, watcher, renderer if folder configured) ──
+    let folder_runtime = if let (Some(ref folder), Some(ref tags)) =
+        (&config.watched_folder, &tag_store)
+    {
+        match FolderRuntime::start(folder, tags) {
+            Ok(rt) => {
+                info!("Folder runtime started for: {}", folder.display());
+                Some(rt)
             }
             Err(e) => {
-                error!("Failed to open search index: {}", e);
+                error!("Failed to start folder runtime: {}", e);
                 None
             }
         }
@@ -83,67 +79,35 @@ fn main() -> eframe::Result {
         None
     };
 
-    // ── Tag Store ──
-    let tag_store = TagStore::open_or_create().ok();
-    let tag_store_writer = tag_store.clone();
-    let tag_store_for_app = tag_store;
+    // ── Extract UI components from runtime ──
+    let (search_engine, search_reader, search_fields) = if let Some(ref rt) = folder_runtime {
+        (
+            Some(rt.search_engine.clone()),
+            Some(rt.search_reader.clone()),
+            Some(rt.search_fields.clone()),
+        )
+    } else {
+        (None, None, None)
+    };
 
-    // ── Shutdown signal ──
-    let shutdown_flag = Arc::new(AtomicBool::new(false));
-    let shutdown_flag_for_watcher = shutdown_flag.clone();
-    let watcher_tx_for_shutdown = watcher_tx.clone();
-
-    // ── Startup Reconciliation ──
-    if let (Some(ref engine), Some(ref tags)) = (&search_engine, &tag_store_writer) {
-        pipeline::reconcile(engine.clone(), tags);
-    }
-
-    // ── Background Threads ──
-    let search_clone = search_engine.clone();
-    let mut indexer_handle = None;
-    let mut watcher_handle = None;
-    let mut renderer_handle = None;
-
-    // Indexer thread
-    if let (Some(engine), Some(tags)) = (search_clone, tag_store_writer) {
-        let progress_tx_clone = progress_tx.clone();
-        indexer_handle = thread::Builder::new()
-            .name("indexer".into())
-            .spawn(move || {
-                let mut p =
-                    pipeline::Pipeline::new(engine, tags, watcher_rx, tag_rx, progress_tx_clone);
-                p.run();
-            })
-            .ok();
-    }
-
-    // Watcher thread
-    if let Some(ref folder) = config.watched_folder {
-        if folder.exists() {
-            let folder = folder.clone();
-            let watcher_tx_clone = watcher_tx;
-            let shutdown = shutdown_flag_for_watcher;
-            watcher_handle = thread::Builder::new()
-                .name("watcher".into())
-                .spawn(move || {
-                    if let Err(e) = watcher_mod::start_watching(folder, watcher_tx_clone, shutdown)
-                    {
-                        error!("Watcher failed: {}", e);
-                    }
-                })
-                .ok();
-        }
-    }
-
-    // Renderer thread
-    let render_tx_clone = render_tx;
-    renderer_handle = thread::Builder::new()
-        .name("renderer".into())
-        .spawn(move || {
-            let mut renderer = PdfRenderer::new(render_rx, render_result_tx);
-            renderer.run();
-        })
-        .ok();
+    let (progress_rx, tag_tx, render_tx, render_result_rx, watcher_shutdown, watcher_shutdown_tx) =
+        if let Some(ref rt) = folder_runtime {
+            (
+                rt.progress_rx.clone(),
+                rt.tag_tx.clone(),
+                Some(rt.render_tx.clone()),
+                Some(rt.render_result_rx.clone()),
+                Some(rt.watcher_shutdown()),
+                rt.watcher_shutdown_tx(),
+            )
+        } else {
+            // Dummy channels for app startup without a folder runtime
+            use crossbeam::channel;
+            let (_, prx) = channel::unbounded::<app::IndexerProgress>();
+            let (rtx2, _) = channel::unbounded::<app::RenderRequest>();
+            let (_, rrx) = channel::unbounded::<app::RenderResult>();
+            (prx, None, Some(rtx2), Some(rrx), None, None)
+        };
 
     // ── UI ──
     let options = eframe::NativeOptions {
@@ -153,30 +117,38 @@ fn main() -> eframe::Result {
         ..Default::default()
     };
 
+    let app_config = config;
+
     eframe::run_native(
         "Papervault",
         options,
         Box::new(move |_cc| {
-            let search_reader = search_engine
-                .as_ref()
-                .map(|e| e.lock().unwrap().reader.clone());
-            let search_fields = search_engine
-                .as_ref()
-                .map(|e| e.lock().unwrap().fields().clone());
             Ok(Box::new(PapervaultApp::new(
-                config,
+                app_config,
                 search_engine,
                 search_reader,
                 search_fields,
                 progress_rx,
-                Some(tag_tx),
-                Some(render_tx_clone),
-                Some(render_result_rx),
+                tag_tx,
+                render_tx,
+                render_result_rx,
                 tag_store_for_app,
-                Some(shutdown_flag),
-                Some(watcher_tx_for_shutdown),
-                indexer_handle,
+                watcher_shutdown,
+                watcher_shutdown_tx,
             )))
         }),
-    )
+    )?;
+
+    // ── Graceful Shutdown ──
+    // eframe::run_native returns when the window closes.
+    // Stop the folder runtime to join all background threads.
+    if let Some(rt) = folder_runtime {
+        info!("Shutting down folder runtime...");
+        if let Err(e) = rt.stop() {
+            error!("Error during folder runtime shutdown: {}", e);
+        }
+        info!("Folder runtime stopped.");
+    }
+
+    Ok(())
 }

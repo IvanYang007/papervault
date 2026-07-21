@@ -26,8 +26,8 @@ pub struct SearchEngine {
 
 impl SearchEngine {
     /// Open an existing index or create a new one at the standard location.
-    pub fn open_or_create(_watched_folder: &Path) -> Result<Self> {
-        let index_dir = Self::index_directory();
+    pub fn open_or_create(watched_folder: &Path) -> Result<Self> {
+        let index_dir = Self::index_directory(watched_folder);
 
         // Ensure the index directory exists before attempting to open it.
         // MmapDirectory::open fails if the directory does not exist.
@@ -85,10 +85,14 @@ impl SearchEngine {
         })
     }
 
-    /// Returns the standard index directory path.
-    fn index_directory() -> PathBuf {
+    /// Returns the per-folder index directory path.
+    /// The canonical watched folder path is hashed with blake3 to produce
+    /// a stable, unique directory name: `%LOCALAPPDATA%/papervault/indexes/<hash>`.
+    fn index_directory(watched_folder: &Path) -> PathBuf {
         let base = dirs_next::data_local_dir().unwrap_or_else(|| PathBuf::from("."));
-        base.join("papervault").join("index")
+        let canonical = std::fs::canonicalize(watched_folder).unwrap_or_else(|_| watched_folder.to_path_buf());
+        let hash = blake3::hash(canonical.to_string_lossy().as_bytes());
+        base.join("papervault").join("indexes").join(hash.to_hex().to_string())
     }
 
     /// Commit pending documents to the index.

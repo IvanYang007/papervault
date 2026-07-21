@@ -101,8 +101,6 @@ pub struct PapervaultApp {
     watcher_shutdown_flag: Option<Arc<AtomicBool>>,
     #[allow(dead_code)]
     watcher_shutdown_tx: Option<Sender<IndexerMessage>>,
-    // Joins on drop — ensures indexer finishes before process exit
-    _indexer_handle: Option<std::thread::JoinHandle<()>>,
     // Debounced search-as-you-type
     last_search_instant: Option<Instant>,
     pending_search: Option<String>,
@@ -123,7 +121,6 @@ impl PapervaultApp {
         tag_store: Option<TagStore>,
         watcher_shutdown_flag: Option<Arc<AtomicBool>>,
         watcher_shutdown_tx: Option<Sender<IndexerMessage>>,
-        _indexer_handle: Option<std::thread::JoinHandle<()>>,
     ) -> Self {
         let status = if config.watched_folder.is_some() && search_engine.is_some() {
             "Ready".to_string()
@@ -165,7 +162,6 @@ impl PapervaultApp {
             current_page: 1,
             watcher_shutdown_flag,
             watcher_shutdown_tx,
-            _indexer_handle,
             last_search_instant: None,
             pending_search: None,
             focus_search_next_frame: true,
