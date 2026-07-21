@@ -79,42 +79,45 @@ impl FolderRuntime {
         let indexer_engine = engine.clone();
         let indexer_tags = tag_store.clone();
         let progress_tx_clone = progress_tx.clone();
-        let indexer_handle = std::thread::Builder::new()
-            .name("indexer".into())
-            .spawn(move || {
-                let mut p = Pipeline::new(
-                    indexer_engine,
-                    indexer_tags,
-                    watcher_rx,
-                    tag_rx,
-                    progress_tx_clone,
-                );
-                p.run();
-            })?;
+        let indexer_handle =
+            std::thread::Builder::new()
+                .name("indexer".into())
+                .spawn(move || {
+                    let mut p = Pipeline::new(
+                        indexer_engine,
+                        indexer_tags,
+                        watcher_rx,
+                        tag_rx,
+                        progress_tx_clone,
+                    );
+                    p.run();
+                })?;
 
         // Watcher
         let watcher_folder = folder.to_path_buf();
         let watcher_tx_clone = watcher_tx.clone();
         let watcher_shutdown_clone = watcher_shutdown.clone();
-        let watcher_handle = std::thread::Builder::new()
-            .name("watcher".into())
-            .spawn(move || {
-                if let Err(e) = watcher::start_watching(
-                    watcher_folder,
-                    watcher_tx_clone,
-                    watcher_shutdown_clone,
-                ) {
-                    tracing::error!("Watcher failed: {}", e);
-                }
-            })?;
+        let watcher_handle =
+            std::thread::Builder::new()
+                .name("watcher".into())
+                .spawn(move || {
+                    if let Err(e) = watcher::start_watching(
+                        watcher_folder,
+                        watcher_tx_clone,
+                        watcher_shutdown_clone,
+                    ) {
+                        tracing::error!("Watcher failed: {}", e);
+                    }
+                })?;
 
         // Renderer
-        let renderer_handle = std::thread::Builder::new()
-            .name("renderer".into())
-            .spawn(move || {
-                let mut renderer = PdfRenderer::new(render_rx, render_result_tx);
-                renderer.run();
-            })?;
+        let renderer_handle =
+            std::thread::Builder::new()
+                .name("renderer".into())
+                .spawn(move || {
+                    let mut renderer = PdfRenderer::new(render_rx, render_result_tx);
+                    renderer.run();
+                })?;
 
         Ok(Self {
             watcher_shutdown,

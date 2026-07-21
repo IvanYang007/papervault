@@ -62,22 +62,21 @@ fn main() -> eframe::Result {
     let tag_store_for_app = tag_store.clone();
 
     // ── Folder Runtime (starts indexer, watcher, renderer if folder configured) ──
-    let folder_runtime = if let (Some(ref folder), Some(ref tags)) =
-        (&config.watched_folder, &tag_store)
-    {
-        match FolderRuntime::start(folder, tags) {
-            Ok(rt) => {
-                info!("Folder runtime started for: {}", folder.display());
-                Some(rt)
+    let folder_runtime =
+        if let (Some(ref folder), Some(ref tags)) = (&config.watched_folder, &tag_store) {
+            match FolderRuntime::start(folder, tags) {
+                Ok(rt) => {
+                    info!("Folder runtime started for: {}", folder.display());
+                    Some(rt)
+                }
+                Err(e) => {
+                    error!("Failed to start folder runtime: {}", e);
+                    None
+                }
             }
-            Err(e) => {
-                error!("Failed to start folder runtime: {}", e);
-                None
-            }
-        }
-    } else {
-        None
-    };
+        } else {
+            None
+        };
 
     // ── Extract UI components from runtime ──
     let (search_engine, search_reader, search_fields) = if let Some(ref rt) = folder_runtime {
@@ -104,8 +103,8 @@ fn main() -> eframe::Result {
             // Dummy channels for app startup without a folder runtime
             use crossbeam::channel;
             let (_, prx) = channel::unbounded::<app::IndexerProgress>();
-            let (rtx2, _) = channel::unbounded::<app::RenderRequest>();
-            let (_, rrx) = channel::unbounded::<app::RenderResult>();
+            let (rtx2, _) = channel::bounded::<app::RenderRequest>(1);
+            let (_, rrx) = channel::bounded::<app::RenderResult>(1);
             (prx, None, Some(rtx2), Some(rrx), None, None)
         };
 

@@ -129,10 +129,10 @@ mod tests {
         layer.use_text("This is page one", 12.0, Mm(10.0), Mm(280.0), &font);
 
         for i in 2..=5 {
-            let (page_idx, layer_idx) = doc.add_page(Mm(210.0), Mm(297.0), &format!("Page {}", i));
+            let (page_idx, layer_idx) = doc.add_page(Mm(210.0), Mm(297.0), format!("Page {}", i));
             let layer = doc.get_page(page_idx).get_layer(layer_idx);
             layer.use_text(
-                &format!("This is page {}", i),
+                format!("This is page {}", i),
                 12.0,
                 Mm(10.0),
                 Mm(280.0),

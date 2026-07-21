@@ -26,6 +26,7 @@ impl PdfRenderer {
         info!("PDF renderer started (pdfium lazy-init on first request)");
 
         // pdfium is lazy-initialized on the first render request
+        #[allow(clippy::arc_with_non_send_sync)]
         let pdfium: Arc<Mutex<Option<pdfium_render::prelude::Pdfium>>> = Arc::new(Mutex::new(None));
 
         while let Ok(request) = self.request_rx.recv() {

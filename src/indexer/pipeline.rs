@@ -1,6 +1,6 @@
 use anyhow::Context;
 use crossbeam::channel::{Receiver, Sender};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tantivy::schema::Value;
@@ -247,7 +247,7 @@ impl Pipeline {
     }
 
     /// Process a file deletion.
-    fn process_delete(&mut self, path: &PathBuf) -> anyhow::Result<()> {
+    fn process_delete(&mut self, path: &Path) -> anyhow::Result<()> {
         let path_str = path.display().to_string();
 
         // Look up content hash from SQLite

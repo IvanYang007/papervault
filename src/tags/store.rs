@@ -145,13 +145,20 @@ impl TagStore {
         }
         let conn = self.connect()?;
         for chunk in hashes.chunks(500) {
-            let placeholders: Vec<String> = chunk.iter().enumerate().map(|(i, _)| format!("?{}", i + 1)).collect();
+            let placeholders: Vec<String> = chunk
+                .iter()
+                .enumerate()
+                .map(|(i, _)| format!("?{}", i + 1))
+                .collect();
             let sql = format!(
                 "SELECT dt.content_hash, t.id, t.name FROM document_tags dt JOIN tags t ON dt.tag_id = t.id WHERE dt.content_hash IN ({}) ORDER BY t.name",
                 placeholders.join(", ")
             );
             let mut stmt = conn.prepare(&sql)?;
-            let params: Vec<&dyn rusqlite::types::ToSql> = chunk.iter().map(|s| s as &dyn rusqlite::types::ToSql).collect();
+            let params: Vec<&dyn rusqlite::types::ToSql> = chunk
+                .iter()
+                .map(|s| s as &dyn rusqlite::types::ToSql)
+                .collect();
             let rows = stmt.query_map(params.as_slice(), |row| {
                 Ok((
                     row.get::<_, String>(0)?,
@@ -161,10 +168,8 @@ impl TagStore {
                     },
                 ))
             })?;
-            for row in rows {
-                if let Ok((hash, tag)) = row {
-                    result.entry(hash).or_default().push(tag);
-                }
+            for (hash, tag) in rows.flatten() {
+                result.entry(hash).or_default().push(tag);
             }
         }
         Ok(result)
@@ -438,5 +443,56 @@ mod tests {
         // Old path should no longer resolve
         let old = store.get_hash_by_path("/old/path/doc.pdf").unwrap();
         assert!(old.is_none());
+    }
+
+    #[test]
+    fn get_tags_for_hashes_batch_query() {
+        let (store, _dir) = setup_test_store();
+
+        // Create documents and tags
+        store
+            .upsert_document("hash_a", "/a.pdf", "pdf", 100, 1700000000)
+            .unwrap();
+        store
+            .upsert_document("hash_b", "/b.txt", "txt", 200, 1700000000)
+            .unwrap();
+        store
+            .upsert_document("hash_c", "/c.md", "md", 300, 1700000000)
+            .unwrap();
+
+        let tag_tax = store.create_tag("tax").unwrap();
+        let tag_2025 = store.create_tag("2025").unwrap();
+        let tag_receipt = store.create_tag("receipt").unwrap();
+
+        store.assign_tag("hash_a", tag_tax.id).unwrap();
+        store.assign_tag("hash_a", tag_2025.id).unwrap();
+        store.assign_tag("hash_b", tag_receipt.id).unwrap();
+        // hash_c has no tags
+
+        // Batch query: all three hashes
+        let map = store
+            .get_tags_for_hashes(&[
+                "hash_a".into(),
+                "hash_b".into(),
+                "hash_c".into(),
+            ])
+            .unwrap();
+
+        assert_eq!(map.len(), 2); // hash_c not in map (no tags)
+        let a_tags: Vec<&str> = map["hash_a"].iter().map(|t| t.name.as_str()).collect();
+        assert!(a_tags.contains(&"tax"));
+        assert!(a_tags.contains(&"2025"));
+        assert_eq!(a_tags.len(), 2);
+
+        let b_tags: Vec<&str> = map["hash_b"].iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(b_tags, vec!["receipt"]);
+
+        // Empty hash list returns empty map
+        let empty = store.get_tags_for_hashes(&[]).unwrap();
+        assert!(empty.is_empty());
+
+        // Non-existent hash returns empty map
+        let missing = store.get_tags_for_hashes(&["no_such_hash".into()]).unwrap();
+        assert!(missing.is_empty());
     }
 }

@@ -2,7 +2,7 @@ use crate::indexer::extractors::SUPPORTED_EXTENSIONS;
 use crossbeam::channel::Sender;
 use notify_debouncer_full::notify::*;
 use notify_debouncer_full::DebounceEventResult;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -128,7 +128,7 @@ fn emit_initial_scan(folder: &PathBuf, tx: &Sender<IndexerMessage>) -> anyhow::R
     Ok(())
 }
 
-fn is_supported_extension(path: &PathBuf) -> bool {
+fn is_supported_extension(path: &Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
         .map(|ext| {

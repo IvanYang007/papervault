@@ -113,6 +113,7 @@ pub struct PapervaultApp {
 }
 
 impl PapervaultApp {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         config: Config,
         search_engine: Option<Arc<Mutex<SearchEngine>>>,
@@ -201,6 +202,8 @@ impl PapervaultApp {
         if query.is_empty() {
             self.search_results.clear();
             self.total_hits = 0;
+            self.selected_result = None;
+            self.selected_hash = None;
             return;
         }
 
@@ -213,16 +216,18 @@ impl PapervaultApp {
                     Ok(mut results) => {
                         // Batch-fetch tags for all results (single query, chunked by 500)
                         if let Some(ref store) = self.tag_store {
-                            let hashes: Vec<String> = results
-                                .items
-                                .iter()
-                                .map(|r| r.content_hash.clone())
-                                .collect();
-                            if let Ok(tag_map) = store.get_tags_for_hashes(&hashes) {
-                                for item in &mut results.items {
-                                    if let Some(tags) = tag_map.get(&item.content_hash) {
-                                        item.tags =
-                                            tags.iter().map(|t| t.name.clone()).collect();
+                            if !results.items.is_empty() {
+                                let hashes: Vec<String> = results
+                                    .items
+                                    .iter()
+                                    .map(|r| r.content_hash.clone())
+                                    .collect();
+                                if let Ok(tag_map) = store.get_tags_for_hashes(&hashes) {
+                                    for item in &mut results.items {
+                                        if let Some(tags) = tag_map.get(&item.content_hash) {
+                                            item.tags =
+                                                tags.iter().map(|t| t.name.clone()).collect();
+                                        }
                                     }
                                 }
                             }
@@ -236,18 +241,24 @@ impl PapervaultApp {
                                 results.items.truncate(50);
                                 results.total_hits = results.items.len();
                             }
+                        } else if !self.active_tag_filters.is_empty() {
+                            // Tag store unavailable but filters are active — warn and
+                            // return empty results rather than showing unfiltered documents.
+                            tracing::warn!(
+                                "Tag filters active but tag store unavailable; showing empty results"
+                            );
+                            self.search_results.clear();
+                            self.total_hits = 0;
+                            return;
                         }
                         self.total_hits = results.total_hits;
                         self.search_results = results.items;
                         // Remap stable hash to index after results change
-                        self.selected_result = self
-                            .selected_hash
-                            .as_ref()
-                            .and_then(|hash| {
-                                self.search_results
-                                    .iter()
-                                    .position(|r| r.content_hash == *hash)
-                            });
+                        self.selected_result = self.selected_hash.as_ref().and_then(|hash| {
+                            self.search_results
+                                .iter()
+                                .position(|r| r.content_hash == *hash)
+                        });
                         if self.selected_result.is_none() {
                             self.selected_hash = None;
                         }
@@ -293,8 +304,7 @@ impl PapervaultApp {
                                 content.push_str("\n\n─── Preview truncated at 2 MB ───");
                                 self.preview_text = Some(content);
                             } else {
-                                self.preview_text =
-                                    Some("Error reading file.".to_string());
+                                self.preview_text = Some("Error reading file.".to_string());
                             }
                         }
                         Err(e) => {
@@ -302,16 +312,14 @@ impl PapervaultApp {
                         }
                     }
                 }
-                _ => {
-                    match std::fs::read_to_string(&file_path) {
-                        Ok(content) => {
-                            self.preview_text = Some(content);
-                        }
-                        Err(e) => {
-                            self.preview_text = Some(format!("Error reading file: {}", e));
-                        }
+                _ => match std::fs::read_to_string(&file_path) {
+                    Ok(content) => {
+                        self.preview_text = Some(content);
                     }
-                }
+                    Err(e) => {
+                        self.preview_text = Some(format!("Error reading file: {}", e));
+                    }
+                },
             }
         }
         self.preview_file_type = Some(file_type);
@@ -548,7 +556,6 @@ impl eframe::App for PapervaultApp {
             }
         }
 
-
         // ── Left panel: tag panel (when open) ──
         if self.tag_panel_open {
             SidePanel::left("tag_panel")
@@ -758,11 +765,17 @@ impl eframe::App for PapervaultApp {
                             self.request_page_render();
                         }
                         if self.current_pdf_page_count > 0 {
-                            ui.label(format!("Page {} / {}", self.current_page, self.current_pdf_page_count));
+                            ui.label(format!(
+                                "Page {} / {}",
+                                self.current_page, self.current_pdf_page_count
+                            ));
                         } else {
                             ui.label(format!("Page {}", self.current_page));
                         }
-                        if ui.add_enabled(!at_last_page, egui::Button::new("Next ▶")).clicked() {
+                        if ui
+                            .add_enabled(!at_last_page, egui::Button::new("Next ▶"))
+                            .clicked()
+                        {
                             self.current_page += 1;
                             self.request_page_render();
                         }

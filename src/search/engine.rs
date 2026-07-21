@@ -90,9 +90,18 @@ impl SearchEngine {
     /// a stable, unique directory name: `%LOCALAPPDATA%/papervault/indexes/<hash>`.
     fn index_directory(watched_folder: &Path) -> PathBuf {
         let base = dirs_next::data_local_dir().unwrap_or_else(|| PathBuf::from("."));
-        let canonical = std::fs::canonicalize(watched_folder).unwrap_or_else(|_| watched_folder.to_path_buf());
+        let canonical = std::fs::canonicalize(watched_folder).unwrap_or_else(|e| {
+            tracing::warn!(
+                "Failed to canonicalize watched folder path '{}': {}. Index may be fragmented.",
+                watched_folder.display(),
+                e
+            );
+            watched_folder.to_path_buf()
+        });
         let hash = blake3::hash(canonical.to_string_lossy().as_bytes());
-        base.join("papervault").join("indexes").join(hash.to_hex().to_string())
+        base.join("papervault")
+            .join("indexes")
+            .join(hash.to_hex().to_string())
     }
 
     /// Commit pending documents to the index.
@@ -129,6 +138,7 @@ impl SearchEngine {
     }
 
     /// Index or update a document in Tantivy.
+    #[allow(clippy::too_many_arguments)]
     pub fn index_document(
         &mut self,
         doc_id: &str,
@@ -229,10 +239,7 @@ pub fn search_with_reader(
             Box::new(TermQuery::new(file_term, IndexRecordOption::Basic)),
         ));
         // Wrap in a BooleanQuery — at least one Should clause must match
-        subqueries.push((
-            Occur::Must,
-            Box::new(BooleanQuery::new(term_subqueries)),
-        ));
+        subqueries.push((Occur::Must, Box::new(BooleanQuery::new(term_subqueries))));
     }
 
     for tag in &request.tag_filters {
