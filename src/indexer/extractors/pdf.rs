@@ -86,18 +86,27 @@ mod tests {
     use super::*;
     use pdfium_render::prelude::Pdfium;
     use tempfile::TempDir;
-    use std::io::Write;
+
+    /// Try to bind pdfium. Returns None if the library is not available.
+    fn try_bind_pdfium() -> Option<Pdfium> {
+        let bindings = Pdfium::bind_to_library(Pdfium::pdfium_platform_library_name())
+            .or_else(|_| Pdfium::bind_to_system_library());
+        match bindings {
+            Ok(b) => Some(Pdfium::new(b)),
+            Err(_) => {
+                eprintln!("Skipping: pdfium library not available");
+                None
+            }
+        }
+    }
 
     #[test]
     fn extract_non_pdf_file_returns_none() {
-        // Skip if pdfium library is not available
-        let bindings = Pdfium::bind_to_library(Pdfium::pdfium_platform_library_name())
-            .or_else(|_| Pdfium::bind_to_system_library());
-        let bindings = match bindings {
-            Ok(b) => b,
-            Err(_) => { eprintln!("Skipping: pdfium library not available"); return; }
+        let pdfium = match try_bind_pdfium() {
+            Some(p) => p,
+            None => return,
         };
-        let extractor = PdfExtractor { pdfium: Pdfium::new(bindings) };
+        let extractor = PdfExtractor { pdfium };
 
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("test.txt");
@@ -109,15 +118,15 @@ mod tests {
 
     #[test]
     fn extract_corrupt_pdf_returns_error() {
+        let pdfium = match try_bind_pdfium() {
+            Some(p) => p,
+            None => return,
+        };
+
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("corrupt.pdf");
         fs::write(&path, b"%PDF-1.4\n%%EOF").unwrap();
 
-        let pdfium = Pdfium::new(
-            Pdfium::bind_to_library(Pdfium::pdfium_platform_library_name())
-                .or_else(|_| Pdfium::bind_to_system_library())
-                .unwrap(),
-        );
         let extractor = PdfExtractor { pdfium };
         let result = extractor.extract(&path);
         // Corrupt PDF should error, not crash
