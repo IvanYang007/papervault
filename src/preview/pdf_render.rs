@@ -30,7 +30,11 @@ impl PdfRenderer {
         #[allow(clippy::arc_with_non_send_sync)]
         let pdfium: Arc<Mutex<Option<pdfium_render::prelude::Pdfium>>> = Arc::new(Mutex::new(None));
 
-        while let Ok(request) = self.request_rx.recv() {
+        while let Ok(mut request) = self.request_rx.recv() {
+            // Coalesce: drain stale requests, keep only the latest
+            while let Ok(newer) = self.request_rx.try_recv() {
+                request = newer;
+            }
             match self.render_page(&request, &pdfium) {
                 Ok(result) => {
                     if self.result_tx.send(result).is_err() {

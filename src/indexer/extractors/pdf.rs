@@ -18,12 +18,16 @@ impl PdfExtractor {
             .and_then(|p| p.parent().map(|d| d.to_path_buf()))
             .unwrap_or_else(|| std::path::PathBuf::from("."));
         let dll_path = dll_dir.join("pdfium.dll");
-        let _lock = pdfium_lock::INIT.lock().unwrap_or_else(|e| e.into_inner());
-        let pdfium = pdfium_render::prelude::Pdfium::new(
-            pdfium_render::prelude::Pdfium::bind_to_library(&dll_path)
-                .or_else(|_| pdfium_render::prelude::Pdfium::bind_to_system_library())
-                .context("Failed to bind pdfium library")?,
-        );
+        // Acquire lock only during init (~1ms), drop immediately after.
+        // FPDF_InitLibrary() is not reentrant but Pdfium::new() is fast.
+        let pdfium = {
+            let _lock = pdfium_lock::INIT.lock().unwrap_or_else(|e| e.into_inner());
+            pdfium_render::prelude::Pdfium::new(
+                pdfium_render::prelude::Pdfium::bind_to_library(&dll_path)
+                    .or_else(|_| pdfium_render::prelude::Pdfium::bind_to_system_library())
+                    .context("Failed to bind pdfium library")?,
+            )
+        }; // lock dropped here
         Ok(Self { pdfium })
     }
 }
