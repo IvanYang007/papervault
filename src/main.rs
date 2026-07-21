@@ -90,13 +90,21 @@ fn main() -> eframe::Result {
     let shutdown_flag_for_watcher = shutdown_flag.clone();
     let watcher_tx_for_shutdown = watcher_tx.clone();
 
+    // ── Startup Reconciliation ──
+    if let (Some(ref engine), Some(ref tags)) = (&search_engine, &tag_store_writer) {
+        pipeline::reconcile(engine.clone(), tags);
+    }
+
     // ── Background Threads ──
     let search_clone = search_engine.clone();
+    let mut indexer_handle = None;
+    let mut watcher_handle = None;
+    let mut renderer_handle = None;
 
     // Indexer thread
     if let (Some(engine), Some(tags)) = (search_clone, tag_store_writer) {
         let progress_tx_clone = progress_tx.clone();
-        thread::Builder::new()
+        indexer_handle = thread::Builder::new()
             .name("indexer".into())
             .spawn(move || {
                 let mut p =
@@ -112,7 +120,7 @@ fn main() -> eframe::Result {
             let folder = folder.clone();
             let watcher_tx_clone = watcher_tx;
             let shutdown = shutdown_flag_for_watcher;
-            thread::Builder::new()
+            watcher_handle = thread::Builder::new()
                 .name("watcher".into())
                 .spawn(move || {
                     if let Err(e) = watcher_mod::start_watching(folder, watcher_tx_clone, shutdown) {
@@ -125,7 +133,7 @@ fn main() -> eframe::Result {
 
     // Renderer thread
     let render_tx_clone = render_tx;
-    thread::Builder::new()
+    renderer_handle = thread::Builder::new()
         .name("renderer".into())
         .spawn(move || {
             let mut renderer = PdfRenderer::new(render_rx, render_result_tx);
@@ -159,6 +167,7 @@ fn main() -> eframe::Result {
                 tag_store_for_app,
                 Some(shutdown_flag),
                 Some(watcher_tx_for_shutdown),
+                indexer_handle,
             )))
         }),
     )

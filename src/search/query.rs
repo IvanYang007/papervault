@@ -5,6 +5,7 @@ use serde::Serialize;
 pub struct SearchRequest {
     pub query: String,
     pub tag_filters: Vec<String>,
+    #[allow(dead_code)]
     pub fuzzy: bool,
     pub limit: usize,
 }
@@ -21,12 +22,14 @@ impl SearchRequest {
     }
 
     /// Set tag filters for this request.
+    #[allow(dead_code)]
     pub fn with_tags(mut self, tags: Vec<String>) -> Self {
         self.tag_filters = tags;
         self
     }
 
     /// Enable fuzzy matching.
+    #[allow(dead_code)]
     pub fn with_fuzzy(mut self, fuzzy: bool) -> Self {
         self.fuzzy = fuzzy;
         self

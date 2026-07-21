@@ -16,7 +16,7 @@ use std::time::Instant;
 /// Messages from the indexer thread to the UI thread.
 #[derive(Debug, Clone)]
 pub enum IndexerProgress {
-    Indexed { path: PathBuf, total: usize },
+    Indexed { total: usize },
     Error { path: PathBuf, error: String },
     Done { total: usize },
 }
@@ -35,6 +35,7 @@ pub enum TagUpdate {
 pub struct RenderRequest {
     pub path: PathBuf,
     pub page: usize,
+    #[allow(dead_code)]
     pub search_terms: Vec<String>,
 }
 
@@ -44,10 +45,12 @@ pub struct RenderResult {
     pub rgba_bytes: Vec<u8>,
     pub width: usize,
     pub height: usize,
+    #[allow(dead_code)]
     pub highlights: Vec<HighlightRect>,
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct HighlightRect {
     pub x: f32,
     pub y: f32,
@@ -93,7 +96,10 @@ pub struct PapervaultApp {
     current_page: usize,
     // Graceful shutdown: signals watcher to stop, closing the channel to indexer
     watcher_shutdown_flag: Option<Arc<AtomicBool>>,
+    #[allow(dead_code)]
     watcher_shutdown_tx: Option<Sender<IndexerMessage>>,
+    // Joins on drop — ensures indexer finishes before process exit
+    _indexer_handle: Option<std::thread::JoinHandle<()>>,
     // Debounced search-as-you-type
     last_search_instant: Option<Instant>,
     pending_search: Option<String>,
@@ -111,6 +117,7 @@ impl PapervaultApp {
         tag_store: Option<TagStore>,
         watcher_shutdown_flag: Option<Arc<AtomicBool>>,
         watcher_shutdown_tx: Option<Sender<IndexerMessage>>,
+        _indexer_handle: Option<std::thread::JoinHandle<()>>,
     ) -> Self {
         let status = if config.watched_folder.is_some() && search_engine.is_some() {
             "Ready".to_string()
@@ -146,6 +153,7 @@ impl PapervaultApp {
             current_page: 1,
             watcher_shutdown_flag,
             watcher_shutdown_tx,
+            _indexer_handle,
             last_search_instant: None,
             pending_search: None,
         }
@@ -295,7 +303,7 @@ impl PapervaultApp {
 
         while let Ok(progress) = self.indexer_progress_rx.try_recv() {
             match progress {
-                IndexerProgress::Indexed { total, .. } => {
+                IndexerProgress::Indexed { total } => {
                     self.indexing_total = total;
                     self.indexing_done += 1;
                 }

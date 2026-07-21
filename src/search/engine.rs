@@ -12,7 +12,9 @@ use crate::error::Result;
 
 /// Manages the Tantivy search index lifecycle.
 pub struct SearchEngine {
+    #[allow(dead_code)]
     pub(crate) index: Index,
+    #[allow(dead_code)]
     pub(crate) schema: Schema,
     pub(crate) fields: SchemaFields,
     /// Lock-free reader — clone for UI thread without Mutex contention.
@@ -75,6 +77,7 @@ impl SearchEngine {
     }
 
     /// Prepare commit (called during graceful shutdown).
+    #[allow(dead_code)]
     pub fn prepare_commit(&mut self) -> Result<u64> {
         let prepared = self.writer.prepare_commit()?;
         Ok(prepared.commit()?)
@@ -83,6 +86,7 @@ impl SearchEngine {
     /// Reload the reader to pick up committed changes.
     /// Only needed when using ReloadPolicy::Manual (tests).
     /// Production code uses OnCommitWithDelay which auto-reloads.
+    #[allow(dead_code)]
     pub fn reload(&mut self) -> Result<()> {
         Ok(self.reader.reload()?)
     }
@@ -94,6 +98,7 @@ impl SearchEngine {
     }
 
     /// Search the index.
+    #[allow(dead_code)]
     pub fn search(&self, request: &SearchRequest) -> Result<SearchResults> {
         search_with_reader(&self.fields, &self.reader, request)
     }
@@ -144,16 +149,19 @@ impl SearchEngine {
     }
 
     /// Get the number of documents in the index.
+    #[allow(dead_code)]
     pub fn doc_count(&self) -> Result<u64> {
         Ok(self.reader.searcher().num_docs())
     }
 
     /// Access the underlying IndexWriter.
+    #[allow(dead_code)]
     pub fn writer_mut(&mut self) -> &mut IndexWriter {
         &mut self.writer
     }
 
     /// Access the schema.
+    #[allow(dead_code)]
     pub fn schema(&self) -> &Schema {
         &self.schema
     }

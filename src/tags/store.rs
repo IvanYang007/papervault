@@ -85,6 +85,7 @@ impl TagStore {
         Ok(tags)
     }
 
+    #[allow(dead_code)]
     pub fn delete_tag(&self, tag_id: i64) -> SqlResult<()> {
         let conn = self.connect()?;
         conn.execute("DELETE FROM tags WHERE id = ?1", params![tag_id])?;
@@ -102,6 +103,7 @@ impl TagStore {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub fn remove_tag(&self, content_hash: &str, tag_id: i64) -> SqlResult<()> {
         let conn = self.connect()?;
         conn.execute(
@@ -130,6 +132,7 @@ impl TagStore {
         Ok(tags)
     }
 
+    #[allow(dead_code)]
     pub fn get_documents_with_tag(&self, tag_id: i64) -> SqlResult<Vec<String>> {
         let conn = self.connect()?;
         let mut stmt = conn.prepare("SELECT content_hash FROM document_tags WHERE tag_id = ?1")?;

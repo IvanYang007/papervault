@@ -105,7 +105,6 @@ impl Pipeline {
                 last_commit = Instant::now();
 
                 let _ = self.progress_tx.send(IndexerProgress::Indexed {
-                    path: PathBuf::new(),
                     total: total_processed,
                 });
             }
@@ -276,6 +275,7 @@ impl Pipeline {
 
 /// Run reconciliation on startup: ensure Tantivy and SQLite are consistent.
 /// Backfills SQLite rows for Tantivy documents that are missing them (crashes).
+#[allow(dead_code)]
 pub fn reconcile(engine: Arc<std::sync::Mutex<SearchEngine>>, tag_store: &TagStore) {
     info!("Running startup reconciliation...");
 

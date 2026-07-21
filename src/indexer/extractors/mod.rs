@@ -20,6 +20,8 @@ pub trait Extractor {
 #[derive(Debug, Clone)]
 pub struct ExtractedContent {
     pub text: String,
+    #[allow(dead_code)]
     pub title: Option<String>,
+    #[allow(dead_code)]
     pub page_count: Option<usize>,
 }

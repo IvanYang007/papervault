@@ -3,6 +3,7 @@ use crate::app::HighlightRect;
 /// Calculate highlight rectangles by finding search term positions in extracted text.
 /// This is a simplified approach — the real implementation uses pdfium's
 /// FPDFText_Find* API for pixel-precise bounding boxes.
+#[allow(dead_code)]
 pub fn find_highlights(
     _page_text: &str,
     _search_terms: &[String],

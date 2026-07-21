@@ -12,15 +12,19 @@ pub enum PapervaultError {
     Sqlite(String),
 
     #[error("PDF extraction error: {0}")]
+    #[allow(dead_code)]
     PdfExtraction(String),
 
     #[error("Config error: {0}")]
+    #[allow(dead_code)]
     Config(String),
 
     #[error("Watcher error: {0}")]
+    #[allow(dead_code)]
     Watcher(String),
 
     #[error("Channel error: {0}")]
+    #[allow(dead_code)]
     Channel(String),
 }
 
