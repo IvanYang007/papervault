@@ -471,11 +471,7 @@ mod tests {
 
         // Batch query: all three hashes
         let map = store
-            .get_tags_for_hashes(&[
-                "hash_a".into(),
-                "hash_b".into(),
-                "hash_c".into(),
-            ])
+            .get_tags_for_hashes(&["hash_a".into(), "hash_b".into(), "hash_c".into()])
             .unwrap();
 
         assert_eq!(map.len(), 2); // hash_c not in map (no tags)

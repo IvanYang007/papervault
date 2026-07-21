@@ -9,6 +9,7 @@ use crossbeam::channel::{Receiver, Sender};
 use egui::{
     CentralPanel, Color32, Frame, RichText, ScrollArea, SidePanel, TextEdit, TopBottomPanel,
 };
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -83,7 +84,7 @@ pub struct PapervaultApp {
     // Tag system
     tag_store: Option<TagStore>,
     all_tags: Vec<Tag>,
-    active_tag_filters: Vec<String>,
+    active_tag_filters: HashSet<String>,
     tag_panel_open: bool,
     new_tag_name: String,
     /// Persistent text input for the folder picker dialog.
@@ -158,7 +159,7 @@ impl PapervaultApp {
             render_result_rx: render_rx,
             tag_store,
             all_tags,
-            active_tag_filters: Vec::new(),
+            active_tag_filters: HashSet::new(),
             tag_panel_open: false,
             new_tag_name: String::new(),
             folder_picker_input: String::new(),
@@ -198,7 +199,7 @@ impl PapervaultApp {
 
     /// Perform a search query using lock-free reader (no Mutex during search).
     fn do_search(&mut self) {
-        let query = self.search_query.trim().to_string();
+        let query = self.search_query.trim();
         if query.is_empty() {
             self.search_results.clear();
             self.total_hits = 0;
@@ -211,7 +212,7 @@ impl PapervaultApp {
             if let Some(ref fields) = self.search_fields {
                 // Don't pass tag filters to Tantivy — Tantivy tags may be stale.
                 // Instead, post-filter using SQLite which always has the truth.
-                let request = SearchRequest::new(query.clone()).with_limit(50);
+                let request = SearchRequest::new(query.to_string()).with_limit(50);
                 match crate::search::engine::search_with_reader(fields, reader, &request) {
                     Ok(mut results) => {
                         // Batch-fetch tags for all results (single query, chunked by 500)
@@ -231,12 +232,12 @@ impl PapervaultApp {
                                     }
                                 }
                             }
-                            // Post-filter by active tag filters
+                            // Post-filter by active tag filters (O(result_tags) HashSet lookup)
                             if !self.active_tag_filters.is_empty() {
                                 results.items.retain(|result| {
                                     self.active_tag_filters
                                         .iter()
-                                        .all(|f| result.tags.contains(f))
+                                        .all(|f| result.tags.iter().any(|t| t == f))
                                 });
                                 results.items.truncate(50);
                                 results.total_hits = results.items.len();
@@ -415,10 +416,10 @@ impl PapervaultApp {
     }
 
     fn toggle_tag_filter(&mut self, tag_name: &str) {
-        if let Some(pos) = self.active_tag_filters.iter().position(|t| t == tag_name) {
-            self.active_tag_filters.remove(pos);
+        if self.active_tag_filters.contains(tag_name) {
+            self.active_tag_filters.remove(tag_name);
         } else {
-            self.active_tag_filters.push(tag_name.to_string());
+            self.active_tag_filters.insert(tag_name.to_string());
         }
         self.do_search();
     }
@@ -539,6 +540,9 @@ impl PapervaultApp {
 impl eframe::App for PapervaultApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_channels(ctx);
+
+        // Pre-compute whether the search query is non-empty (avoids redundant trim scans)
+        let has_search_query = !self.search_query.trim().is_empty();
 
         // Debounced search: execute when 150ms has elapsed since last keystroke
         if let (Some(ref pending), Some(ref instant)) =
@@ -710,7 +714,7 @@ impl eframe::App for PapervaultApp {
             // Active tag filter chips
             if !self.active_tag_filters.is_empty() {
                 ui.horizontal(|ui| {
-                    for tag in &self.active_tag_filters.clone() {
+                    for tag in self.active_tag_filters.iter().cloned().collect::<Vec<_>>() {
                         ui.label(format!("🔖 {}", tag));
                     }
                 });
@@ -745,7 +749,7 @@ impl eframe::App for PapervaultApp {
                     ui.add_space(100.0);
                     ui.label("Type a search query to find documents.");
                 });
-            } else if self.search_results.is_empty() && !self.search_query.trim().is_empty() {
+            } else if self.search_results.is_empty() && has_search_query {
                 ui.vertical_centered(|ui| {
                     ui.add_space(40.0);
                     ui.label(format!("No results for '{}'", self.search_query.trim()));

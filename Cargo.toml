@@ -31,6 +31,12 @@ tempfile = "3"
 printpdf = "0.7"
 lopdf = "0.34"
 
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
+
 ## Benchmarks (requires nightly)
 ## [[bench]]
 ## name = "search_bench"
