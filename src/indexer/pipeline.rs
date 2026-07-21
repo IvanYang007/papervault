@@ -192,7 +192,7 @@ impl Pipeline {
         // Clean up old Tantivy document if content changed at this path
         if let Ok(Some(old_hash)) = self.tag_store.get_hash_by_path(&path_str) {
             if old_hash != content_hash {
-                let mut engine = self.search_engine.lock().unwrap();
+                let mut engine = self.search_engine.lock().unwrap_or_else(|e| e.into_inner());
                 if let Err(e) = engine.delete_by_hash(&old_hash) {
                     warn!("Failed to delete old doc {}: {}", old_hash, e);
                 }
@@ -245,7 +245,7 @@ impl Pipeline {
         )?;
 
         {
-            let mut engine = self.search_engine.lock().unwrap();
+            let mut engine = self.search_engine.lock().unwrap_or_else(|e| e.into_inner());
             engine.index_document(
                 &doc_id,
                 path,
@@ -269,7 +269,7 @@ impl Pipeline {
         if let Some(content_hash) = self.tag_store.get_hash_by_path(&path_str)? {
             // Remove from Tantivy
             {
-                let mut engine = self.search_engine.lock().unwrap();
+                let mut engine = self.search_engine.lock().unwrap_or_else(|e| e.into_inner());
                 engine.delete_by_hash(&content_hash)?;
             }
             // Remove from SQLite
@@ -281,7 +281,7 @@ impl Pipeline {
 
     /// Commit pending Tantivy changes.
     fn commit(&mut self) -> anyhow::Result<()> {
-        let mut engine = self.search_engine.lock().unwrap();
+        let mut engine = self.search_engine.lock().unwrap_or_else(|e| e.into_inner());
         engine.commit()?;
         Ok(())
     }
@@ -294,14 +294,14 @@ pub fn reconcile(engine: Arc<std::sync::Mutex<SearchEngine>>, tag_store: &TagSto
 
     // Garbage collect stale segments
     if let Err(e) = {
-        let mut eng = engine.lock().unwrap();
+        let mut eng = engine.lock().unwrap_or_else(|e| e.into_inner());
         eng.garbage_collect()
     } {
         warn!("Garbage collection during reconciliation: {}", e);
     }
 
     // Iterate all Tantivy documents and verify SQLite presence
-    let eng = engine.lock().unwrap();
+    let eng = engine.lock().unwrap_or_else(|e| e.into_inner());
     let searcher = eng.reader.searcher();
     let mut backfill_count: usize = 0;
 
@@ -610,7 +610,7 @@ mod tests {
         // After shutdown, the document should be committed.
         // Reader uses ReloadPolicy::Manual — must reload to see committed docs.
         {
-            let mut eng = engine.lock().unwrap();
+            let mut eng = engine.lock().unwrap_or_else(|e| e.into_inner());
             eng.reload().unwrap();
             let count = eng.doc_count().unwrap();
             assert!(

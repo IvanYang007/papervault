@@ -368,27 +368,22 @@ impl PapervaultApp {
     fn load_text_preview(&mut self, file_path: &Path) {
         const PREVIEW_MAX_BYTES: u64 = 2 * 1024 * 1024;
         match std::fs::metadata(file_path) {
-            Ok(meta) if meta.len() > PREVIEW_MAX_BYTES => {
-                match std::fs::File::open(file_path) {
-                    Ok(file) => {
-                        use std::io::Read;
-                        let mut reader =
-                            std::io::BufReader::new(file.take(PREVIEW_MAX_BYTES));
-                        let mut content = String::new();
-                        if reader.read_to_string(&mut content).is_ok() {
-                            content.push_str("\n\n─── Preview truncated at 2 MB ───");
-                            self.preview_text = Some(content);
-                        } else {
-                            self.preview_text =
-                                Some("Error reading file.".to_string());
-                        }
-                    }
-                    Err(e) => {
-                        self.preview_text =
-                            Some(format!("Error reading file: {}", e));
+            Ok(meta) if meta.len() > PREVIEW_MAX_BYTES => match std::fs::File::open(file_path) {
+                Ok(file) => {
+                    use std::io::Read;
+                    let mut reader = std::io::BufReader::new(file.take(PREVIEW_MAX_BYTES));
+                    let mut content = String::new();
+                    if reader.read_to_string(&mut content).is_ok() {
+                        content.push_str("\n\n─── Preview truncated at 2 MB ───");
+                        self.preview_text = Some(content);
+                    } else {
+                        self.preview_text = Some("Error reading file.".to_string());
                     }
                 }
-            }
+                Err(e) => {
+                    self.preview_text = Some(format!("Error reading file: {}", e));
+                }
+            },
             _ => match std::fs::read_to_string(file_path) {
                 Ok(content) => {
                     self.preview_text = Some(content);
@@ -643,7 +638,7 @@ impl eframe::App for PapervaultApp {
         // Show background thread errors if any
         let err_flag = self.background_error.clone();
         if let Some(err_flag) = err_flag {
-            let mut guard = err_flag.lock().unwrap();
+            let mut guard = err_flag.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(msg) = guard.take() {
                 self.status_message = msg;
                 self.background_error = None;
@@ -941,8 +936,16 @@ impl eframe::App for PapervaultApp {
                     ui.separator();
                 }
 
-                let tex_id = self.preview_texture.as_ref().unwrap().id();
-                let tex_size = self.preview_texture.as_ref().unwrap().size_vec2();
+                let tex_id = self
+                    .preview_texture
+                    .as_ref()
+                    .expect("preview has texture")
+                    .id();
+                let tex_size = self
+                    .preview_texture
+                    .as_ref()
+                    .expect("preview has texture")
+                    .size_vec2();
                 ui.image(egui::ImageSource::Texture(egui::load::SizedTexture::new(
                     tex_id, tex_size,
                 )));
@@ -1011,14 +1014,15 @@ impl eframe::App for PapervaultApp {
                                 if let Some(ref ts) = tag_store {
                                     match FolderRuntime::start(&new_folder, ts) {
                                         Ok(new_rt) => {
-                                            *pending.lock().unwrap() = Some(new_rt);
+                                            *pending.lock().unwrap_or_else(|e| e.into_inner()) =
+                                                Some(new_rt);
                                         }
                                         Err(e) => {
                                             tracing::error!(
                                                 "Failed to start folder runtime: {}",
                                                 e
                                             );
-                                            *error_flag.lock().unwrap() =
+                                            *error_flag.lock().unwrap_or_else(|e| e.into_inner()) =
                                                 Some(format!("Failed to start indexing: {}", e));
                                         }
                                     }

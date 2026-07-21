@@ -61,7 +61,7 @@ impl PdfRenderer {
         pdfium_ref: &Arc<Mutex<Option<pdfium_render::prelude::Pdfium>>>,
     ) -> anyhow::Result<RenderResult> {
         // Lazy-init pdfium
-        let mut guard = pdfium_ref.lock().unwrap();
+        let mut guard = pdfium_ref.lock().unwrap_or_else(|e| e.into_inner());
         if guard.is_none() {
             info!("Initializing pdfium (first render request)...");
             let pdfium = pdfium_render::prelude::Pdfium::new(
@@ -73,7 +73,7 @@ impl PdfRenderer {
             );
             *guard = Some(pdfium);
         }
-        let pdfium = guard.as_ref().unwrap();
+        let pdfium = guard.as_ref().expect("pdfium was just initialized");
         // Keep the mutex guard alive for the duration of this render call
         // (the pdfium reference borrows from guard)
 
