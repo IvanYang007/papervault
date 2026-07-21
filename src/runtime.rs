@@ -165,7 +165,10 @@ impl FolderRuntime {
             let _ = handle.join();
         }
 
-        // Drop render sender to close renderer channel
+        // Drop render sender to close renderer channel.
+        // NOTE: this only drops OUR clone. PapervaultApp must drop its
+        // render_request_tx clone BEFORE calling stop(), otherwise the
+        // renderer channel stays open and the renderer join hangs.
         drop(self.render_tx);
 
         // Join renderer
