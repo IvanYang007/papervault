@@ -62,7 +62,7 @@ impl PdfRenderer {
         // Lazy-init pdfium
         let mut guard = pdfium_ref.lock().unwrap_or_else(|e| e.into_inner());
         if guard.is_none() {
-            info!("Initializing pdfium (first render request)...");
+            info!("Binding pdfium library...");
             let pdfium = pdfium_render::prelude::Pdfium::new(
                 pdfium_render::prelude::Pdfium::bind_to_library(
                     pdfium_render::prelude::Pdfium::pdfium_platform_library_name(),
@@ -70,9 +70,12 @@ impl PdfRenderer {
                 .or_else(|_| pdfium_render::prelude::Pdfium::bind_to_system_library())
                 .context("Failed to bind pdfium library")?,
             );
+            info!("Pdfium instance created");
             *guard = Some(pdfium);
         }
         let pdfium = guard.as_ref().expect("pdfium was just initialized");
+
+        info!("Reading PDF bytes: {}", request.path.display());
         let bytes = std::fs::read(&request.path)
             .with_context(|| format!("Failed to read: {}", request.path.display()))?;
 
@@ -81,6 +84,7 @@ impl PdfRenderer {
             .context("Failed to load PDF")?;
 
         let pages = doc.pages();
+        info!("PDF opened: {} pages", pages.len());
         if pages.is_empty() {
             return Ok(RenderResult {
                 request_id: request.request_id,
@@ -121,6 +125,8 @@ impl PdfRenderer {
         let bitmap = page
             .render_with_config(&render_config)
             .context("Failed to render page")?;
+
+        info!("Page rendered: {}x{}", render_width, render_height);
 
         // Extract RGBA bytes
         let rgba_bytes = bitmap.as_rgba_bytes();
