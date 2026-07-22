@@ -231,7 +231,7 @@ impl TagStore {
         })
     }
 
-    #[allow(dead_code)]  // used by reconcile path in prior version; kept for API completeness
+    #[allow(dead_code)] // used by reconcile path in prior version; kept for API completeness
     pub fn already_indexed_by_hash(&self, content_hash: &str) -> SqlResult<bool> {
         self.with_conn(|conn| {
             let mut stmt =
@@ -241,7 +241,7 @@ impl TagStore {
         })
     }
 
-    #[allow(dead_code)]  // used by test and prior dedup path
+    #[allow(dead_code)] // used by test and prior dedup path
     pub fn update_path(&self, content_hash: &str, new_path: &str) -> SqlResult<()> {
         self.with_conn(|conn| {
             conn.execute(
@@ -292,9 +292,8 @@ impl TagStore {
     /// List all indexed documents for the file browser.
     pub fn list_all_documents(&self) -> SqlResult<Vec<DocumentInfo>> {
         self.with_conn(|conn| {
-            let mut stmt = conn.prepare(
-                "SELECT file_path, file_type FROM documents ORDER BY file_path",
-            )?;
+            let mut stmt =
+                conn.prepare("SELECT file_path, file_type FROM documents ORDER BY file_path")?;
             let docs = stmt
                 .query_map([], |row| {
                     Ok(DocumentInfo {
@@ -351,10 +350,7 @@ mod tests {
         )
         .unwrap();
 
-        (
-            TagStore::new_for_test(conn),
-            dir,
-        )
+        (TagStore::new_for_test(conn), dir)
     }
 
     #[test]

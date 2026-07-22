@@ -366,7 +366,11 @@ impl PapervaultApp {
 
         let file_path = PathBuf::from(path);
         let is_pdf = path.to_lowercase().ends_with(".pdf");
-        self.preview_file_type = Some(if is_pdf { PDF_TYPE.into() } else { "txt".into() });
+        self.preview_file_type = Some(if is_pdf {
+            PDF_TYPE.into()
+        } else {
+            "txt".into()
+        });
 
         if is_pdf {
             self.latest_render_request_id += 1;
@@ -465,7 +469,9 @@ impl PapervaultApp {
                 if self.current_preview_path.as_deref() != Some(&result.path) {
                     continue;
                 }
-                self.current_pdf_page_count = result.page_count;
+                if result.page_count > 0 {
+                    self.current_pdf_page_count = result.page_count;
+                }
                 if result.width > 0 && result.height > 0 {
                     let color_image = egui::ColorImage::from_rgba_unmultiplied(
                         [result.width, result.height],
@@ -800,26 +806,29 @@ impl eframe::App for PapervaultApp {
                     ui.separator();
 
                     let mut clicked_file: Option<String> = None;
-                    ScrollArea::vertical().id_salt("file_browser_scroll").show(ui, |ui| {
-                        for doc in &self.file_browser_docs {
-                            let file_name = std::path::Path::new(&doc.file_path)
-                                .file_name()
-                                .and_then(|n| n.to_str())
-                                .unwrap_or(&doc.file_path);
-                            let icon = match doc.file_type.as_str() {
-                                PDF_TYPE => "📄",
-                                "txt" => "📝",
-                                "md" => "📋",
-                                _ => "📎",
-                            };
-                            let label = format!("{} {}", icon, file_name);
-                            let is_browsed = self.browsed_file.as_deref() == Some(&doc.file_path);
-                            let resp = ui.selectable_label(is_browsed, label);
-                            if resp.clicked() {
-                                clicked_file = Some(doc.file_path.clone());
+                    ScrollArea::vertical()
+                        .id_salt("file_browser_scroll")
+                        .show(ui, |ui| {
+                            for doc in &self.file_browser_docs {
+                                let file_name = std::path::Path::new(&doc.file_path)
+                                    .file_name()
+                                    .and_then(|n| n.to_str())
+                                    .unwrap_or(&doc.file_path);
+                                let icon = match doc.file_type.as_str() {
+                                    PDF_TYPE => "📄",
+                                    "txt" => "📝",
+                                    "md" => "📋",
+                                    _ => "📎",
+                                };
+                                let label = format!("{} {}", icon, file_name);
+                                let is_browsed =
+                                    self.browsed_file.as_deref() == Some(&doc.file_path);
+                                let resp = ui.selectable_label(is_browsed, label);
+                                if resp.clicked() {
+                                    clicked_file = Some(doc.file_path.clone());
+                                }
                             }
-                        }
-                    });
+                        });
                     if let Some(path) = clicked_file {
                         self.browse_file(&path);
                     }
@@ -869,7 +878,8 @@ impl eframe::App for PapervaultApp {
             // Active tag filter chips
             if !self.active_tag_filters.is_empty() {
                 ui.horizontal(|ui| {
-                    let filters: Vec<&str> = self.active_tag_filters.iter().map(|s| s.as_str()).collect();
+                    let filters: Vec<&str> =
+                        self.active_tag_filters.iter().map(|s| s.as_str()).collect();
                     for tag in &filters {
                         ui.label(format!("🔖 {}", tag));
                     }
@@ -888,49 +898,51 @@ impl eframe::App for PapervaultApp {
                 }
 
                 let mut clicked_idx = self.clicked_index.take();
-                ScrollArea::vertical().id_salt("results_scroll").show(ui, |ui| {
-                    for (i, result) in self.search_results.iter().enumerate() {
-                        let selected = self.selected_result == Some(i);
-                        let bg = if selected {
-                            Color32::from_rgb(40, 80, 120)
-                        } else if i % 2 == 0 {
-                            Color32::from_rgb(30, 30, 35)
-                        } else {
-                            Color32::TRANSPARENT
-                        };
+                ScrollArea::vertical()
+                    .id_salt("results_scroll")
+                    .show(ui, |ui| {
+                        for (i, result) in self.search_results.iter().enumerate() {
+                            let selected = self.selected_result == Some(i);
+                            let bg = if selected {
+                                Color32::from_rgb(40, 80, 120)
+                            } else if i % 2 == 0 {
+                                Color32::from_rgb(30, 30, 35)
+                            } else {
+                                Color32::TRANSPARENT
+                            };
 
-                        Frame::default().fill(bg).inner_margin(4.0).show(ui, |ui| {
-                            let resp = ui.add_sized(
-                                [ui.available_width(), 40.0],
-                                egui::SelectableLabel::new(
-                                    selected,
-                                    RichText::new(format!(
-                                        "{} ({})",
-                                        result.file_name, result.match_count
-                                    ))
-                                    .strong(),
-                                ),
-                            );
-                            if resp.clicked() {
-                                clicked_idx = Some(i);
-                            }
+                            Frame::default().fill(bg).inner_margin(4.0).show(ui, |ui| {
+                                let resp = ui.add_sized(
+                                    [ui.available_width(), 40.0],
+                                    egui::SelectableLabel::new(
+                                        selected,
+                                        RichText::new(format!(
+                                            "{} ({})",
+                                            result.file_name, result.match_count
+                                        ))
+                                        .strong(),
+                                    ),
+                                );
+                                if resp.clicked() {
+                                    clicked_idx = Some(i);
+                                }
 
-                            if !result.tags.is_empty() {
-                                ui.horizontal(|ui| {
-                                    for t in &result.tags {
-                                        ui.label(RichText::new(format!("🏷{}", t)).small());
-                                    }
-                                });
-                            }
+                                if !result.tags.is_empty() {
+                                    ui.horizontal(|ui| {
+                                        for t in &result.tags {
+                                            ui.label(RichText::new(format!("🏷{}", t)).small());
+                                        }
+                                    });
+                                }
 
-                            Self::render_highlighted_snippet(
-                                ui,
-                                &result.snippet,
-                                &result.match_terms,
-                            );
-                        });
-                    }
-                });
+                                Self::render_highlighted_snippet(
+                                    ui,
+                                    &result.snippet,
+                                    &result.match_terms,
+                                );
+                            });
+                        }
+                    });
 
                 if let Some(idx) = clicked_idx {
                     self.select_result(idx);
@@ -1053,9 +1065,11 @@ impl eframe::App for PapervaultApp {
                     ui.label("Place pdfium.dll next to papervault.exe for PDF rendering.");
                 });
             } else if let Some(ref text) = self.preview_text {
-                ScrollArea::vertical().id_salt("preview_scroll").show(ui, |ui| {
-                    ui.monospace(text);
-                });
+                ScrollArea::vertical()
+                    .id_salt("preview_scroll")
+                    .show(ui, |ui| {
+                        ui.monospace(text);
+                    });
             }
         });
 

@@ -191,16 +191,10 @@ impl PdfRenderer {
 
     /// Check the page cache for a matching render.
     /// Moves the found entry to the front (most-recently-used position).
-    fn cache_lookup(
-        &mut self,
-        request: &RenderRequest,
-    ) -> Option<(Vec<u8>, u32, u32)> {
+    fn cache_lookup(&mut self, request: &RenderRequest) -> Option<(Vec<u8>, u32, u32)> {
         let zoom_pct = (request.zoom * 100.0) as u32;
         let key = (request.path.clone(), request.page, zoom_pct);
-        let pos = self
-            .page_cache
-            .iter()
-            .position(|(k, _, _, _)| *k == key);
+        let pos = self.page_cache.iter().position(|(k, _, _, _)| *k == key);
         match pos {
             Some(idx) => {
                 // Move to front to maintain true LRU ordering
@@ -335,7 +329,12 @@ impl PdfRenderer {
         // Cache the result if it's a full-res render
         if let Ok(ref r) = result {
             if !is_preview && r.width > 0 {
-                self.cache_insert(request, r.rgba_bytes.clone(), r.width as u32, r.height as u32);
+                self.cache_insert(
+                    request,
+                    r.rgba_bytes.clone(),
+                    r.width as u32,
+                    r.height as u32,
+                );
             }
         }
 

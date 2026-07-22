@@ -29,9 +29,9 @@ impl Extractor for PdfExtractor {
         let page_count = doc.page_count()?;
         let mut text = String::with_capacity(page_count.saturating_mul(2048));
         for i in 0..page_count {
-            let page_text = doc
-                .extract_text(i)
-                .with_context(|| format!("Failed to extract page {} from: {}", i + 1, path.display()))?;
+            let page_text = doc.extract_text(i).with_context(|| {
+                format!("Failed to extract page {} from: {}", i + 1, path.display())
+            })?;
             if i > 0 {
                 text.push('\n');
             }
@@ -192,7 +192,9 @@ mod tests {
         );
         // Verify page 1 text appears before page 5 text (reading order preserved)
         let p1 = result.text.find("page one").unwrap();
-        let p5 = result.text.find("page five")
+        let p5 = result
+            .text
+            .find("page five")
             .or_else(|| result.text.find("page 5"))
             .unwrap();
         assert!(p1 < p5, "Page 1 text should appear before page 5");
@@ -220,7 +222,10 @@ mod tests {
 
         // Verify the PDF is not encrypted at the lopdf level
         let lopdf_doc = lopdf::Document::load(&path).unwrap();
-        assert!(!lopdf_doc.is_encrypted(), "Test PDF should not be encrypted");
+        assert!(
+            !lopdf_doc.is_encrypted(),
+            "Test PDF should not be encrypted"
+        );
 
         let extractor = PdfExtractor;
         let result = extractor.extract(&path);
@@ -242,7 +247,11 @@ mod tests {
         match result {
             Ok(Some(content)) => {
                 assert!(content.text.is_empty());
-                assert_eq!(content.page_count, Some(0), "0-page PDF should have page_count = 0");
+                assert_eq!(
+                    content.page_count,
+                    Some(0),
+                    "0-page PDF should have page_count = 0"
+                );
             }
             Err(_) => {} // Also acceptable
             _ => {}

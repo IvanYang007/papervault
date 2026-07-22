@@ -48,8 +48,9 @@ impl SearchEngine {
                         "Failed to open existing index (likely corrupted): {}. Recreating.",
                         e
                     );
-                    std::fs::remove_dir_all(&index_dir)
-                        .unwrap_or_else(|e| tracing::error!("Failed to remove corrupted index: {}", e));
+                    std::fs::remove_dir_all(&index_dir).unwrap_or_else(|e| {
+                        tracing::error!("Failed to remove corrupted index: {}", e)
+                    });
                     std::fs::create_dir_all(&index_dir)?;
                     Index::create_in_dir(&index_dir, schema.clone())?
                 }
@@ -668,15 +669,17 @@ mod tests {
         engine.reload().unwrap();
 
         // Searching for just "abc" should find the hyphenated filename
-        let results = engine
-            .search(&SearchRequest::new("abc".into()))
-            .unwrap();
-        assert_eq!(results.total_hits, 1, "Should find ABC-123.pdf by token 'abc'");
+        let results = engine.search(&SearchRequest::new("abc".into())).unwrap();
+        assert_eq!(
+            results.total_hits, 1,
+            "Should find ABC-123.pdf by token 'abc'"
+        );
 
         // Searching for "123" should also find it
-        let results = engine
-            .search(&SearchRequest::new("123".into()))
-            .unwrap();
-        assert_eq!(results.total_hits, 1, "Should find ABC-123.pdf by token '123'");
+        let results = engine.search(&SearchRequest::new("123".into())).unwrap();
+        assert_eq!(
+            results.total_hits, 1,
+            "Should find ABC-123.pdf by token '123'"
+        );
     }
 }

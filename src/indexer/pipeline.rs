@@ -1,5 +1,8 @@
 use crate::app::{IndexerProgress, TagUpdate};
 use crate::indexer::stages;
+use crate::search::engine::SearchEngine;
+use crate::tags::store::TagStore;
+use crate::watcher::watcher::IndexerMessage;
 use crossbeam::channel::{Receiver, Sender};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -7,9 +10,6 @@ use std::time::{Duration, Instant};
 use tantivy::schema::Value;
 use tantivy::DocAddress;
 use tracing::{debug, error, info, warn};
-use crate::search::engine::SearchEngine;
-use crate::tags::store::TagStore;
-use crate::watcher::watcher::IndexerMessage;
 
 /// The indexing pipeline orchestrator.
 /// Receives file events from the watcher, runs extraction, and commits to Tantivy + SQLite.
@@ -66,9 +66,7 @@ impl Pipeline {
         let (scan_tx, scan_rx) = crossbeam::channel::bounded::<IndexerMessage>(256);
         let folder = self.watcher_folder.clone();
         std::thread::spawn(move || {
-            if let Err(e) =
-                crate::watcher::watcher::emit_initial_scan(&folder, &scan_tx)
-            {
+            if let Err(e) = crate::watcher::watcher::emit_initial_scan(&folder, &scan_tx) {
                 tracing::error!("Initial scan failed: {}", e);
             }
         });
@@ -274,21 +272,14 @@ impl Pipeline {
             if old_hash != content_hash {
                 // Remove old Tantivy document
                 {
-                    let mut engine =
-                        self.search_engine.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut engine = self.search_engine.lock().unwrap_or_else(|e| e.into_inner());
                     if let Err(e) = engine.delete_by_hash(&old_hash) {
                         warn!("Failed to delete old Tantivy doc {}: {}", old_hash, e);
                     }
                 }
                 // Remove old SQLite row (different PK = different row)
-                if let Err(e) = self
-                    .tag_store
-                    .delete_document_by_path(&path_str)
-                {
-                    warn!(
-                        "Failed to delete old SQLite row for {}: {}",
-                        path_str, e
-                    );
+                if let Err(e) = self.tag_store.delete_document_by_path(&path_str) {
+                    warn!("Failed to delete old SQLite row for {}: {}", path_str, e);
                 }
             }
         }
@@ -427,30 +418,30 @@ pub fn reconcile(engine: Arc<std::sync::Mutex<SearchEngine>>, tag_store: &TagSto
 
             // O(1) in-memory lookup instead of per-document SQLite query
             if !known_hashes.contains(content_hash) {
-                    // Backfill: insert into SQLite from Tantivy stored fields
-                    let file_size = if file_path.is_empty() {
-                        0i64
-                    } else {
-                        std::fs::metadata(file_path)
-                            .map(|m| m.len() as i64)
-                            .unwrap_or(0)
-                    };
-                    let modified_ts = doc
-                        .get_first(eng.fields.modified_ts)
-                        .and_then(|v| v.as_i64())
-                        .unwrap_or(0);
+                // Backfill: insert into SQLite from Tantivy stored fields
+                let file_size = if file_path.is_empty() {
+                    0i64
+                } else {
+                    std::fs::metadata(file_path)
+                        .map(|m| m.len() as i64)
+                        .unwrap_or(0)
+                };
+                let modified_ts = doc
+                    .get_first(eng.fields.modified_ts)
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0);
 
-                    if let Err(e) = tag_store.upsert_document(
-                        content_hash,
-                        file_path,
-                        file_type,
-                        file_size,
-                        modified_ts,
-                    ) {
-                        warn!("Reconciliation backfill failed for {}: {}", content_hash, e);
-                    } else {
-                        backfill_count += 1;
-                    }
+                if let Err(e) = tag_store.upsert_document(
+                    content_hash,
+                    file_path,
+                    file_type,
+                    file_size,
+                    modified_ts,
+                ) {
+                    warn!("Reconciliation backfill failed for {}: {}", content_hash, e);
+                } else {
+                    backfill_count += 1;
+                }
             }
         }
     }
@@ -501,10 +492,7 @@ mod tests {
         )
         .unwrap();
 
-        (
-            TagStore::new_for_test(conn),
-            dir,
-        )
+        (TagStore::new_for_test(conn), dir)
     }
 
     #[test]
@@ -595,22 +583,23 @@ mod tests {
             .unwrap();
 
         // Set last_error manually (simulating what the pipeline would do for a corrupt file)
-        store.with_conn(|conn| {
-            conn.execute(
-                "UPDATE documents SET last_error = ?1 WHERE content_hash = ?2",
-                rusqlite::params!["Extraction failed: corrupt PDF header", "hash1"],
-            )?;
+        store
+            .with_conn(|conn| {
+                conn.execute(
+                    "UPDATE documents SET last_error = ?1 WHERE content_hash = ?2",
+                    rusqlite::params!["Extraction failed: corrupt PDF header", "hash1"],
+                )?;
 
-            // Verify last_error was stored
-            let error: String = conn
-                .query_row(
+                // Verify last_error was stored
+                let error: String = conn.query_row(
                     "SELECT last_error FROM documents WHERE content_hash = ?1",
                     rusqlite::params!["hash1"],
                     |row| row.get(0),
                 )?;
-            assert!(error.contains("corrupt PDF header"));
-            Ok(())
-        }).unwrap();
+                assert!(error.contains("corrupt PDF header"));
+                Ok(())
+            })
+            .unwrap();
     }
 
     #[test]
@@ -678,7 +667,14 @@ mod tests {
         drop(tag_tx);
 
         // Create pipeline — it will process the Upsert then hit Disconnected
-        let mut pipeline = Pipeline::new(engine.clone(), store, PathBuf::from("/test"), msg_rx, tag_rx, progress_tx);
+        let mut pipeline = Pipeline::new(
+            engine.clone(),
+            store,
+            PathBuf::from("/test"),
+            msg_rx,
+            tag_rx,
+            progress_tx,
+        );
 
         // Run should process the document, then shutdown and commit
         pipeline.run();
