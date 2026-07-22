@@ -2,7 +2,7 @@
 
 **Date:** 2026-07-21  
 **Branch:** `feat/pdf-search-viewer`  
-**Status:** ✅ v1.1 feature-complete — 48 unit tests, clippy clean, PDF preview working
+**Status:** ✅ v1.1 complete — 48 tests, clippy clean, debug + release builds (14.3 MB / 11.8 MB)
 
 ---
 
@@ -111,18 +111,15 @@ The original design had both indexer and renderer creating separate `Pdfium` ins
 git clone https://github.com/IvanYang007/papervault.git
 cd papervault
 git checkout feat/pdf-search-viewer
-cargo build
+cargo build --release
+# Binary: target/release/papervault.exe (~14 MB)
 
-# Download pdfium.dll (Chromium 7543):
-# https://github.com/bblanchon/pdfium-binaries/releases/download/chromium/7543/pdfium-win-x64.tgz
-# Extract bin/pdfium.dll → target/debug/
-
-# Clean state:
-Remove-Item -Recurse -Force $env:LOCALAPPDATA\papervault
-Remove-Item -Force $env:APPDATA\papervault\config.json
+# pdfium.dll is already included in the repo at target/release/
+# If missing, download Chromium 7543 from:
+# https://github.com/bblanchon/pdfium-binaries/releases/tag/chromium/7543
 
 # Run:
-.\target\debug\papervault.exe
+.\target\release\papervault.exe
 ```
 
 ---
@@ -130,7 +127,8 @@ Remove-Item -Force $env:APPDATA\papervault\config.json
 ## Key Git Commits (Recent)
 
 ```
-cb6061f fix: debounce PDF zoom — one render per frame instead of per click
+fd84001 fix: remove panic=abort from release profile
+04a01a5 chore: update README, pdfium.dll to release, clean up
 b6eeaf0 perf: faster startup, eager pdfium init, PDF zoom
 197e533 fix: add unique id_salt to all ScrollArea widgets
 ac6ad1f chore: fix clippy warnings

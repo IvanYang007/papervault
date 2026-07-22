@@ -15,7 +15,7 @@ Fast, lightweight PDF & text file search and viewer for Windows 11. Full-text se
 ## Quick Start
 
 1. Download `papervault.exe` from [Releases](https://github.com/IvanYang007/papervault/releases)
-2. Place `pdfium.dll` next to `papervault.exe` (required for PDF preview)
+2. Place `pdfium.dll` next to `papervault.exe` (included in the repo at `target/release/`)
 3. Launch the app, click 📁 Folder, select your documents folder
 4. Files are indexed automatically — start searching immediately
 
