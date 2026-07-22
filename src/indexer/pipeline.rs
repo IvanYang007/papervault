@@ -190,11 +190,16 @@ impl Pipeline {
             }
         };
 
-        // Compute content hash
-        let file_bytes = std::fs::read(path)
-            .with_context(|| format!("Failed to read file for hashing: {}", path.display()))?;
-        let hash_bytes = blake3::hash(&file_bytes);
-        let content_hash = hash_bytes.to_hex().to_string();
+        // Compute content hash via streaming (avoids loading entire file into memory)
+        let content_hash = {
+            let mut hasher = blake3::Hasher::new();
+            let mut file = std::fs::File::open(path)
+                .with_context(|| format!("Failed to open file for hashing: {}", path.display()))?;
+            hasher
+                .update_reader(&mut file)
+                .with_context(|| format!("Failed to hash file: {}", path.display()))?;
+            hasher.finalize().to_hex().to_string()
+        };
 
         // Clean up old Tantivy document if content changed at this path
         if let Ok(Some(old_hash)) = self.tag_store.get_hash_by_path(&path_str) {
@@ -432,7 +437,7 @@ mod tests {
 
         (
             TagStore {
-                db_path: db_path.clone(),
+                conn: Arc::new(std::sync::Mutex::new(conn)),
             },
             dir,
         )
@@ -526,7 +531,7 @@ mod tests {
             .unwrap();
 
         // Set last_error manually (simulating what the pipeline would do for a corrupt file)
-        let conn = Connection::open(&store.db_path).unwrap();
+        let conn = store.conn.lock().unwrap();
         conn.execute(
             "UPDATE documents SET last_error = ?1 WHERE content_hash = ?2",
             rusqlite::params!["Extraction failed: corrupt PDF header", "hash1"],

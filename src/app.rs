@@ -258,10 +258,10 @@ impl PapervaultApp {
                         // Batch-fetch tags for all results (single query, chunked by 500)
                         if let Some(ref store) = self.tag_store {
                             if !results.items.is_empty() {
-                                let hashes: Vec<String> = results
+                                let hashes: Vec<&str> = results
                                     .items
                                     .iter()
-                                    .map(|r| r.content_hash.clone())
+                                    .map(|r| r.content_hash.as_str())
                                     .collect();
                                 if let Ok(tag_map) = store.get_tags_for_hashes(&hashes) {
                                     for item in &mut results.items {
@@ -699,19 +699,23 @@ impl eframe::App for PapervaultApp {
 
                     // Tag list with checkboxes
                     ScrollArea::vertical().id_salt("tag_scroll").show(ui, |ui| {
-                        let tags = self.all_tags.clone();
-                        for tag in &tags {
-                            let mut checked = self.active_tag_filters.contains(&tag.name);
+                        let tag_list: Vec<(String, i64)> = self
+                            .all_tags
+                            .iter()
+                            .map(|t| (t.name.clone(), t.id))
+                            .collect();
+                        for (tag_name, tag_id) in &tag_list {
+                            let mut checked = self.active_tag_filters.contains(tag_name);
                             ui.horizontal(|ui| {
                                 if ui.checkbox(&mut checked, "").changed() {
-                                    self.toggle_tag_filter(&tag.name);
+                                    self.toggle_tag_filter(tag_name);
                                 }
-                                ui.label(&tag.name);
+                                ui.label(tag_name);
 
                                 // Assign to selected document
                                 if self.selected_result.is_some() && ui.small_button("📌").clicked()
                                 {
-                                    self.assign_tag_to_selected(tag.id);
+                                    self.assign_tag_to_selected(*tag_id);
                                 }
                             });
                         }
@@ -809,7 +813,8 @@ impl eframe::App for PapervaultApp {
             // Active tag filter chips
             if !self.active_tag_filters.is_empty() {
                 ui.horizontal(|ui| {
-                    for tag in self.active_tag_filters.iter().cloned().collect::<Vec<_>>() {
+                    let filters: Vec<&str> = self.active_tag_filters.iter().map(|s| s.as_str()).collect();
+                    for tag in &filters {
                         ui.label(format!("🔖 {}", tag));
                     }
                 });

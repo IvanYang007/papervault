@@ -1,12 +1,14 @@
 use rusqlite::{params, Connection, Result as SqlResult};
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use super::model::Tag;
 
-/// Manages tag storage via SQLite. Cloneable — each clone shares the same connection pool.
+/// Manages tag storage via a single persistent SQLite connection (WAL mode).
+/// Cloneable via Arc — all clones share the same connection.
 #[derive(Clone)]
 pub struct TagStore {
-    pub(crate) db_path: PathBuf,
+    pub(crate) conn: Arc<Mutex<Connection>>,
 }
 
 impl TagStore {
@@ -39,10 +41,13 @@ impl TagStore {
                 content_hash TEXT NOT NULL REFERENCES documents(content_hash) ON DELETE CASCADE,
                 tag_id      INTEGER NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
                 PRIMARY KEY (content_hash, tag_id)
-            );",
+            );
+            CREATE INDEX IF NOT EXISTS idx_documents_file_path ON documents(file_path);",
         )?;
 
-        Ok(Self { db_path })
+        Ok(Self {
+            conn: Arc::new(Mutex::new(conn)),
+        })
     }
 
     fn db_path() -> PathBuf {
@@ -50,140 +55,150 @@ impl TagStore {
         base.join("papervault").join("papervault.db")
     }
 
-    fn connect(&self) -> SqlResult<Connection> {
-        let conn = Connection::open(&self.db_path)?;
-        conn.execute_batch(
-            "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys = ON;",
-        )?;
-        Ok(conn)
+    /// Access the underlying connection. Caller must hold the lock briefly.
+    fn with_conn<F, T>(&self, f: F) -> SqlResult<T>
+    where
+        F: FnOnce(&Connection) -> SqlResult<T>,
+    {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        f(&conn)
     }
 
     // ── Tag CRUD ──
 
     pub fn create_tag(&self, name: &str) -> SqlResult<Tag> {
-        let conn = self.connect()?;
-        conn.execute("INSERT INTO tags (name) VALUES (?1)", params![name])?;
-        let id = conn.last_insert_rowid();
-        Ok(Tag {
-            id,
-            name: name.to_string(),
+        self.with_conn(|conn| {
+            conn.execute("INSERT INTO tags (name) VALUES (?1)", params![name])?;
+            let id = conn.last_insert_rowid();
+            Ok(Tag {
+                id,
+                name: name.to_string(),
+            })
         })
     }
 
     pub fn list_tags(&self) -> SqlResult<Vec<Tag>> {
-        let conn = self.connect()?;
-        let mut stmt = conn.prepare("SELECT id, name FROM tags ORDER BY name")?;
-        let tags = stmt
-            .query_map([], |row| {
-                Ok(Tag {
-                    id: row.get(0)?,
-                    name: row.get(1)?,
-                })
-            })?
-            .filter_map(|r| r.ok())
-            .collect();
-        Ok(tags)
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare("SELECT id, name FROM tags ORDER BY name")?;
+            let tags = stmt
+                .query_map([], |row| {
+                    Ok(Tag {
+                        id: row.get(0)?,
+                        name: row.get(1)?,
+                    })
+                })?
+                .filter_map(|r| r.ok())
+                .collect();
+            Ok(tags)
+        })
     }
 
     #[allow(dead_code)]
     pub fn delete_tag(&self, tag_id: i64) -> SqlResult<()> {
-        let conn = self.connect()?;
-        conn.execute("DELETE FROM tags WHERE id = ?1", params![tag_id])?;
-        Ok(())
+        self.with_conn(|conn| {
+            conn.execute("DELETE FROM tags WHERE id = ?1", params![tag_id])?;
+            Ok(())
+        })
     }
 
     // ── Document Tag Assignment ──
 
     pub fn assign_tag(&self, content_hash: &str, tag_id: i64) -> SqlResult<()> {
-        let conn = self.connect()?;
-        conn.execute(
-            "INSERT OR IGNORE INTO document_tags (content_hash, tag_id) VALUES (?1, ?2)",
-            params![content_hash, tag_id],
-        )?;
-        Ok(())
+        self.with_conn(|conn| {
+            conn.execute(
+                "INSERT OR IGNORE INTO document_tags (content_hash, tag_id) VALUES (?1, ?2)",
+                params![content_hash, tag_id],
+            )?;
+            Ok(())
+        })
     }
 
     #[allow(dead_code)]
     pub fn remove_tag(&self, content_hash: &str, tag_id: i64) -> SqlResult<()> {
-        let conn = self.connect()?;
-        conn.execute(
-            "DELETE FROM document_tags WHERE content_hash = ?1 AND tag_id = ?2",
-            params![content_hash, tag_id],
-        )?;
-        Ok(())
+        self.with_conn(|conn| {
+            conn.execute(
+                "DELETE FROM document_tags WHERE content_hash = ?1 AND tag_id = ?2",
+                params![content_hash, tag_id],
+            )?;
+            Ok(())
+        })
     }
 
     pub fn get_tags_for_document(&self, content_hash: &str) -> SqlResult<Vec<Tag>> {
-        let conn = self.connect()?;
-        let mut stmt = conn.prepare(
-            "SELECT t.id, t.name FROM tags t
-             JOIN document_tags dt ON t.id = dt.tag_id
-             WHERE dt.content_hash = ?1 ORDER BY t.name",
-        )?;
-        let tags = stmt
-            .query_map(params![content_hash], |row| {
-                Ok(Tag {
-                    id: row.get(0)?,
-                    name: row.get(1)?,
-                })
-            })?
-            .filter_map(|r| r.ok())
-            .collect();
-        Ok(tags)
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT t.id, t.name FROM tags t
+                 JOIN document_tags dt ON t.id = dt.tag_id
+                 WHERE dt.content_hash = ?1 ORDER BY t.name",
+            )?;
+            let tags = stmt
+                .query_map(params![content_hash], |row| {
+                    Ok(Tag {
+                        id: row.get(0)?,
+                        name: row.get(1)?,
+                    })
+                })?
+                .filter_map(|r| r.ok())
+                .collect();
+            Ok(tags)
+        })
     }
 
     /// Batch-fetch tags for multiple document hashes in a single query.
-    /// Hashes are split into chunks of 500 to stay within SQLite's variable limit (999).
+    /// Accepts `&[&str]` to avoid unnecessary String allocations at call sites.
     pub fn get_tags_for_hashes(
         &self,
-        hashes: &[String],
+        hashes: &[&str],
     ) -> SqlResult<std::collections::HashMap<String, Vec<Tag>>> {
         use std::collections::HashMap;
-        let mut result = HashMap::new();
         if hashes.is_empty() {
-            return Ok(result);
+            return Ok(HashMap::new());
         }
-        let conn = self.connect()?;
-        for chunk in hashes.chunks(500) {
-            let placeholders: Vec<String> = chunk
-                .iter()
-                .enumerate()
-                .map(|(i, _)| format!("?{}", i + 1))
-                .collect();
-            let sql = format!(
-                "SELECT dt.content_hash, t.id, t.name FROM document_tags dt JOIN tags t ON dt.tag_id = t.id WHERE dt.content_hash IN ({}) ORDER BY t.name",
-                placeholders.join(", ")
-            );
-            let mut stmt = conn.prepare(&sql)?;
-            let params: Vec<&dyn rusqlite::types::ToSql> = chunk
-                .iter()
-                .map(|s| s as &dyn rusqlite::types::ToSql)
-                .collect();
-            let rows = stmt.query_map(params.as_slice(), |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    Tag {
-                        id: row.get(1)?,
-                        name: row.get(2)?,
-                    },
-                ))
-            })?;
-            for (hash, tag) in rows.flatten() {
-                result.entry(hash).or_default().push(tag);
+        self.with_conn(|conn| {
+            let mut result: HashMap<String, Vec<Tag>> = HashMap::new();
+            for chunk in hashes.chunks(500) {
+                let placeholders: Vec<String> = chunk
+                    .iter()
+                    .enumerate()
+                    .map(|(i, _)| format!("?{}", i + 1))
+                    .collect();
+                let sql = format!(
+                    "SELECT dt.content_hash, t.id, t.name FROM document_tags dt JOIN tags t ON dt.tag_id = t.id WHERE dt.content_hash IN ({}) ORDER BY t.name",
+                    placeholders.join(", ")
+                );
+                let mut stmt = conn.prepare(&sql)?;
+                let params: Vec<&dyn rusqlite::types::ToSql> = chunk
+                    .iter()
+                    .map(|s| s as &dyn rusqlite::types::ToSql)
+                    .collect();
+                let rows = stmt.query_map(params.as_slice(), |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        Tag {
+                            id: row.get(1)?,
+                            name: row.get(2)?,
+                        },
+                    ))
+                })?;
+                for (hash, tag) in rows.flatten() {
+                    result.entry(hash).or_default().push(tag);
+                }
             }
-        }
-        Ok(result)
+            Ok(result)
+        })
     }
 
     #[allow(dead_code)]
     pub fn get_documents_with_tag(&self, tag_id: i64) -> SqlResult<Vec<String>> {
-        let conn = self.connect()?;
-        let mut stmt = conn.prepare("SELECT content_hash FROM document_tags WHERE tag_id = ?1")?;
-        let hashes = stmt
-            .query_map(params![tag_id], |row| row.get::<_, String>(0))?
-            .filter_map(|r| r.ok())
-            .collect();
-        Ok(hashes)
+        self.with_conn(|conn| {
+            let mut stmt =
+                conn.prepare("SELECT content_hash FROM document_tags WHERE tag_id = ?1")?;
+            let hashes = stmt
+                .query_map(params![tag_id], |row| row.get::<_, String>(0))?
+                .filter_map(|r| r.ok())
+                .collect();
+            Ok(hashes)
+        })
     }
 
     // ── Document Metadata ──
@@ -194,29 +209,34 @@ impl TagStore {
         size: u64,
         mtime: u64,
     ) -> SqlResult<bool> {
-        let conn = self.connect()?;
-        let mut stmt = conn.prepare(
-            "SELECT COUNT(*) FROM documents
-             WHERE file_path = ?1 AND file_size = ?2 AND modified_ts = ?3",
-        )?;
-        let count: i64 = stmt.query_row(params![path, size as i64, mtime as i64], |r| r.get(0))?;
-        Ok(count > 0)
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT COUNT(*) FROM documents
+                 WHERE file_path = ?1 AND file_size = ?2 AND modified_ts = ?3",
+            )?;
+            let count: i64 =
+                stmt.query_row(params![path, size as i64, mtime as i64], |r| r.get(0))?;
+            Ok(count > 0)
+        })
     }
 
     pub fn already_indexed_by_hash(&self, content_hash: &str) -> SqlResult<bool> {
-        let conn = self.connect()?;
-        let mut stmt = conn.prepare("SELECT COUNT(*) FROM documents WHERE content_hash = ?1")?;
-        let count: i64 = stmt.query_row(params![content_hash], |r| r.get(0))?;
-        Ok(count > 0)
+        self.with_conn(|conn| {
+            let mut stmt =
+                conn.prepare("SELECT COUNT(*) FROM documents WHERE content_hash = ?1")?;
+            let count: i64 = stmt.query_row(params![content_hash], |r| r.get(0))?;
+            Ok(count > 0)
+        })
     }
 
     pub fn update_path(&self, content_hash: &str, new_path: &str) -> SqlResult<()> {
-        let conn = self.connect()?;
-        conn.execute(
-            "UPDATE documents SET file_path = ?1 WHERE content_hash = ?2",
-            params![new_path, content_hash],
-        )?;
-        Ok(())
+        self.with_conn(|conn| {
+            conn.execute(
+                "UPDATE documents SET file_path = ?1 WHERE content_hash = ?2",
+                params![new_path, content_hash],
+            )?;
+            Ok(())
+        })
     }
 
     pub fn upsert_document(
@@ -227,50 +247,55 @@ impl TagStore {
         file_size: i64,
         modified_ts: i64,
     ) -> SqlResult<()> {
-        let conn = self.connect()?;
-        conn.execute(
-            "INSERT OR REPLACE INTO documents (content_hash, file_path, file_type, file_size, modified_ts, indexed_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, datetime('now'))",
-            params![content_hash, file_path, file_type, file_size, modified_ts],
-        )?;
-        Ok(())
+        self.with_conn(|conn| {
+            conn.execute(
+                "INSERT OR REPLACE INTO documents (content_hash, file_path, file_type, file_size, modified_ts, indexed_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, datetime('now'))",
+                params![content_hash, file_path, file_type, file_size, modified_ts],
+            )?;
+            Ok(())
+        })
     }
 
     pub fn delete_document_by_path(&self, path: &str) -> SqlResult<()> {
-        let conn = self.connect()?;
-        conn.execute("DELETE FROM documents WHERE file_path = ?1", params![path])?;
-        Ok(())
+        self.with_conn(|conn| {
+            conn.execute("DELETE FROM documents WHERE file_path = ?1", params![path])?;
+            Ok(())
+        })
     }
 
     pub fn get_hash_by_path(&self, path: &str) -> SqlResult<Option<String>> {
-        let conn = self.connect()?;
-        let mut stmt = conn.prepare("SELECT content_hash FROM documents WHERE file_path = ?1")?;
-        match stmt.query_row(params![path], |row| row.get(0)) {
-            Ok(hash) => Ok(Some(hash)),
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(e),
-        }
+        self.with_conn(|conn| {
+            let mut stmt =
+                conn.prepare("SELECT content_hash FROM documents WHERE file_path = ?1")?;
+            match stmt.query_row(params![path], |row| row.get(0)) {
+                Ok(hash) => Ok(Some(hash)),
+                Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+                Err(e) => Err(e),
+            }
+        })
     }
 
     /// List all indexed documents for the file browser.
     pub fn list_all_documents(&self) -> SqlResult<Vec<DocumentInfo>> {
-        let conn = self.connect()?;
-        let mut stmt = conn.prepare(
-            "SELECT file_path, file_type, file_size, modified_ts, content_hash FROM documents ORDER BY file_path",
-        )?;
-        let docs = stmt
-            .query_map([], |row| {
-                Ok(DocumentInfo {
-                    file_path: row.get(0)?,
-                    file_type: row.get(1)?,
-                    file_size: row.get(2)?,
-                    modified_ts: row.get(3)?,
-                    content_hash: row.get(4)?,
-                })
-            })?
-            .filter_map(|r| r.ok())
-            .collect();
-        Ok(docs)
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT file_path, file_type, file_size, modified_ts, content_hash FROM documents ORDER BY file_path",
+            )?;
+            let docs = stmt
+                .query_map([], |row| {
+                    Ok(DocumentInfo {
+                        file_path: row.get(0)?,
+                        file_type: row.get(1)?,
+                        file_size: row.get(2)?,
+                        modified_ts: row.get(3)?,
+                        content_hash: row.get(4)?,
+                    })
+                })?
+                .filter_map(|r| r.ok())
+                .collect();
+            Ok(docs)
+        })
     }
 }
 
@@ -324,7 +349,7 @@ mod tests {
 
         (
             TagStore {
-                db_path: db_path.clone(),
+                conn: Arc::new(Mutex::new(conn)),
             },
             dir,
         )
@@ -348,12 +373,9 @@ mod tests {
         let (store, _dir) = setup_test_store();
 
         // Insert a document first (required for FK constraint)
-        let conn = Connection::open(&store.db_path).unwrap();
-        conn.execute(
-            "INSERT INTO documents (content_hash, file_path, file_type) VALUES (?1, ?2, ?3)",
-            rusqlite::params!["hash1", "/test/doc.pdf", "pdf"],
-        )
-        .unwrap();
+        store
+            .upsert_document("hash1", "/test/doc.pdf", "pdf", 0, 0)
+            .unwrap();
 
         let tag1 = store.create_tag("tax").unwrap();
         let tag2 = store.create_tag("receipt").unwrap();
@@ -375,27 +397,18 @@ mod tests {
     fn get_documents_with_tag_returns_correct_docs() {
         let (store, _dir) = setup_test_store();
 
-        // Insert documents
-        let conn = Connection::open(&store.db_path).unwrap();
-        conn.execute(
-            "INSERT INTO documents (content_hash, file_path, file_type) VALUES (?1, ?2, ?3)",
-            rusqlite::params!["hash_a", "/test/a.pdf", "pdf"],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO documents (content_hash, file_path, file_type) VALUES (?1, ?2, ?3)",
-            rusqlite::params!["hash_b", "/test/b.pdf", "pdf"],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO documents (content_hash, file_path, file_type) VALUES (?1, ?2, ?3)",
-            rusqlite::params!["hash_c", "/test/c.pdf", "pdf"],
-        )
-        .unwrap();
+        store
+            .upsert_document("hash_a", "/test/a.pdf", "pdf", 0, 0)
+            .unwrap();
+        store
+            .upsert_document("hash_b", "/test/b.pdf", "pdf", 0, 0)
+            .unwrap();
+        store
+            .upsert_document("hash_c", "/test/c.pdf", "pdf", 0, 0)
+            .unwrap();
 
         let tag = store.create_tag("shared").unwrap();
 
-        // Assign to two docs, leave third untagged
         store.assign_tag("hash_a", tag.id).unwrap();
         store.assign_tag("hash_b", tag.id).unwrap();
 
@@ -410,32 +423,24 @@ mod tests {
     fn concurrent_reader_during_writer_no_busy() {
         let (store, _dir) = setup_test_store();
 
-        // Insert a document
-        let conn = Connection::open(&store.db_path).unwrap();
-        conn.execute(
-            "INSERT INTO documents (content_hash, file_path, file_type) VALUES (?1, ?2, ?3)",
-            rusqlite::params!["hash1", "/test/doc.pdf", "pdf"],
-        )
-        .unwrap();
+        store
+            .upsert_document("hash1", "/test/doc.pdf", "pdf", 0, 0)
+            .unwrap();
 
         let tag = store.create_tag("test").unwrap();
         store.assign_tag("hash1", tag.id).unwrap();
 
-        // WAL mode: reader on one connection, writer on another should not block
         let store_clone = store.clone();
         let handle = thread::spawn(move || {
-            // Reader thread: list tags while writer may be active
             let tags = store_clone.list_tags().unwrap();
             assert!(!tags.is_empty());
         });
 
-        // Main thread: do a write operation
         let tag2 = store.create_tag("concurrent").unwrap();
         assert!(tag2.id > 0);
 
         handle.join().unwrap();
 
-        // Both operations should have completed
         let all_tags = store.list_tags().unwrap();
         let names: Vec<&str> = all_tags.iter().map(|t| t.name.as_str()).collect();
         assert!(names.contains(&"test"));
@@ -446,10 +451,8 @@ mod tests {
     fn already_indexed_by_hash() {
         let (store, _dir) = setup_test_store();
 
-        // Not yet indexed
         assert!(!store.already_indexed_by_hash("hash_x").unwrap());
 
-        // Insert
         store
             .upsert_document("hash_x", "/test/x.pdf", "pdf", 1024, 1700000000)
             .unwrap();
@@ -465,7 +468,6 @@ mod tests {
             .upsert_document("hash1", "/old/path/doc.pdf", "pdf", 1024, 1700000000)
             .unwrap();
 
-        // Update path for same content hash
         store.update_path("hash1", "/new/path/doc.pdf").unwrap();
 
         let hash = store
@@ -474,7 +476,6 @@ mod tests {
             .unwrap();
         assert_eq!(hash, "hash1");
 
-        // Old path should no longer resolve
         let old = store.get_hash_by_path("/old/path/doc.pdf").unwrap();
         assert!(old.is_none());
     }
@@ -483,7 +484,6 @@ mod tests {
     fn get_tags_for_hashes_batch_query() {
         let (store, _dir) = setup_test_store();
 
-        // Create documents and tags
         store
             .upsert_document("hash_a", "/a.pdf", "pdf", 100, 1700000000)
             .unwrap();
@@ -501,14 +501,13 @@ mod tests {
         store.assign_tag("hash_a", tag_tax.id).unwrap();
         store.assign_tag("hash_a", tag_2025.id).unwrap();
         store.assign_tag("hash_b", tag_receipt.id).unwrap();
-        // hash_c has no tags
 
-        // Batch query: all three hashes
+        // Batch query with &str references (zero allocation)
         let map = store
-            .get_tags_for_hashes(&["hash_a".into(), "hash_b".into(), "hash_c".into()])
+            .get_tags_for_hashes(&["hash_a", "hash_b", "hash_c"])
             .unwrap();
 
-        assert_eq!(map.len(), 2); // hash_c not in map (no tags)
+        assert_eq!(map.len(), 2);
         let a_tags: Vec<&str> = map["hash_a"].iter().map(|t| t.name.as_str()).collect();
         assert!(a_tags.contains(&"tax"));
         assert!(a_tags.contains(&"2025"));
@@ -517,12 +516,10 @@ mod tests {
         let b_tags: Vec<&str> = map["hash_b"].iter().map(|t| t.name.as_str()).collect();
         assert_eq!(b_tags, vec!["receipt"]);
 
-        // Empty hash list returns empty map
         let empty = store.get_tags_for_hashes(&[]).unwrap();
         assert!(empty.is_empty());
 
-        // Non-existent hash returns empty map
-        let missing = store.get_tags_for_hashes(&["no_such_hash".into()]).unwrap();
+        let missing = store.get_tags_for_hashes(&["no_such_hash"]).unwrap();
         assert!(missing.is_empty());
     }
 }
