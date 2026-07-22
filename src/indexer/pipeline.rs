@@ -805,4 +805,252 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn process_batch_extracts_and_indexes_files() {
+        use crate::app::TagUpdate;
+        use crate::search::engine::SearchEngine;
+        use crate::watcher::watcher::IndexerMessage;
+        use std::path::PathBuf;
+
+        let (store, _dir) = setup_tag_store();
+
+        // Create search engine
+        let index_dir = tempfile::TempDir::new().unwrap();
+        let schema = crate::search::schema::build_schema();
+        let fields = crate::search::schema::SchemaFields::from_schema(&schema);
+        let index =
+            tantivy::Index::create_in_dir(index_dir.path(), schema.clone()).unwrap();
+        let tokenizer = tantivy::tokenizer::TextAnalyzer::builder(
+            tantivy::tokenizer::SimpleTokenizer::default(),
+        )
+        .filter(tantivy::tokenizer::LowerCaser)
+        .build();
+        index.tokenizers().register("body", tokenizer);
+        let writer = index.writer(50_000_000).unwrap();
+        let reader = index
+            .reader_builder()
+            .reload_policy(tantivy::ReloadPolicy::Manual)
+            .try_into()
+            .unwrap();
+        let engine = SearchEngine {
+            index,
+            schema,
+            fields,
+            reader,
+            writer,
+        };
+        let engine = Arc::new(std::sync::Mutex::new(engine));
+
+        let (_msg_tx, msg_rx) = crossbeam::channel::bounded::<IndexerMessage>(1);
+        let (_tag_tx, tag_rx) = crossbeam::channel::bounded::<TagUpdate>(1);
+        let (progress_tx, progress_rx) = crossbeam::channel::unbounded::<IndexerProgress>();
+
+        // Create test files
+        let tmp = tempfile::TempDir::new().unwrap();
+        let f1 = tmp.path().join("a.txt");
+        let f2 = tmp.path().join("b.txt");
+        std::fs::write(&f1, "hello world").unwrap();
+        std::fs::write(&f2, "foo bar baz").unwrap();
+        let m1 = std::fs::metadata(&f1).unwrap();
+        let m2 = std::fs::metadata(&f2).unwrap();
+        let mtime1 = m1
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let mtime2 = m2
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let size1 = m1.len();
+        let size2 = m2.len();
+
+        let batch = vec![
+            (f1.clone(), mtime1, size1),
+            (f2.clone(), mtime2, size2),
+        ];
+
+        let mut pipeline = Pipeline::new(
+            engine.clone(),
+            store,
+            PathBuf::from("/test"),
+            msg_rx,
+            tag_rx,
+            progress_tx,
+        );
+
+        // Process batch with offset 0
+        let processed = pipeline.process_batch(&batch, 0);
+        assert_eq!(processed, 2, "Should process both files");
+
+        // Verify progress messages
+        let mut progress_count = 0;
+        while let Ok(p) = progress_rx.try_recv() {
+            if let IndexerProgress::Progress { processed } = p {
+                assert!(
+                    processed > 0,
+                    "Progress should start from 1 with offset 0, got {}",
+                    processed
+                );
+            }
+            progress_count += 1;
+        }
+        assert_eq!(progress_count, 2, "Should emit 2 progress messages");
+
+        // Verify documents were indexed
+        {
+            let mut eng = engine.lock().unwrap_or_else(|e| e.into_inner());
+            eng.reload().unwrap();
+            let count = eng.doc_count().unwrap();
+            assert_eq!(count, 2, "Should have 2 indexed documents");
+        }
+    }
+
+    #[test]
+    fn process_batch_offset_produces_cumulative_progress() {
+        use crate::app::TagUpdate;
+        use crate::search::engine::SearchEngine;
+        use crate::watcher::watcher::IndexerMessage;
+        use std::path::PathBuf;
+
+        let (store, _dir) = setup_tag_store();
+        let index_dir = tempfile::TempDir::new().unwrap();
+        let schema = crate::search::schema::build_schema();
+        let fields = crate::search::schema::SchemaFields::from_schema(&schema);
+        let index =
+            tantivy::Index::create_in_dir(index_dir.path(), schema.clone()).unwrap();
+        let tokenizer = tantivy::tokenizer::TextAnalyzer::builder(
+            tantivy::tokenizer::SimpleTokenizer::default(),
+        )
+        .filter(tantivy::tokenizer::LowerCaser)
+        .build();
+        index.tokenizers().register("body", tokenizer);
+        let writer = index.writer(50_000_000).unwrap();
+        let reader = index
+            .reader_builder()
+            .reload_policy(tantivy::ReloadPolicy::Manual)
+            .try_into()
+            .unwrap();
+        let engine = SearchEngine {
+            index,
+            schema,
+            fields,
+            reader,
+            writer,
+        };
+        let engine = Arc::new(std::sync::Mutex::new(engine));
+
+        let (_msg_tx, msg_rx) = crossbeam::channel::bounded::<IndexerMessage>(1);
+        let (_tag_tx, tag_rx) = crossbeam::channel::bounded::<TagUpdate>(1);
+        let (progress_tx, progress_rx) = crossbeam::channel::unbounded::<IndexerProgress>();
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let f = tmp.path().join("x.txt");
+        std::fs::write(&f, "content").unwrap();
+        let m = std::fs::metadata(&f).unwrap();
+        let mtime = m
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let batch = vec![(f.clone(), mtime, m.len())];
+
+        let mut pipeline = Pipeline::new(
+            engine.clone(),
+            store,
+            PathBuf::from("/test"),
+            msg_rx,
+            tag_rx,
+            progress_tx,
+        );
+
+        // Process with offset 10 (simulating second batch)
+        let processed = pipeline.process_batch(&batch, 10);
+        assert_eq!(processed, 1);
+
+        // Verify progress starts from offset+1
+        let progress = progress_rx.try_recv().unwrap();
+        if let IndexerProgress::Progress { processed } = progress {
+            assert_eq!(
+                processed, 11,
+                "Progress should be offset+1 = 11, got {}",
+                processed
+            );
+        } else {
+            panic!("Expected Progress");
+        }
+    }
+
+    #[test]
+    fn process_batch_skips_unsupported_files() {
+        use crate::app::TagUpdate;
+        use crate::search::engine::SearchEngine;
+        use crate::watcher::watcher::IndexerMessage;
+        use std::path::PathBuf;
+
+        let (store, _dir) = setup_tag_store();
+        let index_dir = tempfile::TempDir::new().unwrap();
+        let schema = crate::search::schema::build_schema();
+        let fields = crate::search::schema::SchemaFields::from_schema(&schema);
+        let index =
+            tantivy::Index::create_in_dir(index_dir.path(), schema.clone()).unwrap();
+        let tokenizer = tantivy::tokenizer::TextAnalyzer::builder(
+            tantivy::tokenizer::SimpleTokenizer::default(),
+        )
+        .filter(tantivy::tokenizer::LowerCaser)
+        .build();
+        index.tokenizers().register("body", tokenizer);
+        let writer = index.writer(50_000_000).unwrap();
+        let reader = index
+            .reader_builder()
+            .reload_policy(tantivy::ReloadPolicy::Manual)
+            .try_into()
+            .unwrap();
+        let engine = SearchEngine {
+            index,
+            schema,
+            fields,
+            reader,
+            writer,
+        };
+        let engine = Arc::new(std::sync::Mutex::new(engine));
+
+        let (_msg_tx, msg_rx) = crossbeam::channel::bounded::<IndexerMessage>(1);
+        let (_tag_tx, tag_rx) = crossbeam::channel::bounded::<TagUpdate>(1);
+        let (progress_tx, _rx) = crossbeam::channel::unbounded::<IndexerProgress>();
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let bad = tmp.path().join("corrupt.pdf");
+        std::fs::write(&bad, b"%%BAD_DATA%%").unwrap();
+        let m = std::fs::metadata(&bad).unwrap();
+        let mtime = m
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let batch = vec![(bad.clone(), mtime, m.len())];
+
+        let mut pipeline = Pipeline::new(
+            engine.clone(),
+            store,
+            PathBuf::from("/test"),
+            msg_rx,
+            tag_rx,
+            progress_tx,
+        );
+
+        // Corrupt PDF should not crash — just skip
+        let processed = pipeline.process_batch(&batch, 0);
+        assert_eq!(processed, 0, "Corrupt file should be skipped, not crash");
+
+        let mut eng = engine.lock().unwrap_or_else(|e| e.into_inner());
+        eng.reload().unwrap();
+        assert_eq!(eng.doc_count().unwrap(), 0, "No docs should be indexed from corrupt file");
+    }
 }
