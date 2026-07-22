@@ -1098,6 +1098,12 @@ impl eframe::App for PapervaultApp {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         let _ = self.config.save();
 
+        // Drop sender clones before stop() — if these stay alive, the
+        // indexer and renderer channels never close and thread joins hang.
+        self.render_request_tx = None;
+        self.watcher_shutdown_tx = None;
+        self.watcher_shutdown_flag = None;
+
         // Gracefully stop the folder runtime (joins all background threads).
         if let Some(rt) = self.folder_runtime.take() {
             let _ = rt.stop();
