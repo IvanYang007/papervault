@@ -46,6 +46,11 @@ pub struct RenderRequest {
     pub path: PathBuf,
     pub page: usize,
     pub zoom: f32,
+    /// Target display dimensions in physical pixels (0 = use default max).
+    pub target_width: u32,
+    pub target_height: u32,
+    /// Priority: 0 = prefetch (process only when idle), 1 = normal.
+    pub priority: u8,
 }
 
 /// Messages from the renderer thread to the UI thread.
@@ -59,6 +64,8 @@ pub struct RenderResult {
     pub rgba_bytes: Vec<u8>,
     pub width: usize,
     pub height: usize,
+    /// Whether this is a low-res preview (true) or the final full-res render (false).
+    pub is_preview: bool,
 }
 
 /// Top-level application state.
@@ -111,6 +118,8 @@ pub struct PapervaultApp {
     current_pdf_page_count: usize,
     /// PDF zoom level (1.0 = 100%).
     pdf_zoom: f32,
+    /// Last known preview panel size for display-resolution rendering.
+    preview_panel_size: (u32, u32),
     // Graceful shutdown: signals watcher to stop, closing the channel to indexer
     watcher_shutdown_flag: Option<Arc<AtomicBool>>,
     #[allow(dead_code)]
@@ -193,6 +202,7 @@ impl PapervaultApp {
             current_preview_path: None,
             current_pdf_page_count: 0,
             pdf_zoom: 1.0,
+            preview_panel_size: (800, 600),
             watcher_shutdown_flag,
             watcher_shutdown_tx,
             last_search_instant: None,
@@ -367,6 +377,9 @@ impl PapervaultApp {
                     path: file_path,
                     page: 1,
                     zoom: self.pdf_zoom,
+                    target_width: self.preview_panel_size.0,
+                    target_height: self.preview_panel_size.1,
+                    priority: 1,
                 });
             }
             self.preview_text = None;
@@ -427,6 +440,9 @@ impl PapervaultApp {
                 path,
                 page: self.current_page,
                 zoom: self.pdf_zoom,
+                target_width: self.preview_panel_size.0,
+                target_height: self.preview_panel_size.1,
+                priority: 1,
             };
             let _ = tx.send(request);
         }
@@ -460,6 +476,29 @@ impl PapervaultApp {
                         color_image,
                         egui::TextureOptions::default(),
                     ));
+                    // After a full-res render, prefetch the next and previous pages
+                    if !result.is_preview && self.current_pdf_page_count > 0 {
+                        if let Some(ref tx) = self.render_request_tx {
+                            let path = if let Some(ref p) = self.current_preview_path {
+                                p.clone()
+                            } else {
+                                continue;
+                            };
+                            // Prefetch next page
+                            let next = self.current_page + 1;
+                            if next <= self.current_pdf_page_count {
+                                let _ = tx.send(RenderRequest {
+                                    request_id: self.latest_render_request_id + 1,
+                                    path: path.clone(),
+                                    page: next,
+                                    zoom: self.pdf_zoom,
+                                    target_width: self.preview_panel_size.0,
+                                    target_height: self.preview_panel_size.1,
+                                    priority: 0,
+                                });
+                            }
+                        }
+                    }
                 } else {
                     // Render failed — keep texture cleared, error will show
                     self.preview_texture = None;
@@ -992,6 +1031,11 @@ impl eframe::App for PapervaultApp {
                     .as_ref()
                     .expect("preview has texture")
                     .size_vec2();
+
+                // Update preview panel size for display-resolution rendering
+                let avail = ui.available_size();
+                self.preview_panel_size = (avail.x as u32, avail.y as u32);
+
                 ui.image(egui::ImageSource::Texture(egui::load::SizedTexture::new(
                     tex_id, tex_size,
                 )));
