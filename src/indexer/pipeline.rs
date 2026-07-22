@@ -51,7 +51,6 @@ impl Pipeline {
         info!("Pipeline started");
 
         // Build extractor chain on this thread (avoids Send requirement on pdfium)
-        let stages = stages::create_extractor_chain();
 
         // Run reconciliation before processing any files.
         // This was moved from the main thread so the UI starts instantly.
@@ -71,24 +70,18 @@ impl Pipeline {
             }
         });
         let mut scan_processed = 0usize;
+
+        // Batch files for parallel extraction (Tantivy writes stay sequential).
+        const PARALLEL_BATCH: usize = 8;
+        let mut batch: Vec<(PathBuf, u64, u64)> = Vec::with_capacity(PARALLEL_BATCH);
+
         for msg in scan_rx {
             match msg {
                 IndexerMessage::Upsert { path, mtime, size } => {
-                    match self.process_upsert(&path, mtime, size, &stages) {
-                        Ok(()) => {
-                            scan_processed += 1;
-                            self.pending_count += 1;
-                            let _ = self.progress_tx.send(IndexerProgress::Progress {
-                                processed: scan_processed,
-                            });
-                        }
-                        Err(e) => {
-                            error!("Pipeline error for {}: {}", path.display(), e);
-                            let _ = self.progress_tx.send(IndexerProgress::Error {
-                                path: path.clone(),
-                                error: e.to_string(),
-                            });
-                        }
+                    batch.push((path, mtime, size));
+                    if batch.len() >= PARALLEL_BATCH {
+                        scan_processed += self.process_batch(&batch);
+                        batch.clear();
                     }
                 }
                 IndexerMessage::Delete { path } => {
@@ -98,6 +91,10 @@ impl Pipeline {
                     }
                 }
             }
+        }
+        // Process remaining batch
+        if !batch.is_empty() {
+            scan_processed += self.process_batch(&batch);
         }
         // Commit any pending files from the initial scan
         if self.pending_count > 0 {
@@ -116,6 +113,9 @@ impl Pipeline {
         let commit_interval = Duration::from_secs(2);
 
         info!("Pipeline started, waiting for messages...");
+
+        // Create extractors for the regular message loop (one-at-a-time, no parallelism needed)
+        let stages = crate::indexer::stages::create_extractor_chain();
 
         loop {
             // Use recv_timeout to periodically check commit timer even when idle
@@ -203,6 +203,115 @@ impl Pipeline {
                 );
             }
         }
+    }
+
+    fn process_batch(
+        &mut self,
+        batch: &[(PathBuf, u64, u64)],
+    ) -> usize {
+        use rayon::prelude::*;
+
+        // Phase 1: Extract text in parallel (each thread creates its own extractors)
+        let results: Vec<_> = batch
+            .par_iter()
+            .map(|(path, mtime, size)| {
+                let stages = crate::indexer::stages::create_extractor_chain();
+                let extracted = match crate::indexer::stages::run_chain(path, &stages) {
+                    Ok(Some(content)) => Some(content),
+                    Ok(None) => None,
+                    Err(_) => None,
+                };
+                (path, *mtime, *size, extracted)
+            })
+            .collect();
+
+        // Phase 2: Index sequentially (Tantivy is single-writer, SQLite under Mutex)
+        let mut processed = 0usize;
+        for (path, mtime, size, extracted) in &results {
+            let Some(extracted) = extracted else {
+                continue;
+            };
+            let path_str = path.display().to_string();
+            let file_type = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("")
+                .to_lowercase();
+            let content_hash = {
+                let mut hasher = blake3::Hasher::new();
+                hasher.update(extracted.text.as_bytes());
+                hasher.update(file_type.as_bytes());
+                hasher.finalize().to_hex().to_string()
+            };
+
+            // Clean up old entries
+            if let Ok(Some(old_hash)) = self.tag_store.get_hash_by_path(&path_str) {
+                if old_hash != content_hash {
+                    {
+                        let mut engine =
+                            self.search_engine.lock().unwrap_or_else(|e| e.into_inner());
+                        let _ = engine.delete_by_hash(&old_hash);
+                    }
+                    let _ = self.tag_store.delete_document_by_path(&path_str);
+                }
+            }
+
+            let file_name =
+                path.file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("")
+                    .to_string();
+            let doc_id = format!("{}{}", content_hash, file_type);
+            let modified_ts = *mtime as i64;
+            let tags = self
+                .tag_store
+                .get_tags_for_document(&content_hash)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|t| t.name)
+                .collect::<Vec<String>>();
+
+            if let Err(e) = self.tag_store.upsert_document(
+                &content_hash,
+                &path_str,
+                &file_type,
+                *size as i64,
+                modified_ts,
+            ) {
+                error!("Batch upsert error for {}: {}", path_str, e);
+                continue;
+            }
+
+            {
+                let mut engine = self.search_engine.lock().unwrap_or_else(|e| e.into_inner());
+                if let Err(e) = engine.index_document(
+                    &doc_id,
+                    path,
+                    &file_name,
+                    &extracted.text,
+                    &file_type,
+                    modified_ts,
+                    &content_hash,
+                    &tags,
+                ) {
+                    error!("Batch index error for {}: {}", path_str, e);
+                    continue;
+                }
+            }
+
+            processed += 1;
+            self.pending_count += 1;
+            let _ = self.progress_tx.send(IndexerProgress::Progress { processed });
+        }
+
+        // Commit after each batch
+        if self.pending_count > 0 {
+            if let Err(e) = self.commit() {
+                error!("Batch commit error: {}", e);
+            }
+            self.pending_count = 0;
+        }
+        processed
     }
 
     /// Process a file create/modify event.

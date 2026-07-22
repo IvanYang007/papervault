@@ -9,7 +9,8 @@ use std::path::Path;
 pub const SUPPORTED_EXTENSIONS: &[&str] = &["pdf", "txt", "md", "log"];
 
 /// Single-method extractor — returns Ok(None) for unsupported files.
-pub trait Extractor {
+/// Send bound required for parallel extraction via rayon.
+pub trait Extractor: Send {
     /// Attempt text extraction. Returns Ok(None) if this extractor
     /// cannot handle this file type (not an error — try next extractor).
     /// Returns Err only on genuine extraction failures.

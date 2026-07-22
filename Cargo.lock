@@ -3304,6 +3304,7 @@ dependencies = [
  "pdf_oxide",
  "pdfium-render",
  "printpdf",
+ "rayon",
  "rfd",
  "rusqlite",
  "serde",
