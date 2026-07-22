@@ -190,16 +190,28 @@ impl PdfRenderer {
     }
 
     /// Check the page cache for a matching render.
+    /// Moves the found entry to the front (most-recently-used position).
     fn cache_lookup(
-        &self,
+        &mut self,
         request: &RenderRequest,
     ) -> Option<(Vec<u8>, u32, u32)> {
         let zoom_pct = (request.zoom * 100.0) as u32;
         let key = (request.path.clone(), request.page, zoom_pct);
-        self.page_cache
+        let pos = self
+            .page_cache
             .iter()
-            .find(|(k, _, _, _)| *k == key)
-            .map(|(_, bytes, w, h)| (bytes.clone(), *w, *h))
+            .position(|(k, _, _, _)| *k == key);
+        match pos {
+            Some(idx) => {
+                // Move to front to maintain true LRU ordering
+                let entry = self.page_cache.remove(idx).unwrap();
+                let (_, bytes, w, h) = &entry;
+                let result = (bytes.clone(), *w, *h);
+                self.page_cache.push_front(entry);
+                Some(result)
+            }
+            None => None,
+        }
     }
 
     /// Insert a rendered page into the cache, evicting the oldest if needed.

@@ -485,10 +485,12 @@ impl PapervaultApp {
                                 continue;
                             };
                             // Prefetch next page
+                            // Use request_id=0 to avoid collision with user-initiated requests.
+                            // Prefetch results only warm the cache; the UI never accepts request_id=0.
                             let next = self.current_page + 1;
                             if next <= self.current_pdf_page_count {
                                 let _ = tx.send(RenderRequest {
-                                    request_id: self.latest_render_request_id + 1,
+                                    request_id: 0,
                                     path: path.clone(),
                                     page: next,
                                     zoom: self.pdf_zoom,
@@ -500,8 +502,9 @@ impl PapervaultApp {
                         }
                     }
                 } else {
-                    // Render failed — keep texture cleared, error will show
-                    self.preview_texture = None;
+                    // Render failed — but keep any existing preview (e.g., low-res
+                    // preview succeeded before full-res failed). Only clear if we
+                    // have no texture at all (first render truly failed).
                 }
             }
         }
