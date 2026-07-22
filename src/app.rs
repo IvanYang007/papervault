@@ -3,6 +3,8 @@ use crate::runtime::FolderRuntime;
 use crate::search::engine::SearchEngine;
 use crate::search::query::{SearchRequest, SearchResult};
 use crate::search::schema::SchemaFields;
+
+const PDF_TYPE: &str = "pdf";
 use crate::tags::model::Tag;
 use crate::tags::store::DocumentInfo;
 use crate::tags::store::TagStore;
@@ -326,7 +328,7 @@ impl PapervaultApp {
         // Clear stale preview when switching documents
         self.preview_texture = None;
         self.current_pdf_page_count = 0;
-        let is_pdf = self.search_results[index].file_type == "pdf";
+        let is_pdf = self.search_results[index].file_type == PDF_TYPE;
         let file_path = self.search_results[index].file_path.clone();
         let file_type = self.search_results[index].file_type.clone();
 
@@ -351,7 +353,7 @@ impl PapervaultApp {
 
         let file_path = PathBuf::from(path);
         let is_pdf = path.to_lowercase().ends_with(".pdf");
-        self.preview_file_type = Some(if is_pdf { "pdf".into() } else { "txt".into() });
+        self.preview_file_type = Some(if is_pdf { PDF_TYPE.into() } else { "txt".into() });
 
         if is_pdf {
             self.latest_render_request_id += 1;
@@ -729,12 +731,12 @@ impl eframe::App for PapervaultApp {
                 });
         }
 
-        // ── Left panel: file browser ──
-        if self.config.watched_folder.is_some() {
-            // Tick down file browser refresh cooldown
+        // Tick down file browser refresh cooldown (rate-limits list_all_documents)
         self.file_browser_refresh_cooldown = self.file_browser_refresh_cooldown.saturating_sub(1);
 
-        // Refresh file list if dirty
+        // ── Left panel: file browser ──
+        if self.config.watched_folder.is_some() {
+            // Refresh file list if dirty
             if self.file_browser_dirty {
                 if let Some(ref store) = self.tag_store {
                     if let Ok(docs) = store.list_all_documents() {
@@ -760,7 +762,7 @@ impl eframe::App for PapervaultApp {
                                 .and_then(|n| n.to_str())
                                 .unwrap_or(&doc.file_path);
                             let icon = match doc.file_type.as_str() {
-                                "pdf" => "📄",
+                                PDF_TYPE => "📄",
                                 "txt" => "📝",
                                 "md" => "📋",
                                 _ => "📎",
@@ -932,7 +934,7 @@ impl eframe::App for PapervaultApp {
                     ui.label("Try different terms or remove tag filters.");
                 });
             } else if self.preview_texture.is_some() {
-                let is_pdf = self.preview_file_type.as_deref() == Some("pdf");
+                let is_pdf = self.preview_file_type.as_deref() == Some(PDF_TYPE);
                 let current_page = self.current_page;
 
                 // PDF page navigation (before preview borrow)

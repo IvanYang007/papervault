@@ -436,9 +436,7 @@ mod tests {
         .unwrap();
 
         (
-            TagStore {
-                conn: Arc::new(std::sync::Mutex::new(conn)),
-            },
+            TagStore::new_for_test(conn),
             dir,
         )
     }
@@ -531,22 +529,22 @@ mod tests {
             .unwrap();
 
         // Set last_error manually (simulating what the pipeline would do for a corrupt file)
-        let conn = store.conn.lock().unwrap();
-        conn.execute(
-            "UPDATE documents SET last_error = ?1 WHERE content_hash = ?2",
-            rusqlite::params!["Extraction failed: corrupt PDF header", "hash1"],
-        )
-        .unwrap();
+        store.with_conn(|conn| {
+            conn.execute(
+                "UPDATE documents SET last_error = ?1 WHERE content_hash = ?2",
+                rusqlite::params!["Extraction failed: corrupt PDF header", "hash1"],
+            )?;
 
-        // Verify last_error was stored
-        let error: String = conn
-            .query_row(
-                "SELECT last_error FROM documents WHERE content_hash = ?1",
-                rusqlite::params!["hash1"],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert!(error.contains("corrupt PDF header"));
+            // Verify last_error was stored
+            let error: String = conn
+                .query_row(
+                    "SELECT last_error FROM documents WHERE content_hash = ?1",
+                    rusqlite::params!["hash1"],
+                    |row| row.get(0),
+                )?;
+            assert!(error.contains("corrupt PDF header"));
+            Ok(())
+        }).unwrap();
     }
 
     #[test]

@@ -8,10 +8,21 @@ use super::model::Tag;
 /// Cloneable via Arc — all clones share the same connection.
 #[derive(Clone)]
 pub struct TagStore {
-    pub(crate) conn: Arc<Mutex<Connection>>,
+    conn: Arc<Mutex<Connection>>,
 }
 
 impl TagStore {
+    /// Test-only constructor. Not for production use — use open_or_create().
+    #[cfg(test)]
+    pub fn new_for_test(conn: Connection) -> Self {
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys = ON;",
+        )
+        .ok();
+        Self {
+            conn: Arc::new(Mutex::new(conn)),
+        }
+    }
     /// Open or create the tag database at the standard location.
     pub fn open_or_create() -> SqlResult<Self> {
         let db_path = Self::db_path();
@@ -56,7 +67,7 @@ impl TagStore {
     }
 
     /// Access the underlying connection. Caller must hold the lock briefly.
-    fn with_conn<F, T>(&self, f: F) -> SqlResult<T>
+    pub(crate) fn with_conn<F, T>(&self, f: F) -> SqlResult<T>
     where
         F: FnOnce(&Connection) -> SqlResult<T>,
     {
@@ -280,16 +291,13 @@ impl TagStore {
     pub fn list_all_documents(&self) -> SqlResult<Vec<DocumentInfo>> {
         self.with_conn(|conn| {
             let mut stmt = conn.prepare(
-                "SELECT file_path, file_type, file_size, modified_ts, content_hash FROM documents ORDER BY file_path",
+                "SELECT file_path, file_type FROM documents ORDER BY file_path",
             )?;
             let docs = stmt
                 .query_map([], |row| {
                     Ok(DocumentInfo {
                         file_path: row.get(0)?,
                         file_type: row.get(1)?,
-                        file_size: row.get(2)?,
-                        modified_ts: row.get(3)?,
-                        content_hash: row.get(4)?,
                     })
                 })?
                 .filter_map(|r| r.ok())
@@ -304,12 +312,6 @@ impl TagStore {
 pub struct DocumentInfo {
     pub file_path: String,
     pub file_type: String,
-    #[allow(dead_code)]
-    pub file_size: i64,
-    #[allow(dead_code)]
-    pub modified_ts: i64,
-    #[allow(dead_code)]
-    pub content_hash: String,
 }
 
 #[cfg(test)]
@@ -348,9 +350,7 @@ mod tests {
         .unwrap();
 
         (
-            TagStore {
-                conn: Arc::new(Mutex::new(conn)),
-            },
+            TagStore::new_for_test(conn),
             dir,
         )
     }
