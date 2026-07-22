@@ -644,4 +644,39 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn search_hyphenated_term_finds_tokenized_match() {
+        let (mut engine, _dir) = create_test_engine();
+
+        // Index a document whose file_name contains a hyphenated term.
+        // SimpleTokenizer splits "ABC-123" into ["abc", "123"].
+        engine
+            .index_document(
+                "hash1pdf",
+                Path::new("/test/ABC-123.pdf"),
+                "ABC-123.pdf",
+                "quarterly financial report",
+                "pdf",
+                1700000000,
+                "hash1",
+                &[],
+            )
+            .unwrap();
+
+        engine.commit().unwrap();
+        engine.reload().unwrap();
+
+        // Searching for just "abc" should find the hyphenated filename
+        let results = engine
+            .search(&SearchRequest::new("abc".into()))
+            .unwrap();
+        assert_eq!(results.total_hits, 1, "Should find ABC-123.pdf by token 'abc'");
+
+        // Searching for "123" should also find it
+        let results = engine
+            .search(&SearchRequest::new("123".into()))
+            .unwrap();
+        assert_eq!(results.total_hits, 1, "Should find ABC-123.pdf by token '123'");
+    }
 }

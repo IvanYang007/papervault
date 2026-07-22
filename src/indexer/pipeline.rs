@@ -1,4 +1,5 @@
-use anyhow::Context;
+use crate::app::{IndexerProgress, TagUpdate};
+use crate::indexer::stages;
 use crossbeam::channel::{Receiver, Sender};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -6,9 +7,6 @@ use std::time::{Duration, Instant};
 use tantivy::schema::Value;
 use tantivy::DocAddress;
 use tracing::{debug, error, info, warn};
-
-use crate::app::{IndexerProgress, TagUpdate};
-use crate::indexer::stages;
 use crate::search::engine::SearchEngine;
 use crate::tags::store::TagStore;
 use crate::watcher::watcher::IndexerMessage;
@@ -212,7 +210,7 @@ impl Pipeline {
     /// Process a file create/modify event.
     fn process_upsert(
         &mut self,
-        path: &PathBuf,
+        path: &Path,
         mtime: u64,
         size: u64,
         stages: &[Box<dyn crate::indexer::extractors::Extractor>],
@@ -247,40 +245,20 @@ impl Pipeline {
             }
         };
 
-        // Compute content hash via streaming (avoids loading entire file into memory)
-        let content_hash = {
-            let mut hasher = blake3::Hasher::new();
-            let mut file = std::fs::File::open(path)
-                .with_context(|| format!("Failed to open file for hashing: {}", path.display()))?;
-            hasher
-                .update_reader(&mut file)
-                .with_context(|| format!("Failed to hash file: {}", path.display()))?;
-            hasher.finalize().to_hex().to_string()
-        };
-
-        // Clean up old Tantivy document if content changed at this path
-        if let Ok(Some(old_hash)) = self.tag_store.get_hash_by_path(&path_str) {
-            if old_hash != content_hash {
-                let mut engine = self.search_engine.lock().unwrap_or_else(|e| e.into_inner());
-                if let Err(e) = engine.delete_by_hash(&old_hash) {
-                    warn!("Failed to delete old doc {}: {}", old_hash, e);
-                }
-            }
-        }
-
-        // Dedup check
-        if self.tag_store.already_indexed_by_hash(&content_hash)? {
-            // Same content, different path — update path only
-            self.tag_store.update_path(&content_hash, &path_str)?;
-            return Ok(());
-        }
-
-        // Determine file type
+        // Compute content hash from extracted text (not raw bytes).
+        // This avoids reading the file twice and correctly deduplicates
+        // documents with identical text content regardless of metadata variation.
         let file_type = path
             .extension()
             .and_then(|e| e.to_str())
             .unwrap_or("")
             .to_lowercase();
+        let content_hash = {
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(extracted.text.as_bytes());
+            hasher.update(file_type.as_bytes());
+            hasher.finalize().to_hex().to_string()
+        };
 
         let file_name = path
             .file_name()
@@ -369,6 +347,19 @@ pub fn reconcile(engine: Arc<std::sync::Mutex<SearchEngine>>, tag_store: &TagSto
         warn!("Garbage collection during reconciliation: {}", e);
     }
 
+    // Batch-load all known content hashes from SQLite into memory.
+    // This avoids per-document SELECT COUNT(*) queries (was O(n) SQLite calls).
+    let known_hashes: std::collections::HashSet<String> = tag_store
+        .with_conn(|conn| {
+            let mut stmt = conn.prepare("SELECT content_hash FROM documents")?;
+            let hashes = stmt
+                .query_map([], |row| row.get::<_, String>(0))?
+                .filter_map(|r| r.ok())
+                .collect();
+            Ok(hashes)
+        })
+        .unwrap_or_default();
+
     // Iterate all Tantivy documents and verify SQLite presence
     let eng = engine.lock().unwrap_or_else(|e| e.into_inner());
     let searcher = eng.reader.searcher();
@@ -407,9 +398,8 @@ pub fn reconcile(engine: Arc<std::sync::Mutex<SearchEngine>>, tag_store: &TagSto
                 continue;
             }
 
-            // Check if SQLite has this document
-            match tag_store.already_indexed_by_hash(content_hash) {
-                Ok(false) => {
+            // O(1) in-memory lookup instead of per-document SQLite query
+            if !known_hashes.contains(content_hash) {
                     // Backfill: insert into SQLite from Tantivy stored fields
                     let file_size = if file_path.is_empty() {
                         0i64
@@ -434,14 +424,6 @@ pub fn reconcile(engine: Arc<std::sync::Mutex<SearchEngine>>, tag_store: &TagSto
                     } else {
                         backfill_count += 1;
                     }
-                }
-                Ok(true) => {}
-                Err(e) => {
-                    warn!(
-                        "Reconciliation SQLite check failed for {}: {}",
-                        content_hash, e
-                    );
-                }
             }
         }
     }

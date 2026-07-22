@@ -231,6 +231,7 @@ impl TagStore {
         })
     }
 
+    #[allow(dead_code)]  // used by reconcile path in prior version; kept for API completeness
     pub fn already_indexed_by_hash(&self, content_hash: &str) -> SqlResult<bool> {
         self.with_conn(|conn| {
             let mut stmt =
@@ -240,6 +241,7 @@ impl TagStore {
         })
     }
 
+    #[allow(dead_code)]  // used by test and prior dedup path
     pub fn update_path(&self, content_hash: &str, new_path: &str) -> SqlResult<()> {
         self.with_conn(|conn| {
             conn.execute(
