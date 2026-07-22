@@ -18,6 +18,7 @@ use crate::watcher::watcher::IndexerMessage;
 pub struct Pipeline {
     search_engine: Arc<std::sync::Mutex<SearchEngine>>,
     tag_store: TagStore,
+    watcher_folder: PathBuf,
     msg_rx: Receiver<IndexerMessage>,
     tag_rx: Receiver<TagUpdate>,
     progress_tx: Sender<IndexerProgress>,
@@ -29,6 +30,7 @@ impl Pipeline {
     pub fn new(
         search_engine: Arc<std::sync::Mutex<SearchEngine>>,
         tag_store: TagStore,
+        watcher_folder: PathBuf,
         msg_rx: Receiver<IndexerMessage>,
         tag_rx: Receiver<TagUpdate>,
         progress_tx: Sender<IndexerProgress>,
@@ -36,6 +38,7 @@ impl Pipeline {
         Self {
             search_engine,
             tag_store,
+            watcher_folder,
             msg_rx,
             tag_rx,
             progress_tx,
@@ -58,7 +61,61 @@ impl Pipeline {
         crate::indexer::pipeline::reconcile(self.search_engine.clone(), &self.tag_store);
         info!("Reconciliation complete.");
 
-        let mut total_processed: usize = 0;
+        // Run initial file scan on the pipeline thread (not the watcher) so
+        // the watcher never blocks on a bounded channel and always responds
+        // to shutdown signals.
+        info!("Running initial file scan...");
+        let (scan_tx, scan_rx) = crossbeam::channel::bounded::<IndexerMessage>(256);
+        let folder = self.watcher_folder.clone();
+        std::thread::spawn(move || {
+            if let Err(e) =
+                crate::watcher::watcher::emit_initial_scan(&folder, &scan_tx)
+            {
+                tracing::error!("Initial scan failed: {}", e);
+            }
+        });
+        let mut scan_processed = 0usize;
+        for msg in scan_rx {
+            match msg {
+                IndexerMessage::Upsert { path, mtime, size } => {
+                    match self.process_upsert(&path, mtime, size, &stages) {
+                        Ok(()) => {
+                            scan_processed += 1;
+                            self.pending_count += 1;
+                            let _ = self.progress_tx.send(IndexerProgress::Progress {
+                                processed: scan_processed,
+                            });
+                        }
+                        Err(e) => {
+                            error!("Pipeline error for {}: {}", path.display(), e);
+                            let _ = self.progress_tx.send(IndexerProgress::Error {
+                                path: path.clone(),
+                                error: e.to_string(),
+                            });
+                        }
+                    }
+                }
+                IndexerMessage::Delete { path } => {
+                    debug!("Pipeline delete: {}", path.display());
+                    if let Err(e) = self.process_delete(&path) {
+                        error!("Delete error for {}: {}", path.display(), e);
+                    }
+                }
+            }
+        }
+        // Commit any pending files from the initial scan
+        if self.pending_count > 0 {
+            if let Err(e) = self.commit() {
+                error!("Initial scan commit error: {}", e);
+            }
+            self.pending_count = 0;
+        }
+        let _ = self.progress_tx.send(IndexerProgress::ScanComplete {
+            total: scan_processed,
+        });
+        info!("Initial scan complete: {} files indexed", scan_processed);
+
+        let mut total_processed: usize = scan_processed;
         let mut last_commit = Instant::now();
         let commit_interval = Duration::from_secs(2);
 
@@ -612,7 +669,7 @@ mod tests {
         drop(tag_tx);
 
         // Create pipeline — it will process the Upsert then hit Disconnected
-        let mut pipeline = Pipeline::new(engine.clone(), store, msg_rx, tag_rx, progress_tx);
+        let mut pipeline = Pipeline::new(engine.clone(), store, PathBuf::from("/test"), msg_rx, tag_rx, progress_tx);
 
         // Run should process the document, then shutdown and commit
         pipeline.run();

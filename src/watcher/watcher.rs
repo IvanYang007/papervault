@@ -30,8 +30,8 @@ pub fn start_watching(
     tx: Sender<IndexerMessage>,
     shutdown: Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
-    // Emit initial scan events for existing files
-    emit_initial_scan(&folder, &tx)?;
+    // NOTE: emit_initial_scan moved to the pipeline thread so the watcher
+    // thread never blocks on a bounded channel — it always responds to shutdown.
 
     let event_handler = move |result: DebounceEventResult| match result {
         Ok(events) => {
@@ -96,7 +96,9 @@ pub fn start_watching(
 }
 
 /// Emit events for all existing supported files in the folder, recursively.
-fn emit_initial_scan(folder: &PathBuf, tx: &Sender<IndexerMessage>) -> anyhow::Result<()> {
+/// Called from the pipeline thread (not the watcher) to avoid blocking
+/// on bounded channel backpressure during shutdown.
+pub fn emit_initial_scan(folder: &PathBuf, tx: &Sender<IndexerMessage>) -> anyhow::Result<()> {
     use walkdir::WalkDir;
     let mut count = 0u64;
     for entry in WalkDir::new(folder).into_iter().filter_map(|e| e.ok()) {
@@ -134,7 +136,7 @@ fn emit_initial_scan(folder: &PathBuf, tx: &Sender<IndexerMessage>) -> anyhow::R
     Ok(())
 }
 
-fn is_supported_extension(path: &Path) -> bool {
+pub fn is_supported_extension(path: &Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
         .map(|ext| {

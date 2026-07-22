@@ -56,7 +56,7 @@ impl FolderRuntime {
     /// Dropping `FolderRuntime` drops `tag_tx`, closing the channel naturally.
     pub fn start(folder: &Path, tag_store: &TagStore) -> Result<Self> {
         // ── Channels ──
-        let (watcher_tx, watcher_rx) = channel::bounded::<IndexerMessage>(10_000);
+        let (watcher_tx, watcher_rx) = channel::bounded::<IndexerMessage>(256);
         let (progress_tx, progress_rx) = channel::unbounded::<IndexerProgress>();
         let (tag_tx, tag_rx) = channel::unbounded::<TagUpdate>();
         let (render_tx, render_rx) = channel::unbounded::<RenderRequest>();
@@ -79,6 +79,7 @@ impl FolderRuntime {
         let indexer_engine = engine.clone();
         let indexer_tags = tag_store.clone();
         let progress_tx_clone = progress_tx.clone();
+        let watcher_folder = folder.to_path_buf();
         let indexer_handle =
             std::thread::Builder::new()
                 .name("indexer".into())
@@ -86,6 +87,7 @@ impl FolderRuntime {
                     let mut p = Pipeline::new(
                         indexer_engine,
                         indexer_tags,
+                        watcher_folder,
                         watcher_rx,
                         tag_rx,
                         progress_tx_clone,
