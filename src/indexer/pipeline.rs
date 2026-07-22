@@ -72,7 +72,9 @@ impl Pipeline {
         let mut scan_processed = 0usize;
 
         // Batch files for parallel extraction (Tantivy writes stay sequential).
-        const PARALLEL_BATCH: usize = 8;
+        // Larger batch = better parallelism, but also more memory for extracted text.
+        // 32 files × ~50KB avg text = ~1.6MB per batch — well within desktop memory.
+        const PARALLEL_BATCH: usize = 32;
         let mut batch: Vec<(PathBuf, u64, u64)> = Vec::with_capacity(PARALLEL_BATCH);
 
         for msg in scan_rx {
