@@ -126,6 +126,8 @@ pub struct PapervaultApp {
     file_browser_docs: Vec<DocumentInfo>,
     /// Whether the file browser needs a refresh.
     file_browser_dirty: bool,
+    /// Cooldown counter: only refresh file browser every N frames during active indexing.
+    file_browser_refresh_cooldown: usize,
     /// Currently previewed file path (from file browser, not search).
     browsed_file: Option<String>,
 }
@@ -199,6 +201,7 @@ impl PapervaultApp {
             background_error: None,
             file_browser_docs: Vec::new(),
             file_browser_dirty: true,
+            file_browser_refresh_cooldown: 0,
             browsed_file: None,
         }
     }
@@ -466,7 +469,10 @@ impl PapervaultApp {
             match progress {
                 IndexerProgress::Progress { processed } => {
                     self.indexing_done = processed;
-                    self.file_browser_dirty = true;
+                    if self.file_browser_refresh_cooldown == 0 {
+                        self.file_browser_dirty = true;
+                        self.file_browser_refresh_cooldown = 30; // ~0.5s at 60fps
+                    }
                 }
                 IndexerProgress::ScanComplete { total } => {
                     self.indexing_total = total;
@@ -725,7 +731,10 @@ impl eframe::App for PapervaultApp {
 
         // ── Left panel: file browser ──
         if self.config.watched_folder.is_some() {
-            // Refresh file list if dirty
+            // Tick down file browser refresh cooldown
+        self.file_browser_refresh_cooldown = self.file_browser_refresh_cooldown.saturating_sub(1);
+
+        // Refresh file list if dirty
             if self.file_browser_dirty {
                 if let Some(ref store) = self.tag_store {
                     if let Ok(docs) = store.list_all_documents() {
