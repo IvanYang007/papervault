@@ -93,19 +93,22 @@ impl PdfRenderer {
     fn render_two_pass(&mut self, request: &RenderRequest) {
         // Pass 1: low-res (1/4 dimensions)
         let preview_result = self.render_and_send(request, true);
-        // Pass 2: full-res (only if preview succeeded)
         if preview_result {
-            // Check if a newer normal-priority request arrived while we were
-            // rendering the preview (prefetch requests don't supersede).
-            let mut stale = false;
+            // Collect the latest normal-priority request that arrived during preview.
+            // Don't discard it — render it so the user's navigation is respected.
+            let mut latest: Option<RenderRequest> = None;
             while let Ok(newer) = self.request_rx.try_recv() {
                 if newer.priority >= 1 {
-                    stale = true;
+                    latest = Some(newer);
                 }
             }
-            if stale {
+            if let Some(new_req) = latest {
+                // User navigated while preview was rendering — render the new page
+                let _ = self.render_and_send(&new_req, true);
+                let _ = self.render_and_send(&new_req, false);
                 return;
             }
+            // No newer request — render full-res of the original page
             let _ = self.render_and_send(request, false);
         }
     }

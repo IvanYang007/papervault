@@ -271,7 +271,14 @@ impl PapervaultApp {
             if let Some(ref fields) = self.search_fields {
                 // Don't pass tag filters to Tantivy — Tantivy tags may be stale.
                 // Instead, post-filter using SQLite which always has the truth.
-                let request = SearchRequest::new(query.to_string()).with_limit(50);
+                // Fetch more results when tag filters are active so the post-filter
+                // has enough documents to work with beyond the default 50-result window.
+                let limit = if self.active_tag_filters.is_empty() {
+                    50
+                } else {
+                    200
+                };
+                let request = SearchRequest::new(query.to_string()).with_limit(limit);
                 match crate::search::engine::search_with_reader(fields, reader, &request) {
                     Ok(mut results) => {
                         // Batch-fetch tags for all results (single query, chunked by 500)

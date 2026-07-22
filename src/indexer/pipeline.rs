@@ -411,10 +411,11 @@ impl Pipeline {
             .collect::<Vec<String>>();
 
         // Write SQLite FIRST, then Tantivy.
-        // If crash between writes: SQLite has doc, Tantivy doesn't → next file event
-        // triggers re-indexing (metadata fast-path skip fails because mtime unchanged
-        // but Tantivy won't have the doc, so search returns stale results until next event).
-        // Reconciliation on startup backfills any Tantivy-missing docs.
+        // If crash between writes: SQLite has doc, Tantivy doesn't. The
+        // metadata fast-path will skip re-indexing (same path+size+mtime),
+        // but the file becomes searchable again after any modification.
+        // Reconciliation backfills Tantivy-missing SQLite rows, but the
+        // reverse (SQLite→Tantivy) requires re-extraction on modification.
         self.tag_store.upsert_document(
             &content_hash,
             &path_str,
@@ -562,7 +563,7 @@ pub fn reconcile(engine: Arc<std::sync::Mutex<SearchEngine>>, tag_store: &TagSto
 
     if backfill_count > 0 {
         info!(
-            "Reconciliation backfilled {} documents to SQLite",
+            "Reconciliation backfilled {} documents to SQLite (Tantivy→SQLite).",
             backfill_count
         );
     }
