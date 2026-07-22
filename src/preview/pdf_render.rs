@@ -95,9 +95,16 @@ impl PdfRenderer {
         let preview_result = self.render_and_send(request, true);
         // Pass 2: full-res (only if preview succeeded)
         if preview_result {
-            // Check if a newer request arrived while we were rendering the preview
-            if self.request_rx.try_recv().is_ok() {
-                return; // Stale — a newer request superseded this one
+            // Check if a newer normal-priority request arrived while we were
+            // rendering the preview (prefetch requests don't supersede).
+            let mut stale = false;
+            while let Ok(newer) = self.request_rx.try_recv() {
+                if newer.priority >= 1 {
+                    stale = true;
+                }
+            }
+            if stale {
+                return;
             }
             let _ = self.render_and_send(request, false);
         }

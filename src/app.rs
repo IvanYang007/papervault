@@ -171,10 +171,7 @@ impl PapervaultApp {
             .as_ref()
             .and_then(|store| store.list_tags().ok())
             .unwrap_or_default();
-        let tag_list_cache = all_tags
-            .iter()
-            .map(|t| (t.name.clone(), t.id))
-            .collect();
+        let tag_list_cache = all_tags.iter().map(|t| (t.name.clone(), t.id)).collect();
         Self {
             config,
             search_reader,
@@ -321,11 +318,8 @@ impl PapervaultApp {
                         // Pre-lowercase match terms so render_highlighted_snippet
                         // doesn't allocate per-term per-frame.
                         for item in &mut results.items {
-                            item.match_terms = item
-                                .match_terms
-                                .iter()
-                                .map(|t| t.to_lowercase())
-                                .collect();
+                            item.match_terms =
+                                item.match_terms.iter().map(|t| t.to_lowercase()).collect();
                         }
                         self.search_results = results.items;
                         // Remap stable hash to index after results change
@@ -775,8 +769,7 @@ impl eframe::App for PapervaultApp {
                     // Tag list with checkboxes — clone only names (not full Tag structs)
                     // because toggle_tag_filter/assign_tag_to_selected need &mut self.
                     ScrollArea::vertical().id_salt("tag_scroll").show(ui, |ui| {
-                        let tag_names: Vec<(String, i64)> =
-                            self.tag_list_cache.clone();
+                        let tag_names: Vec<(String, i64)> = self.tag_list_cache.clone();
                         for (tag_name, tag_id) in &tag_names {
                             let mut checked = self.active_tag_filters.contains(tag_name);
                             ui.horizontal(|ui| {

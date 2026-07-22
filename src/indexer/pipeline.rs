@@ -80,7 +80,8 @@ impl Pipeline {
                 IndexerMessage::Upsert { path, mtime, size } => {
                     batch.push((path, mtime, size));
                     if batch.len() >= PARALLEL_BATCH {
-                        scan_processed += self.process_batch(&batch);
+                        let batch_start = scan_processed;
+                        scan_processed += self.process_batch(&batch, batch_start);
                         batch.clear();
                     }
                 }
@@ -94,7 +95,8 @@ impl Pipeline {
         }
         // Process remaining batch
         if !batch.is_empty() {
-            scan_processed += self.process_batch(&batch);
+            let batch_start = scan_processed;
+            scan_processed += self.process_batch(&batch, batch_start);
         }
         // Commit any pending files from the initial scan
         if self.pending_count > 0 {
@@ -205,10 +207,7 @@ impl Pipeline {
         }
     }
 
-    fn process_batch(
-        &mut self,
-        batch: &[(PathBuf, u64, u64)],
-    ) -> usize {
+    fn process_batch(&mut self, batch: &[(PathBuf, u64, u64)], offset: usize) -> usize {
         use rayon::prelude::*;
 
         // Phase 1: Extract text in parallel (each thread creates its own extractors)
@@ -256,11 +255,11 @@ impl Pipeline {
                 }
             }
 
-            let file_name =
-                path.file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("")
-                    .to_string();
+            let file_name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+                .to_string();
             let doc_id = format!("{}{}", content_hash, file_type);
             let modified_ts = *mtime as i64;
             let tags = self
@@ -301,7 +300,11 @@ impl Pipeline {
 
             processed += 1;
             self.pending_count += 1;
-            let _ = self.progress_tx.send(IndexerProgress::Progress { processed });
+            let _ = self
+                .progress_tx
+                .send(IndexerProgress::Progress {
+                    processed: offset + processed,
+                });
         }
 
         // Commit after each batch
