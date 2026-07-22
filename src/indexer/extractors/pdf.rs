@@ -27,11 +27,11 @@ impl Extractor for PdfExtractor {
             .with_context(|| format!("Failed to open PDF: {}", path.display()))?;
 
         let page_count = doc.page_count()?;
-        let mut text = String::new();
+        let mut text = String::with_capacity(page_count.saturating_mul(2048));
         for i in 0..page_count {
             let page_text = doc
                 .extract_text(i)
-                .with_context(|| format!("Failed to extract page {} from: {}", i, path.display()))?;
+                .with_context(|| format!("Failed to extract page {} from: {}", i + 1, path.display()))?;
             if i > 0 {
                 text.push('\n');
             }
@@ -170,6 +170,10 @@ mod tests {
             Some(1),
             "1-page PDF should report page_count = 1"
         );
+        assert!(
+            !result.text.starts_with('\n'),
+            "Single-page PDF text should not start with newline"
+        );
     }
 
     #[test]
@@ -186,6 +190,12 @@ mod tests {
             Some(5),
             "5-page PDF should report page_count = 5"
         );
+        // Verify page 1 text appears before page 5 text (reading order preserved)
+        let p1 = result.text.find("page one").unwrap();
+        let p5 = result.text.find("page five")
+            .or_else(|| result.text.find("page 5"))
+            .unwrap();
+        assert!(p1 < p5, "Page 1 text should appear before page 5");
     }
 
     #[test]
@@ -200,14 +210,25 @@ mod tests {
     }
 
     #[test]
-    fn extract_password_protected_pdf_returns_error() {
+    fn extract_unencrypted_pdf_succeeds() {
+        // Verify pdf_oxide extracts a normal unencrypted PDF without errors.
+        // True password-protected PDF testing requires a pre-built encrypted
+        // fixture (lopdf 0.34 does not support writing encryption).
         let dir = TempDir::new().unwrap();
-        let path = dir.path().join("password.pdf");
-        generate_no_text_pdf(&path); // Use blank PDF as stand-in
+        let path = dir.path().join("normal.pdf");
+        generate_no_text_pdf(&path);
+
+        // Verify the PDF is not encrypted at the lopdf level
+        let lopdf_doc = lopdf::Document::load(&path).unwrap();
+        assert!(!lopdf_doc.is_encrypted(), "Test PDF should not be encrypted");
+
         let extractor = PdfExtractor;
         let result = extractor.extract(&path);
-        // pdf-extract handles this gracefully
-        assert!(result.is_ok() || result.is_err());
+        assert!(
+            result.is_ok(),
+            "Unencrypted PDF should extract successfully, got: {:?}",
+            result.err()
+        );
     }
 
     #[test]
@@ -217,9 +238,12 @@ mod tests {
         generate_empty_pdf(&path);
         let extractor = PdfExtractor;
         let result = extractor.extract(&path);
-        // 0-page PDF — either error or empty text is acceptable
+        // 0-page PDF — either error or Ok with empty text and page_count=0
         match result {
-            Ok(Some(content)) => assert!(content.text.is_empty()),
+            Ok(Some(content)) => {
+                assert!(content.text.is_empty());
+                assert_eq!(content.page_count, Some(0), "0-page PDF should have page_count = 0");
+            }
             Err(_) => {} // Also acceptable
             _ => {}
         }
