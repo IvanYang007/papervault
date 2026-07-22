@@ -11,7 +11,7 @@ egui = "0.30"
 eframe = "0.30"
 tantivy = "0.22"
 pdfium-render = "0.8"
-pdf_oxide = "0.3"
+pdf_oxide = { version = "0.3", default-features = false }
 notify = { version = "7", features = ["macos_kqueue"] }
 notify-debouncer-full = "0.4"
 rusqlite = { version = "0.32", features = ["bundled"] }
@@ -34,9 +34,14 @@ printpdf = "0.7"
 lopdf = "0.34"
 
 [profile.release]
-lto = true
-codegen-units = 1
+lto = "thin"
+codegen-units = 4
 strip = true
+
+[profile.dev]
+# Faster debug builds: optimize dependencies mildly, skip debug info for deps
+opt-level = 1
+debug = 1
 
 ## Benchmarks (requires nightly)
 ## [[bench]]
