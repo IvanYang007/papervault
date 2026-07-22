@@ -1,8 +1,9 @@
 use super::{ExtractedContent, Extractor};
 use anyhow::{Context, Result};
+use pdf_oxide::PdfDocument;
 use std::path::Path;
 
-/// Extracts text from PDF files using `pdf-extract` (pure Rust, no DLL).
+/// Extracts text from PDF files using `pdf_oxide` (pure Rust, no DLL, high performance).
 pub struct PdfExtractor;
 
 impl PdfExtractor {
@@ -20,14 +21,28 @@ impl Extractor for PdfExtractor {
             _ => return Ok(None),
         }
 
-        let text = pdf_extract::extract_text(path)
-            .with_context(|| format!("Failed to extract PDF: {}", path.display()))?;
+        // pdf_oxide provides extract_all_text() as a convenience, but we iterate
+        // pages manually to also capture the page count (R4).
+        let doc = PdfDocument::open(path)
+            .with_context(|| format!("Failed to open PDF: {}", path.display()))?;
+
+        let page_count = doc.page_count()?;
+        let mut text = String::new();
+        for i in 0..page_count {
+            let page_text = doc
+                .extract_text(i)
+                .with_context(|| format!("Failed to extract page {} from: {}", i, path.display()))?;
+            if i > 0 {
+                text.push('\n');
+            }
+            text.push_str(&page_text);
+        }
 
         let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
         Ok(Some(ExtractedContent {
             text,
             title: Some(file_name.to_string()),
-            page_count: None,
+            page_count: Some(page_count),
         }))
     }
 }
@@ -150,6 +165,11 @@ mod tests {
             "Should extract known text, got: {}",
             result.text
         );
+        assert_eq!(
+            result.page_count,
+            Some(1),
+            "1-page PDF should report page_count = 1"
+        );
     }
 
     #[test]
@@ -161,6 +181,11 @@ mod tests {
         let result = extractor.extract(&path).unwrap().unwrap();
         assert!(result.text.contains("page one"));
         assert!(result.text.contains("page five") || result.text.contains("page 5"));
+        assert_eq!(
+            result.page_count,
+            Some(5),
+            "5-page PDF should report page_count = 5"
+        );
     }
 
     #[test]
@@ -186,13 +211,13 @@ mod tests {
     }
 
     #[test]
-    fn extract_empty_pdf_returns_text() {
+    fn extract_empty_pdf_handled_gracefully() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("empty.pdf");
         generate_empty_pdf(&path);
         let extractor = PdfExtractor;
         let result = extractor.extract(&path);
-        // 0-page PDF — pdf-extract may error or return empty
+        // 0-page PDF — either error or empty text is acceptable
         match result {
             Ok(Some(content)) => assert!(content.text.is_empty()),
             Err(_) => {} // Also acceptable

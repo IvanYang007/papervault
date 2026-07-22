@@ -105,7 +105,7 @@ impl PdfRenderer {
         let cache_hit = self
             .cached_bytes
             .as_ref()
-            .map_or(false, |(cached_path, _)| cached_path == path);
+            .is_some_and(|(cached_path, _)| cached_path == path);
 
         if cache_hit {
             debug!("PDF bytes cache hit: {}", path.display());

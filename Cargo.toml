@@ -11,7 +11,7 @@ egui = "0.30"
 eframe = "0.30"
 tantivy = "0.22"
 pdfium-render = "0.8"
-pdf-extract = "0.9"
+pdf_oxide = "0.3"
 notify = { version = "7", features = ["macos_kqueue"] }
 notify-debouncer-full = "0.4"
 rusqlite = { version = "0.32", features = ["bundled"] }
