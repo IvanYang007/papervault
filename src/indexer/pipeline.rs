@@ -266,6 +266,33 @@ impl Pipeline {
             .unwrap_or("")
             .to_string();
 
+        // Clean up old entries before inserting new ones.
+        // If the file's content changed, the old content_hash differs from the
+        // new one. Both SQLite (PK=content_hash) and Tantivy (stored by hash)
+        // would accumulate duplicate entries without this cleanup.
+        if let Ok(Some(old_hash)) = self.tag_store.get_hash_by_path(&path_str) {
+            if old_hash != content_hash {
+                // Remove old Tantivy document
+                {
+                    let mut engine =
+                        self.search_engine.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Err(e) = engine.delete_by_hash(&old_hash) {
+                        warn!("Failed to delete old Tantivy doc {}: {}", old_hash, e);
+                    }
+                }
+                // Remove old SQLite row (different PK = different row)
+                if let Err(e) = self
+                    .tag_store
+                    .delete_document_by_path(&path_str)
+                {
+                    warn!(
+                        "Failed to delete old SQLite row for {}: {}",
+                        path_str, e
+                    );
+                }
+            }
+        }
+
         let doc_id = format!("{}{}", content_hash, file_type);
         let modified_ts = mtime as i64;
 

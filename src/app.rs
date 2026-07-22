@@ -284,8 +284,11 @@ impl PapervaultApp {
                                         .iter()
                                         .all(|f| result.tags.iter().any(|t| t == f))
                                 });
+                                // Capture true filtered count before truncation so
+                                // the UI can show "X shown of N matches" correctly.
+                                let filtered = results.items.len();
                                 results.items.truncate(50);
-                                results.total_hits = results.items.len();
+                                results.total_hits = filtered;
                             }
                         } else if !self.active_tag_filters.is_empty() {
                             // Tag store unavailable but filters are active — warn and
