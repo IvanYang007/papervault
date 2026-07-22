@@ -1,6 +1,5 @@
 use std::path::{Path, PathBuf};
 use tantivy::collector::{Count, MultiCollector, TopDocs};
-use tantivy::directory::MmapDirectory;
 use tantivy::query::{BooleanQuery, Occur, Query, TermQuery};
 use tantivy::schema::*;
 use tantivy::tokenizer::*;
@@ -35,21 +34,22 @@ impl SearchEngine {
             std::fs::create_dir_all(&index_dir)?;
         }
 
-        let dir = MmapDirectory::open(&index_dir)?;
-
         let schema = build_schema();
         let fields = SchemaFields::from_schema(&schema);
 
         let index = if index_dir.join("meta.json").exists() {
-            match Index::open(dir) {
+            match Index::open_in_dir(&index_dir) {
                 Ok(index) => index,
                 Err(e) => {
                     // Index is corrupted — remove it and recreate.
+                    // On Windows, MmapDirectory must be fully dropped before
+                    // remove_dir_all can succeed (file handle release).
                     tracing::warn!(
                         "Failed to open existing index (likely corrupted): {}. Recreating.",
                         e
                     );
-                    std::fs::remove_dir_all(&index_dir)?;
+                    std::fs::remove_dir_all(&index_dir)
+                        .unwrap_or_else(|e| tracing::error!("Failed to remove corrupted index: {}", e));
                     std::fs::create_dir_all(&index_dir)?;
                     Index::create_in_dir(&index_dir, schema.clone())?
                 }
