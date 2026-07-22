@@ -1,52 +1,59 @@
-# Technical Handoff — Papervault v1.1
+# Technical Handoff — Papervault v2.0
 
-**Date:** 2026-07-21  
-**Branch:** `feat/pdf-search-viewer`  
-**Status:** ✅ v1.1 complete — 48 tests, clippy clean, debug + release builds (14.3 MB / 11.8 MB)
+**Date:** 2026-07-22  
+**Branch:** `feat/pdf-oxide-extraction`  
+**Status:** ✅ v2.0 complete — 52 tests, clippy clean, debug + release builds
 
 ---
 
 ## What's Built
 
-Windows 11 desktop PDF/text search & viewer. Rust + egui 0.30 + Tantivy 0.22 + pdfium-render 0.8.37 + pdf-extract 0.9 + SQLite.
+Windows 11 desktop PDF/text search & viewer. Rust + egui 0.30 + Tantivy 0.22 + pdfium-render 0.8.37 + pdf_oxide 0.3 + SQLite + rayon.
 
 | Feature | Status |
 |---------|--------|
 | Full-text search with highlighted snippets | ✅ |
 | Recursive subfolder indexing (walkdir) | ✅ |
-| File browser panel (all indexed docs from SQLite) | ✅ |
-| PDF preview with page navigation + zoom | ✅ |
+| Parallel extraction via rayon (8→32 batch size) | ✅ |
+| File browser panel with refresh cooldown | ✅ |
+| PDF preview — two-pass rendering (low-res→full-res) | ✅ |
+| PDF preview — LRU page cache (8 pages, true LRU) | ✅ |
+| PDF preview — display-resolution rendering | ✅ |
+| PDF preview — page prefetch (N+1 during idle) | ✅ |
+| PDF preview — render at display resolution | ✅ |
 | Text file preview with 2MB cap | ✅ |
 | Tag management (create, assign, filter) | ✅ |
+| Tag post-filtering with 200-result window | ✅ |
 | FolderRuntime lifecycle (start/stop/switch) | ✅ |
 | Per-folder index via blake3 hash | ✅ |
 | Lock-free search (SchemaFields pre-cloned) | ✅ |
 | Graceful shutdown (thread joins in order) | ✅ |
-| Atomic config save (tmp → rename) | ✅ |
-| Conditional windows_subsystem (debug=console, release=GUI) | ✅ |
-| Release profile (lto, strip, panic=abort) | ✅ |
+| SQLite connection caching (Arc&lt;Mutex&lt;Connection&gt;&gt;) | ✅ |
+| Streaming/blake3 content hashing (text-based, not file bytes) | ✅ |
+| Batch reconcile with HashSet preload | ✅ |
+| Duplicate document cleanup on file modification | ✅ |
 
 ---
 
 ## Architecture
 
 ```
-4 Threads:
+4 Threads + Rayon pool (for initial scan):
   UI         — egui rendering, lock-free Tantivy search, file browser, preview
-  Indexer    — pdf-extract/TextExtractor → blake3 → Tantivy + SQLite write
+  Indexer    — pdf_oxide/TextExtractor → blake3 → Tantivy + SQLite write
   Renderer   — pdfium page → RGBA bitmap → channel → UI TextureHandle
   Watcher    — notify-debouncer-full → recursive folder watching
 
 5 Channels:
-  watcher_tx ──bounded(10k)──▶ watcher_rx → Pipeline
-  tag_tx     ──unbounded────▶ tag_rx    → Pipeline
+  watcher_tx ──bounded(256)──▶ watcher_rx → Pipeline
+  tag_tx     ──unbounded────▶ tag_rx    → Pipeline (no-op handler, kept for future)
   render_tx  ──unbounded────▶ render_rx → PdfRenderer (coalescing: latest-wins)
   result_tx  ──unbounded────▶ UI        → TextureHandle
   progress_tx──unbounded────▶ UI        → status bar
 
 Layout:
   Left panel:    📂 File browser (all indexed docs from SQLite)
-                 🏷 Tag panel (conditional)
+                 🏷 Tag panel (pre-computed cache, updated on tag change)
   Center top:    🔍 Search bar
   Center below:  Search results (when typing) OR file preview
   Bottom:        Status bar
@@ -54,36 +61,38 @@ Layout:
 
 ---
 
-## Key Technical Decisions
+## Key Technical Decisions (v2.0)
 
 | Decision | Rationale |
 |----------|-----------|
-| `pdf-extract` for indexer, pdfium for renderer only | Eliminates FPDF_InitLibrary deadlock. Pure-Rust extraction, pdfium only for rendering — one thread, no contention |
-| `FolderRuntime` owns thread lifecycle | Clean start/stop/switch with `stop()` joining in order: watcher→indexer→renderer |
-| `SchemaFields` pre-cloned for UI | Removes Mutex from hot search path. Reader cloned at startup |
-| Per-folder index via blake3 of canonical path | Isolates indexes, supports switching folders without cross-contamination |
-| Batch tag query (`get_tags_for_hashes`) | Single SQL query for all result tags, eliminates N+1 |
-| `active_tag_filters: HashSet<String>` | O(1) tag check instead of O(n) Vec |
-| Tags loaded once at startup | No per-frame `list_tags()` SQLite query |
-| `MAX_MESSAGES_PER_FRAME = 64` | Bounded channel processing prevents UI starvation |
-| Render request coalescing | `try_recv()` drain loop keeps only latest request |
-| `current_exe()`-relative DLL path | Works regardless of CWD |
-| Reconcile on indexer thread | UI starts instantly, reconciliation runs in background |
-| Eager pdfium init on renderer thread | First PDF click is instant (no lazy-init delay) |
-| Zoom debounce (per-frame) | 10 rapid zoom clicks → 1 render request |
+| `pdf_oxide` for indexer (replaces pdf-extract) | ~5x faster extraction (0.8ms vs 4.08ms), 100% pass rate on 3,830 PDFs |
+| `rayon` parallel extraction for initial scan | 32-file batches extracted in parallel, then indexed sequentially |
+| `Arc<Mutex<Connection>>` in TagStore | Single persistent connection, ~100x faster than per-operation connect() |
+| Content hash from extracted text | Eliminates double file I/O (no separate hashing pass) |
+| Initial scan on pipeline thread | Watcher never blocks on bounded channel — always responds to shutdown |
+| Two-pass rendering (low-res → full-res) | ~10ms low-res preview appears, replaced by full-res within ~100ms |
+| 8-entry LRU page cache | Back-navigation is instant (0ms from cache), true LRU ordering |
+| Display-resolution rendering | Renders at preview panel pixel size, not fixed 2000px max |
+| Page prefetch (N+1 during idle) | Forward navigation feels instant after current page renders |
+| Tag post-filter with 200-result window | Prevents false-empty results when tag matches fall outside top-50 |
+| HashSet-based reconcile preload | Single SQL query loads all hashes → O(1) in-memory lookups |
+| File browser refresh cooldown (30 frames) | Rate-limits `list_all_documents()` during active indexing |
+| Pre-lowercased match terms in do_search | Eliminates per-frame String allocations in snippet highlighting |
 
 ---
 
-## PDF Rendering Saga — Resolved
+## Performance Benchmarks (700-file collection)
 
-The original design had both indexer and renderer creating separate `Pdfium` instances. `FPDF_InitLibrary()` is not reentrant — two threads calling it simultaneously deadlocked.
-
-| Attempt | What | Outcome |
-|---------|------|---------|
-| 1 | `thread_safe` feature on pdfium-render | ❌ Still deadlocks — protects FFI calls, not init |
-| 2 | Global `pdfium_lock::INIT` Mutex | ❌ Indexer holds lock for 17s during batch extraction |
-| 3 | Lock scope shrink + pre-init + `mem::forget` | ❌ `FPDF_DestroyLibrary` tears down global state |
-| 4 | **Switch indexer to `pdf-extract` (pure Rust)** | ✅ One pdfium user, no contention |
+| Metric | Value |
+|--------|-------|
+| Initial scan (small PDFs) | ~1.5s |
+| Initial scan (large PDFs) | ~20s |
+| Search (any collection size) | <10ms |
+| PDF page flip (cache hit) | 0ms |
+| PDF page flip (cache miss) | ~10ms low-res, ~80ms full-res |
+| Release build time | ~110s |
+| Release binary size | ~19 MB |
+| Memory (10K doc vault) | ~300-500MB |
 
 ---
 
@@ -110,12 +119,12 @@ The original design had both indexer and renderer creating separate `Pdfium` ins
 ```powershell
 git clone https://github.com/IvanYang007/papervault.git
 cd papervault
-git checkout feat/pdf-search-viewer
+git checkout feat/pdf-oxide-extraction
 cargo build --release
-# Binary: target/release/papervault.exe (~14 MB)
+# Binary: target/release/papervault.exe (~19 MB)
 
-# pdfium.dll is already included in the repo at target/release/
-# If missing, download Chromium 7543 from:
+# Place pdfium.dll next to papervault.exe
+# Download Chromium 7543 from:
 # https://github.com/bblanchon/pdfium-binaries/releases/tag/chromium/7543
 
 # Run:
@@ -124,27 +133,25 @@ cargo build --release
 
 ---
 
-## Key Git Commits (Recent)
+## Key Git Commits
 
 ```
-fd84001 fix: remove panic=abort from release profile
-04a01a5 chore: update README, pdfium.dll to release, clean up
-b6eeaf0 perf: faster startup, eager pdfium init, PDF zoom
-197e533 fix: add unique id_salt to all ScrollArea widgets
-ac6ad1f chore: fix clippy warnings
-292ee36 fix: switch indexer to pure-Rust pdf-extract, remove pdfium_lock
-866d278 docs: update technical handoff with PDF rendering saga
-6cdcbe8 fix: keep pre-init Pdfium alive with mem::forget
-be40850 fix: pre-init pdfium on main thread before spawning worker threads
-1b09924 fix: shrink lock scope, add render coalescing
-7eca893 fix: serialize FPDF_InitLibrary() across threads with global Mutex
-f22d42f fix: enable thread_safe feature for pdfium-render
-dc77133 fix: PDF rendering now works (debug session confirmed)
-cb9264f fix: handle Mutex poisoning, replace fragile unwrap with expect
-4ee4ee7 fix: file browser preview, PDF page nav, search result font size
-c777cbf fix: clear old channel clones before stopping runtime
-353e7fb feat(runtime): add FolderRuntime with per-folder indexes
-097aaab fix: correctness fixes — unicode safety, render identity, progress, tags
+bb900f9 fix(review): 3 P1 bugs from final review cycle
+97bb803 test: add 3 tests for parallel extraction
+466dd9f perf: increase parallel batch size 8→32
+3b0fd3b fix(review): P1 prefetch cancels full-res render + progress reset
+862fb52 feat: parallel extraction for initial file scan via rayon
+7c476e6 perf(review): eliminate per-frame String allocations in hot paths
+553566b fix(review): rust-code-review findings
+4e74f71 perf: 2x faster compile with thin LTO
+c0a657a fix: freeze on window close
+8e83efd perf: aggressive compile-speed tuning
+af92540 simplify: address ce-simplify-code review findings
+efcd109 perf: file browser refresh cooldown
+6429326 perf: fix P0/P1 performance issues
+ef68dc8 fix: address rust-code-review P2 findings
+032c983 feat: replace pdf-extract with pdf_oxide
+867a0fa fix: search engine init failure on Windows
 ```
 
 ---
@@ -153,8 +160,7 @@ c777cbf fix: clear old channel clones before stopping runtime
 
 | Priority | Item |
 |----------|------|
-| P1 | SQLite connection caching (per-operation `connect()` is wasteful) |
-| P1 | Integration tests (pipeline end-to-end, concurrent search+index) |
+| P1 | File browser virtualization (egui limitation, 10K+ docs) |
 | P2 | OCR for scanned PDFs |
 | P2 | Keyboard shortcuts |
 | P2 | Release packaging / installer |
