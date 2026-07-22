@@ -34,8 +34,11 @@ printpdf = "0.7"
 lopdf = "0.34"
 
 [profile.release]
-lto = "thin"
-codegen-units = 4
+# Aggressive compile-speed tuning — binary size is not a concern.
+lto = false         # no link-time optimization (biggest compile-time win)
+codegen-units = 16  # max parallel LLVM codegen
+debug = false       # skip debug info generation
+debug-assertions = false
 strip = true
 
 [profile.dev]
