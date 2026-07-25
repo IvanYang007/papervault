@@ -24,7 +24,7 @@ pub fn build_schema() -> Schema {
     // content_hash: STRING = raw text, Stored + Indexed for delete_term
     schema_builder.add_text_field("content_hash", STRING | STORED);
     // tags: multi-valued for tag filtering
-    schema_builder.add_text_field("tags", STRING | STORED);
+    schema_builder.add_text_field("tags", TEXT | STORED);
 
     schema_builder.build()
 }

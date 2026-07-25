@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 use tantivy::collector::{Count, MultiCollector, TopDocs};
-use tantivy::query::{BooleanQuery, Occur, Query, TermQuery};
+use tantivy::query::{BooleanQuery, FuzzyTermQuery, Occur, Query, TermQuery};
 use tantivy::schema::*;
 use tantivy::tokenizer::*;
 use tantivy::{
@@ -64,6 +64,11 @@ impl SearchEngine {
             .filter(LowerCaser)
             .build();
         index.tokenizers().register("body", tokenizer);
+
+        let tag_tokenizer = TextAnalyzer::builder(SimpleTokenizer::default())
+            .filter(LowerCaser)
+            .build();
+        index.tokenizers().register("tags", tag_tokenizer);
 
         let writer = index.writer(50_000_000)?; // 50MB buffer
 
@@ -239,6 +244,11 @@ pub fn search_with_reader(
             Occur::Should,
             Box::new(TermQuery::new(file_term, IndexRecordOption::Basic)),
         ));
+        let tag_term = Term::from_field_text(fields.tags, &lower);
+        term_subqueries.push((
+            Occur::Should,
+            Box::new(TermQuery::new(tag_term, IndexRecordOption::Basic)),
+        ));
         // Wrap in a BooleanQuery — at least one Should clause must match
         subqueries.push((Occur::Must, Box::new(BooleanQuery::new(term_subqueries))));
     }
@@ -263,8 +273,43 @@ pub fn search_with_reader(
     let top_docs_handle = multi.add_collector(TopDocs::with_limit(request.limit));
 
     let mut multi_fruit = searcher.search(&query, &multi)?;
-    let total_hits = count_handle.extract(&mut multi_fruit);
-    let top_docs = top_docs_handle.extract(&mut multi_fruit);
+    let mut total_hits = count_handle.extract(&mut multi_fruit);
+    let mut top_docs = top_docs_handle.extract(&mut multi_fruit);
+
+    // Fuzzy retry: if exact search returns 0 results and fuzzy is enabled,
+    // re-run with FuzzyTermQuery (Levenshtein distance 1) on body + tags.
+    if total_hits == 0 && request.fuzzy {
+        let mut fuzzy_subqueries: Vec<(Occur, Box<dyn Query>)> = Vec::new();
+        for term in &terms {
+            let lower = term.to_lowercase();
+            let mut term_fuzzy: Vec<(Occur, Box<dyn Query>)> = Vec::new();
+            let body_fuzzy = FuzzyTermQuery::new(
+                Term::from_field_text(fields.body, &lower),
+                1,
+                true,
+            );
+            term_fuzzy.push((Occur::Should, Box::new(body_fuzzy)));
+            let tag_fuzzy = FuzzyTermQuery::new(
+                Term::from_field_text(fields.tags, &lower),
+                1,
+                true,
+            );
+            term_fuzzy.push((Occur::Should, Box::new(tag_fuzzy)));
+            fuzzy_subqueries.push((Occur::Must, Box::new(BooleanQuery::new(term_fuzzy))));
+        }
+        let fuzzy_query: Box<dyn Query> = if fuzzy_subqueries.len() == 1 {
+            fuzzy_subqueries.remove(0).1
+        } else {
+            Box::new(BooleanQuery::new(fuzzy_subqueries))
+        };
+
+        let mut multi2 = MultiCollector::new();
+        let count2 = multi2.add_collector(Count);
+        let top2 = multi2.add_collector(TopDocs::with_limit(request.limit));
+        let mut fruit2 = searcher.search(&fuzzy_query, &multi2)?;
+        total_hits = count2.extract(&mut fruit2);
+        top_docs = top2.extract(&mut fruit2);
+    }
 
     // Build snippet generator for context-aware, match-centered snippets
     let snippet_gen = SnippetGenerator::create(&searcher, query.as_ref(), fields.body)?;
@@ -361,6 +406,11 @@ mod tests {
             .filter(tantivy::tokenizer::LowerCaser)
             .build();
         index.tokenizers().register("body", tokenizer);
+
+        let tag_tokenizer = TextAnalyzer::builder(SimpleTokenizer::default())
+            .filter(LowerCaser)
+            .build();
+        index.tokenizers().register("tags", tag_tokenizer);
 
         let writer = index.writer(50_000_000).unwrap();
         let reader = index
