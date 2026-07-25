@@ -101,6 +101,7 @@ pub struct PapervaultApp {
     show_auto_tag_opt_in: bool,
     accepted_auto_tags: std::collections::HashMap<String, std::collections::HashSet<String>>,
     pending_retag: bool,
+    pending_reindex: bool,
     search_query: String,
     search_results: Vec<SearchResult>,
     total_hits: usize,
@@ -241,6 +242,7 @@ impl PapervaultApp {
             show_auto_tag_opt_in: false,
             accepted_auto_tags: std::collections::HashMap::new(),
             pending_retag: false,
+            pending_reindex: false,
             last_search_instant: None,
             pending_search: None,
             focus_search_next_frame: true,
@@ -777,6 +779,37 @@ impl eframe::App for PapervaultApp {
             self.retag_selected();
         }
 
+        // Process deferred reindex — queue ALL docs for auto-tagging
+        if self.pending_reindex {
+            self.pending_reindex = false;
+            if let Some(ref store) = self.tag_store {
+                if let Some(ref tx) = self.auto_tagger_tx {
+                    if let Ok(docs) = store.list_all_documents() {
+                        self.auto_tag_progress = Some((0, docs.len()));
+                        for doc in docs {
+                            let file_name = std::path::Path::new(&doc.file_path)
+                                .file_name()
+                                .and_then(|n| n.to_str())
+                                .unwrap_or("")
+                                .to_string();
+                            let content_hash_before_tag = {
+                                let mut hasher = blake3::Hasher::new();
+                                hasher.update(file_name.as_bytes());
+                                hasher.update(b"reindex");
+                                hasher.finalize().to_hex().to_string()
+                            };
+                            let _ = tx.send(AutoTagRequest::TagDocument {
+                                content_hash: doc.content_hash.clone(),
+                                filename: file_name,
+                                text: "[Document text could not be extracted. Use filename to determine topic.]".to_string(),
+                                content_hash_before_tag,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
         // Check if a background folder switch has completed
         let pending = self.pending_runtime.clone();
         if let Some(pending) = pending {
@@ -849,22 +882,7 @@ impl eframe::App for PapervaultApp {
                         };
                         ui.label(RichText::new(status_text).size(10.0).color(status_color));
                         if ui.small_button("🔄 Re-index for tags").clicked() {
-                            if let Some(ref folder) = self.config.watched_folder {
-                                // Stop old runtime first
-                                if let Some(old_rt) = self.folder_runtime.take() {
-                                    self.render_request_tx = None;
-                                    self.search_reader = None;
-                                    self.search_fields = None;
-                                    self.search_engine = None;
-                                    self.auto_tagger_tx = None;
-                                    if let Err(e) = old_rt.stop() {
-                                        tracing::warn!("Error stopping old runtime: {}", e);
-                                    }
-                                    std::thread::sleep(std::time::Duration::from_secs(3));
-                                }
-                                let folder = folder.clone();
-                                self.start_folder_runtime(&folder);
-                            }
+                            self.pending_reindex = true;
                         }
 
                         // Progress bar
