@@ -107,7 +107,11 @@ fn tag_document(
     config: &crate::auto_tagger::config::AutoTagConfig,
 ) {
     // Tier 1: exact BLAKE3 hash match
-    if !config.enabled { return; }
+    if !config.enabled {
+        debug!("auto-tagger disabled, skipping {filename}");
+        return;
+    }
+    info!("Auto-tagging: {filename}");
     if let Ok(Some(status)) = tag_store.auto_tag_status(content_hash) {
         if status.content_hash_before_tag == content_hash_before_tag && status.status == "tagged" {
             debug!("cache hit (tier 1) for {filename}: exact hash match");
