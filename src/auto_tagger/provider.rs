@@ -87,7 +87,7 @@ pub trait TagProvider: Send + Sync {
     fn health_check(&self) -> Result<(), TagError>;
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-util"))]
 mod tests {
     use super::*;
 

@@ -43,13 +43,14 @@ Filename: "2023-tax-return-yang-guorui.pdf"
 Text: "Form 1040. Yang Guorui. Tax year 2023. Adjusted gross income $45,230..."
 Output: {"tags": ["tax-return", "tax", "irs", "form-1040"], "entities": {"persons": ["Yang Guorui", "guorui yang"], "organizations": ["IRS"], "years": ["2023"], "doc_id": ["1040"], "amounts": ["$45,230"]}}
 
-Filename: {filename}
-Text: {text}
-Existing tags: {existing_tags}
+Filename: {{FILENAME}}
+Text: {{TEXT}}
+Existing tags: {{EXISTING_TAGS}}
 Output:"#;
 
 /// Provider that calls the DeepSeek API for tag generation.
 pub struct DeepSeekProvider {
+    agent: ureq::Agent,
     endpoint: String,
     model: String,
     api_key_env: String,
@@ -67,6 +68,10 @@ impl DeepSeekProvider {
         timeout_secs: u64,
     ) -> Self {
         Self {
+            agent: ureq::AgentBuilder::new()
+                .timeout_connect(Duration::from_secs(10))
+                .timeout_read(Duration::from_secs(timeout_secs))
+                .build(),
             endpoint: endpoint.into(),
             model: model.into(),
             api_key_env: api_key_env.into(),
@@ -112,9 +117,9 @@ impl DeepSeekProvider {
         };
 
         PROMPT_TEMPLATE
-            .replace("{filename}", filename)
-            .replace("{text}", truncated)
-            .replace("{existing_tags}", &existing)
+            .replace("{{FILENAME}}", filename)
+            .replace("{{EXISTING_TAGS}}", &existing)
+            .replace("{{TEXT}}", truncated)
     }
 
     /// Parse the DeepSeek API response JSON into a TagResponse.
@@ -173,26 +178,30 @@ impl TagProvider for DeepSeekProvider {
             TagError::BadRequest(format!("failed to serialize request body: {}", e))
         })?;
 
-        let response = ureq::post(&self.endpoint)
+        let response = self
+            .agent
+            .post(&self.endpoint)
             .set("Authorization", &format!("Bearer {}", api_key))
             .set("Content-Type", "application/json")
             .timeout(self.timeout)
             .send_string(&body_str)
             .map_err(|e| {
-                let err_str = e.to_string();
-                if err_str.contains("401") || err_str.contains("403") {
-                    TagError::Auth(format!("DeepSeek API auth failed: {}", err_str))
-                } else if err_str.contains("429") {
-                    TagError::Unavailable(format!("DeepSeek API rate limited: {}", err_str))
-                } else if err_str.contains("400") {
-                    TagError::BadRequest(format!("DeepSeek API bad request: {}", err_str))
-                } else if err_str.contains("DnsFailed")
-                    || err_str.contains("ConnectionFailed")
-                    || err_str.contains("timed out")
-                {
-                    TagError::Unavailable(format!("DeepSeek API unreachable: {}", err_str))
-                } else {
-                    TagError::Unavailable(format!("DeepSeek API request failed: {}", err_str))
+                match &e {
+                    ureq::Error::Status(401 | 403, _) => {
+                        TagError::Auth(format!("DeepSeek API auth failed: {}", e))
+                    }
+                    ureq::Error::Status(429, _) => {
+                        TagError::Unavailable(format!("DeepSeek API rate limited: {}", e))
+                    }
+                    ureq::Error::Status(code, _) if *code >= 400 && *code < 500 => {
+                        TagError::BadRequest(format!("DeepSeek API bad request ({}): {}", code, e))
+                    }
+                    ureq::Error::Status(_, _) => {
+                        TagError::Unavailable(format!("DeepSeek API server error: {}", e))
+                    }
+                    ureq::Error::Transport(_) => {
+                        TagError::Unavailable(format!("DeepSeek API unreachable: {}", e))
+                    }
                 }
             })?;
 
