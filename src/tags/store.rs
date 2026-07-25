@@ -2,7 +2,7 @@ use rusqlite::{params, Connection, Result as SqlResult};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use super::model::Tag;
+use super::model::{AutoTagStatus, Tag};
 
 /// Manages tag storage via a single persistent SQLite connection (WAL mode).
 /// Cloneable via Arc — all clones share the same connection.
@@ -53,7 +53,32 @@ impl TagStore {
                 tag_id      INTEGER NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
                 PRIMARY KEY (content_hash, tag_id)
             );
-            CREATE INDEX IF NOT EXISTS idx_documents_file_path ON documents(file_path);",
+            CREATE INDEX IF NOT EXISTS idx_documents_file_path ON documents(file_path);
+
+            -- Per-document auto-tagging state
+            CREATE TABLE IF NOT EXISTS auto_tag_status (
+                content_hash TEXT PRIMARY KEY REFERENCES documents(content_hash) ON DELETE CASCADE,
+                filename     TEXT NOT NULL,
+                content_hash_before_tag TEXT NOT NULL,
+                status       TEXT NOT NULL DEFAULT 'pending',
+                tags_json    TEXT,
+                attempts     INTEGER NOT NULL DEFAULT 0,
+                last_error   TEXT,
+                created_at   TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at   TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+
+            -- Filename-token cache for tier-2 tag lookups
+            CREATE TABLE IF NOT EXISTS auto_tag_cache (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                filename_tokens TEXT NOT NULL,
+                tags_json       TEXT NOT NULL,
+                source_hash     TEXT NOT NULL,
+                hit_count       INTEGER NOT NULL DEFAULT 1,
+                created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_auto_tag_cache_tokens ON auto_tag_cache(filename_tokens);",
         )?;
 
         Ok(Self {
@@ -315,6 +340,194 @@ pub struct DocumentInfo {
     pub file_type: String,
 }
 
+// ── Auto-Tag Status ──
+
+impl TagStore {
+    /// Insert or update auto-tagging status for a document.
+    pub fn upsert_auto_tag_status(
+        &self,
+        content_hash: &str,
+        filename: &str,
+        content_hash_before_tag: &str,
+        status: &str,
+        tags_json: Option<&str>,
+        last_error: Option<&str>,
+    ) -> SqlResult<()> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "INSERT OR REPLACE INTO auto_tag_status
+                 (content_hash, filename, content_hash_before_tag, status, tags_json, last_error, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, datetime('now'))",
+                params![
+                    content_hash,
+                    filename,
+                    content_hash_before_tag,
+                    status,
+                    tags_json,
+                    last_error
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Get auto-tagging status for a document.
+    pub fn auto_tag_status(&self, content_hash: &str) -> SqlResult<Option<AutoTagStatus>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT content_hash, filename, content_hash_before_tag, status,
+                        tags_json, attempts, last_error, created_at, updated_at
+                 FROM auto_tag_status WHERE content_hash = ?1",
+            )?;
+            let mut rows = stmt.query_map(params![content_hash], |row| {
+                Ok(AutoTagStatus {
+                    content_hash: row.get(0)?,
+                    filename: row.get(1)?,
+                    content_hash_before_tag: row.get(2)?,
+                    status: row.get(3)?,
+                    tags_json: row.get(4)?,
+                    attempts: row.get(5)?,
+                    last_error: row.get(6)?,
+                    created_at: row.get(7)?,
+                    updated_at: row.get(8)?,
+                })
+            })?;
+            match rows.next() {
+                Some(Ok(status)) => Ok(Some(status)),
+                Some(Err(e)) => Err(e),
+                None => Ok(None),
+            }
+        })
+    }
+
+    /// Get documents that need auto-tagging (status = 'pending'), ordered by creation time.
+    pub fn pending_auto_tags(&self, limit: usize) -> SqlResult<Vec<AutoTagStatus>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT content_hash, filename, content_hash_before_tag, status,
+                        tags_json, attempts, last_error, created_at, updated_at
+                 FROM auto_tag_status
+                 WHERE status = 'pending'
+                 ORDER BY created_at ASC
+                 LIMIT ?1",
+            )?;
+            let rows = stmt
+                .query_map(params![limit as i64], |row| {
+                    Ok(AutoTagStatus {
+                        content_hash: row.get(0)?,
+                        filename: row.get(1)?,
+                        content_hash_before_tag: row.get(2)?,
+                        status: row.get(3)?,
+                        tags_json: row.get(4)?,
+                        attempts: row.get(5)?,
+                        last_error: row.get(6)?,
+                        created_at: row.get(7)?,
+                        updated_at: row.get(8)?,
+                    })
+                })?
+                .filter_map(|r| r.ok())
+                .collect();
+            Ok(rows)
+        })
+    }
+
+    /// Remove a specific tag from the auto-tag JSON for a document.
+    pub fn dismiss_auto_tag(&self, content_hash: &str, tag_name: &str) -> SqlResult<()> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT tags_json FROM auto_tag_status WHERE content_hash = ?1",
+            )?;
+            let json: Option<String> =
+                stmt.query_row(params![content_hash], |row| row.get(0))
+                    .ok();
+
+            if let Some(json_str) = json {
+                if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&json_str) {
+                    if let Some(tags) = value.get_mut("tags") {
+                        if let Some(arr) = tags.as_array_mut() {
+                            arr.retain(|t| t.as_str() != Some(tag_name));
+                        }
+                    }
+                    let updated = serde_json::to_string(&value).unwrap_or(json_str);
+                    conn.execute(
+                        "UPDATE auto_tag_status SET tags_json = ?1, updated_at = datetime('now') WHERE content_hash = ?2",
+                        params![updated, content_hash],
+                    )?;
+                }
+            }
+            Ok(())
+        })
+    }
+
+    // ── Auto-Tag Cache ──
+
+    /// Look up cached tags by filename token overlap.
+    /// Returns `tags_json` if a cache entry has >= min_overlap_ratio token overlap.
+    pub fn lookup_cache_by_tokens(
+        &self,
+        tokens: &[String],
+        min_overlap_ratio: f64,
+    ) -> SqlResult<Option<String>> {
+        if tokens.is_empty() {
+            return Ok(None);
+        }
+        self.with_conn(|conn| {
+            let mut stmt =
+                conn.prepare("SELECT filename_tokens, tags_json FROM auto_tag_cache")?;
+            let rows: Vec<(String, String)> = stmt
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .filter_map(|r| r.ok())
+                .collect();
+
+            for (cached_tokens_str, tags_json) in &rows {
+                let cached: std::collections::HashSet<&str> =
+                    cached_tokens_str.split_whitespace().collect();
+                let overlap: usize = tokens
+                    .iter()
+                    .filter(|t| cached.contains(t.as_str()))
+                    .count();
+                let ratio = overlap as f64 / tokens.len() as f64;
+                if ratio >= min_overlap_ratio && overlap > 0 {
+                    return Ok(Some(tags_json.clone()));
+                }
+            }
+            Ok(None)
+        })
+    }
+
+    /// Insert or update a cache entry. Increments hit_count if the same tokens already exist.
+    pub fn upsert_cache_entry(
+        &self,
+        filename_tokens: &str,
+        tags_json: &str,
+        source_hash: &str,
+    ) -> SqlResult<()> {
+        self.with_conn(|conn| {
+            // Check if tokens already exist
+            let existing: Option<(i64, i64)> = conn
+                .query_row(
+                    "SELECT id, hit_count FROM auto_tag_cache WHERE filename_tokens = ?1",
+                    params![filename_tokens],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .ok();
+
+            if let Some((id, hit_count)) = existing {
+                conn.execute(
+                    "UPDATE auto_tag_cache SET tags_json = ?1, hit_count = ?2, updated_at = datetime('now') WHERE id = ?3",
+                    params![tags_json, hit_count + 1, id],
+                )?;
+            } else {
+                conn.execute(
+                    "INSERT INTO auto_tag_cache (filename_tokens, tags_json, source_hash) VALUES (?1, ?2, ?3)",
+                    params![filename_tokens, tags_json, source_hash],
+                )?;
+            }
+            Ok(())
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -346,6 +559,26 @@ mod tests {
                 content_hash TEXT NOT NULL REFERENCES documents(content_hash) ON DELETE CASCADE,
                 tag_id      INTEGER NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
                 PRIMARY KEY (content_hash, tag_id)
+            );
+            CREATE TABLE IF NOT EXISTS auto_tag_status (
+                content_hash TEXT PRIMARY KEY REFERENCES documents(content_hash) ON DELETE CASCADE,
+                filename     TEXT NOT NULL,
+                content_hash_before_tag TEXT NOT NULL,
+                status       TEXT NOT NULL DEFAULT 'pending',
+                tags_json    TEXT,
+                attempts     INTEGER NOT NULL DEFAULT 0,
+                last_error   TEXT,
+                created_at   TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at   TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE TABLE IF NOT EXISTS auto_tag_cache (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                filename_tokens TEXT NOT NULL,
+                tags_json       TEXT NOT NULL,
+                source_hash     TEXT NOT NULL,
+                hit_count       INTEGER NOT NULL DEFAULT 1,
+                created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
             );",
         )
         .unwrap();
@@ -519,5 +752,197 @@ mod tests {
 
         let missing = store.get_tags_for_hashes(&["no_such_hash"]).unwrap();
         assert!(missing.is_empty());
+    }
+
+    // ── Auto-Tag Status Tests ──
+
+    #[test]
+    fn auto_tag_status_round_trips() {
+        let (store, _dir) = setup_test_store();
+        store
+            .upsert_document("hash1", "/test/doc.pdf", "pdf", 0, 0)
+            .unwrap();
+
+        store
+            .upsert_auto_tag_status(
+                "hash1",
+                "doc.pdf",
+                "abc123def",
+                "tagged",
+                Some(r#"{"tags":["tax","irs"]}"#),
+                None,
+            )
+            .unwrap();
+
+        let status = store.auto_tag_status("hash1").unwrap().unwrap();
+        assert_eq!(status.content_hash, "hash1");
+        assert_eq!(status.filename, "doc.pdf");
+        assert_eq!(status.content_hash_before_tag, "abc123def");
+        assert_eq!(status.status, "tagged");
+        assert_eq!(
+            status.tags_json.unwrap(),
+            r#"{"tags":["tax","irs"]}"#
+        );
+    }
+
+    #[test]
+    fn auto_tag_status_nonexistent_returns_none() {
+        let (store, _dir) = setup_test_store();
+        let result = store.auto_tag_status("no-such-hash").unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn pending_auto_tags_returns_only_pending() {
+        let (store, _dir) = setup_test_store();
+        store
+            .upsert_document("h1", "/a.pdf", "pdf", 0, 0)
+            .unwrap();
+        store
+            .upsert_document("h2", "/b.pdf", "pdf", 0, 0)
+            .unwrap();
+        store
+            .upsert_document("h3", "/c.pdf", "pdf", 0, 0)
+            .unwrap();
+
+        store
+            .upsert_auto_tag_status("h1", "a.pdf", "x", "pending", None, None)
+            .unwrap();
+        store
+            .upsert_auto_tag_status("h2", "b.pdf", "y", "tagged", None, None)
+            .unwrap();
+        store
+            .upsert_auto_tag_status("h3", "c.pdf", "z", "failed", None, None)
+            .unwrap();
+
+        let pending = store.pending_auto_tags(10).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].status, "pending");
+    }
+
+    #[test]
+    fn upsert_auto_tag_status_overwrites() {
+        let (store, _dir) = setup_test_store();
+        store
+            .upsert_document("hash1", "/doc.pdf", "pdf", 0, 0)
+            .unwrap();
+
+        store
+            .upsert_auto_tag_status("hash1", "doc.pdf", "x", "pending", None, None)
+            .unwrap();
+        store
+            .upsert_auto_tag_status("hash1", "doc.pdf", "y", "tagged", Some(r#"{"tags":["ok"]}"#), None)
+            .unwrap();
+
+        let status = store.auto_tag_status("hash1").unwrap().unwrap();
+        assert_eq!(status.status, "tagged");
+        assert_eq!(status.content_hash_before_tag, "y");
+    }
+
+    #[test]
+    fn dismiss_auto_tag_removes_tag() {
+        let (store, _dir) = setup_test_store();
+        store
+            .upsert_document("hash1", "/doc.pdf", "pdf", 0, 0)
+            .unwrap();
+        store
+            .upsert_auto_tag_status(
+                "hash1",
+                "doc.pdf",
+                "x",
+                "tagged",
+                Some(r#"{"tags":["tax","irs","2023"]}"#),
+                None,
+            )
+            .unwrap();
+
+        store.dismiss_auto_tag("hash1", "irs").unwrap();
+
+        let status = store.auto_tag_status("hash1").unwrap().unwrap();
+        let json: serde_json::Value =
+            serde_json::from_str(&status.tags_json.unwrap()).unwrap();
+        let tags: Vec<&str> = json["tags"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(tags, vec!["tax", "2023"]);
+    }
+
+    // ── Cache Tests ──
+
+    #[test]
+    fn cache_lookup_full_overlap_returns_tags() {
+        let (store, _dir) = setup_test_store();
+        store
+            .upsert_cache_entry("tax return yang guorui", r#"{"tags":["tax"]}"#, "h1")
+            .unwrap();
+
+        let tokens: Vec<String> = ["tax", "return", "yang", "guorui"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let result = store.lookup_cache_by_tokens(&tokens, 0.5).unwrap();
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn cache_lookup_zero_overlap_returns_none() {
+        let (store, _dir) = setup_test_store();
+        store
+            .upsert_cache_entry("tax return yang guorui", r#"{"tags":["tax"]}"#, "h1")
+            .unwrap();
+
+        let tokens: Vec<String> = ["recipe", "cookbook"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let result = store.lookup_cache_by_tokens(&tokens, 0.5).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn cache_lookup_partial_below_threshold_returns_none() {
+        let (store, _dir) = setup_test_store();
+        store
+            .upsert_cache_entry("tax return yang guorui", r#"{"tags":["tax"]}"#, "h1")
+            .unwrap();
+
+        // Only "tax" overlaps (1 of 5 = 20% < 50%)
+        let tokens: Vec<String> = ["tax", "2023", "form", "1040", "irs"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let result = store.lookup_cache_by_tokens(&tokens, 0.5).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn cache_upsert_increments_hit_count() {
+        let (store, _dir) = setup_test_store();
+        store
+            .upsert_cache_entry("tax return", r#"{"tags":["tax"]}"#, "h1")
+            .unwrap();
+        store
+            .upsert_cache_entry("tax return", r#"{"tags":["tax"]}"#, "h2")
+            .unwrap();
+
+        let result = store.lookup_cache_by_tokens(
+            &["tax".into(), "return".into()],
+            0.5,
+        ).unwrap();
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn cache_lookup_empty_tokens_returns_none() {
+        let (store, _dir) = setup_test_store();
+        store
+            .upsert_cache_entry("tax return", r#"{"tags":["tax"]}"#, "h1")
+            .unwrap();
+
+        let result = store.lookup_cache_by_tokens(&[], 0.5).unwrap();
+        assert!(result.is_none());
     }
 }
