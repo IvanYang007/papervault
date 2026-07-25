@@ -93,6 +93,13 @@ pub struct PapervaultApp {
     /// Owns watcher, indexer, renderer threads and channels for folder lifecycle.
     folder_runtime: Option<FolderRuntime>,
     auto_tagger_tx: Option<Sender<AutoTagRequest>>,
+    cached_auto_tag_hash: Option<String>,
+    cached_auto_tag_value: Option<serde_json::Value>,
+    auto_tag_enabled: bool,
+    auto_tag_progress: Option<(usize, usize)>,
+    auto_tag_error: Option<String>,
+    show_auto_tag_opt_in: bool,
+    accepted_auto_tags: std::collections::HashMap<String, std::collections::HashSet<String>>,
     search_query: String,
     search_results: Vec<SearchResult>,
     total_hits: usize,
@@ -225,6 +232,13 @@ impl PapervaultApp {
             preview_panel_size: (800, 600),
             watcher_shutdown_flag,
             watcher_shutdown_tx,
+            cached_auto_tag_hash: None,
+            cached_auto_tag_value: None,
+            auto_tag_enabled: false,
+            auto_tag_progress: None,
+            auto_tag_error: None,
+            show_auto_tag_opt_in: false,
+            accepted_auto_tags: std::collections::HashMap::new(),
             last_search_instant: None,
             pending_search: None,
             focus_search_next_frame: true,
@@ -775,6 +789,35 @@ impl eframe::App for PapervaultApp {
                     ui.heading("Tags");
                     ui.separator();
 
+                    // Auto-tag status indicator
+                    if self.auto_tag_enabled {
+                        let (status_text, status_color) = if self.auto_tag_error.is_some() {
+                            ("☁ Auto-tag: error", Color32::RED)
+                        } else if self.auto_tag_progress.is_some() {
+                            ("☁ Auto-tag: running...", Color32::from_rgb(100, 180, 255))
+                        } else {
+                            ("☁ Auto-tag: ready", Color32::from_rgb(100, 200, 100))
+                        };
+                        ui.label(RichText::new(status_text).size(10.0).color(status_color));
+
+                        // Progress bar
+                        if let Some((completed, total)) = self.auto_tag_progress {
+                            let pct = completed as f32 / total.max(1) as f32;
+                            ui.add(egui::ProgressBar::new(pct).text(format!("{completed}/{total}")));
+                            if completed >= total {
+                                self.auto_tag_progress = None;
+                            }
+                        }
+
+                        if let Some(ref err) = self.auto_tag_error {
+                            ui.label(RichText::new(err).size(10.0).color(Color32::RED));
+                            if ui.small_button("Dismiss").clicked() {
+                                self.auto_tag_error = None;
+                            }
+                        }
+                        ui.separator();
+                    }
+
                     // Create new tag
                     ui.horizontal(|ui| {
                         ui.add_sized(
@@ -820,20 +863,46 @@ impl eframe::App for PapervaultApp {
                                                     ui.separator();
                                                     ui.label(RichText::new("✨ Auto-tags").size(11.0).color(Color32::GRAY));
                                                     let mut to_dismiss: Option<String> = None;
+                                                    let mut to_toggle: Option<String> = None;
+                                                    let accepted = self.accepted_auto_tags
+                                                        .entry(hash.clone())
+                                                        .or_default();
                                                     for tag_value in tags {
                                                         if let Some(tag_name) = tag_value.as_str() {
-                                                            ui.horizontal(|ui| {
-                                                                ui.label("✨");
-                                                                if ui.selectable_label(false, tag_name).clicked() {
-                                                                    // Accept: toggle to solid (click to accept)
-                                                                }
-                                                                if ui.small_button("✕").clicked() {
-                                                                    to_dismiss = Some(tag_name.to_string());
-                                                                }
+                                                            let is_accepted = accepted.contains(tag_name);
+                                                            let frame = if is_accepted {
+                                                                egui::Frame::default()
+                                                                    .fill(Color32::from_rgb(40, 80, 40))
+                                                                    .rounding(egui::Rounding::same(4.0))
+                                                            } else {
+                                                                egui::Frame::default()
+                                                                    .stroke(egui::Stroke::new(1.0, Color32::from_rgb(100, 100, 100)))
+                                                                    .rounding(egui::Rounding::same(4.0))
+                                                            };
+                                                            frame.show(ui, |ui| {
+                                                                ui.horizontal(|ui| {
+                                                                    ui.label("✨");
+                                                                    if ui.selectable_label(is_accepted, tag_name)
+                                                                        .on_hover_text(format!("AI tag for \"{}\"", auto_status.filename))
+                                                                        .clicked() {
+                                                                        to_toggle = Some(tag_name.to_string());
+                                                                    }
+                                                                    if ui.small_button("✕").clicked() {
+                                                                        to_dismiss = Some(tag_name.to_string());
+                                                                    }
+                                                                });
                                                             });
                                                         }
                                                     }
+                                                    if let Some(tag) = to_toggle {
+                                                        if accepted.contains(&tag) {
+                                                            accepted.remove(&tag);
+                                                        } else {
+                                                            accepted.insert(tag);
+                                                        }
+                                                    }
                                                     if let Some(tag) = to_dismiss {
+                                                        accepted.remove(&tag);
                                                         if let Some(ref store) = self.tag_store {
                                                             let _ = store.dismiss_auto_tag(hash, &tag);
                                                         }
@@ -1187,6 +1256,16 @@ impl eframe::App for PapervaultApp {
                             }
                         }
                     });
+                    ui.add_space(4.0);
+                    ui.checkbox(&mut self.auto_tag_enabled, "Enable AI auto-tagging (DeepSeek)");
+                    if self.auto_tag_enabled {
+                        ui.label(
+                            RichText::new("⚠ Document text is sent to DeepSeek (servers in China). Text is not stored. Requires DEEPSEEK_API_KEY env var.")
+                                .size(11.0)
+                                .color(Color32::from_rgb(180, 140, 60)),
+                        );
+                    }
+                    ui.add_space(4.0);
                     if ui.button("Set Folder").clicked() {
                         let path = PathBuf::from(&self.folder_picker_input);
                         if path.exists() && path.is_dir() {
