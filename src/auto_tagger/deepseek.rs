@@ -5,10 +5,9 @@ use serde_json::Value;
 use super::provider::{TagError, TagProvider, TagResponse};
 
 /// Prompt template for the DeepSeek API — kept minimal to force JSON compliance.
-const PROMPT_TEMPLATE: &str = r#"Output ONLY this JSON structure. No markdown, no explanation.
-
-Tags: lowercase, hyphen-separated, 1-3 words. Entities: only what is clearly present.
-
+/// Prompt template — minimal to force JSON compliance with deepseek-v4-flash.
+const PROMPT_TEMPLATE: &str = r#"Output ONLY this JSON. No other text.
+If text is empty, generate tags from the filename alone.
 {"tags":["tax-return","tax"],"entities":{"persons":["Yang Guorui","guorui yang"],"organizations":["IRS"],"years":["2023"],"doc_id":["1040"],"amounts":["$45,230"]}}
 
 Filename: {{FILENAME}}
@@ -139,7 +138,7 @@ impl TagProvider for DeepSeekProvider {
                     "content": prompt
                 }
             ],
-            "temperature": 0.0,
+            "temperature": 0.1,
             "max_tokens": 512,
             "stream": false
         });

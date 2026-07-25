@@ -233,6 +233,26 @@ impl Pipeline {
         let mut processed = 0usize;
         for (path, mtime, size, extracted) in &results {
             let Some(extracted) = extracted else {
+                // Extraction failed — still try to auto-tag from filename
+                let file_name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("")
+                    .to_string();
+                if let Some(ref tx) = self.auto_tagger_tx {
+                    let content_hash_before_tag = {
+                        let mut hasher = blake3::Hasher::new();
+                        hasher.update(file_name.as_bytes());
+                        hasher.update(b"[no text]");
+                        hasher.finalize().to_hex().to_string()
+                    };
+                    let _ = tx.try_send(AutoTagRequest::TagDocument {
+                        content_hash: format!("batch_failed_{}", file_name),
+                        filename: file_name,
+                        text: "[Document text could not be extracted. Use filename to determine topic.]".to_string(),
+                        content_hash_before_tag,
+                    });
+                }
                 continue;
             };
             let path_str = path.display().to_string();
@@ -372,20 +392,17 @@ impl Pipeline {
 
         // Extract text
         let extracted = match stages::run_chain(path, stages) {
-            Ok(Some(content)) => content,
+            Ok(Some(content)) => Some(content),
             Ok(None) => {
-                // No extractor handles this file type — log and skip.
-                // For PDFs, this typically means pdfium.dll is not available.
                 tracing::warn!(
-                    "No extractor available for {} — file will not be indexed",
+                    "No extractor available for {} — indexing filename only",
                     path.display()
                 );
-                return Ok(());
+                None
             }
             Err(e) => {
-                // Log error but continue
-                warn!("Extraction failed for {}: {}", path.display(), e);
-                return Err(e);
+                warn!("Extraction failed for {}: {} — indexing filename only", path.display(), e);
+                None
             }
         };
 
@@ -397,9 +414,10 @@ impl Pipeline {
             .and_then(|e| e.to_str())
             .unwrap_or("")
             .to_lowercase();
+        let extracted_text = extracted.as_ref().map(|e| e.text.as_str()).unwrap_or("[Document text could not be extracted. Use filename to determine topic.]");
         let content_hash = {
             let mut hasher = blake3::Hasher::new();
-            hasher.update(extracted.text.as_bytes());
+            hasher.update(extracted_text.as_bytes());
             hasher.update(file_type.as_bytes());
             hasher.finalize().to_hex().to_string()
         };
@@ -462,7 +480,7 @@ impl Pipeline {
                 &doc_id,
                 path,
                 &file_name,
-                &extracted.text,
+                &extracted_text,
                 &file_type,
                 modified_ts,
                 &content_hash,
@@ -476,7 +494,7 @@ impl Pipeline {
             let content_hash_before_tag = {
                 let mut hasher = blake3::Hasher::new();
                 hasher.update(file_name.as_bytes());
-                hasher.update(extracted.text.as_bytes());
+                hasher.update(extracted_text.as_bytes());
                 hasher.finalize().to_hex().to_string()
             };
             if let Err(e) = self.tag_store.upsert_auto_tag_status(
@@ -495,7 +513,7 @@ impl Pipeline {
                 let request = AutoTagRequest::TagDocument {
                     content_hash: content_hash.clone(),
                     filename: file_name.clone(),
-                    text: extracted.text.clone(),
+                    text: extracted_text.to_string(),
                     content_hash_before_tag,
                 };
                 let _ = tx.try_send(request);
