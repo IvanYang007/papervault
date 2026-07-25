@@ -63,7 +63,7 @@ pub fn run_auto_tagger(
 ) {
     info!("AutoTagger thread started");
     while !shutdown_flag.load(Ordering::Acquire) {
-        match rx.recv_timeout(Duration::from_millis(500)) {
+        match rx.recv_timeout(Duration::from_millis(100)) {
             Ok(request) => {
                 if shutdown_flag.load(Ordering::Acquire) { break; }
                 let is_shutdown = process_request(request, &tag_store, provider.as_ref(), &auto_tag_config);

@@ -847,6 +847,12 @@ impl eframe::App for PapervaultApp {
                             ("☁ Auto-tag: ready", Color32::from_rgb(100, 200, 100))
                         };
                         ui.label(RichText::new(status_text).size(10.0).color(status_color));
+                        if ui.small_button("🔄 Re-index for tags").clicked() {
+                            if let Some(ref folder) = self.config.watched_folder {
+                                let folder = folder.clone();
+                                self.start_folder_runtime(&folder);
+                            }
+                        }
 
                         // Progress bar
                         if let Some((completed, total)) = self.auto_tag_progress {

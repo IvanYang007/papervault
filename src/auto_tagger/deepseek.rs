@@ -139,7 +139,7 @@ impl TagProvider for DeepSeekProvider {
                 }
             ],
             "temperature": 0.1,
-            "max_tokens": 2048,
+            "max_tokens": 4000,
             "stream": false
         });
 
