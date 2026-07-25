@@ -37,13 +37,19 @@ pub fn extract_filename_tokens(filename: &str) -> Vec<String> {
         .collect()
 }
 
-/// Split CamelCase or PascalCase into words.
-/// "YangGuoRui" → ["yang", "guo", "rui"]
+/// Split CamelCase or PascalCase into words, treating spaces as delimiters.
 fn split_camel_case(s: &str) -> Option<Vec<String>> {
     if !s.chars().any(|c| c.is_uppercase()) { return None; }
     let mut parts: Vec<String> = Vec::new();
     let mut current = String::new();
     for c in s.chars() {
+        if c.is_whitespace() {
+            if !current.is_empty() {
+                parts.push(current.to_lowercase());
+                current = String::new();
+            }
+            continue;
+        }
         if c.is_uppercase() && !current.is_empty() {
             parts.push(current.to_lowercase());
             current = String::new();
@@ -87,32 +93,6 @@ pub fn normalize_person_name(name: &str) -> Vec<String> {
         variants.insert(reversed);
         let concatenated: String = parts.join("");
         variants.insert(concatenated);
-    }
-
-    // Try to split CamelCase using the ORIGINAL (non-lowered) name
-    // Handles "YangGuoRui" → ["yang", "guo", "rui"]
-    let original = name.trim();
-    if !original.contains(' ') && original.chars().any(|c| c.is_uppercase()) {
-        let mut camel_parts: Vec<String> = Vec::new();
-        let mut current = String::new();
-        for c in original.chars() {
-            if c.is_uppercase() && !current.is_empty() {
-                camel_parts.push(current.to_lowercase());
-                current = String::new();
-            }
-            current.push(c);
-        }
-        if !current.is_empty() {
-            camel_parts.push(current.to_lowercase());
-        }
-        if camel_parts.len() >= 2 {
-            let spaced = camel_parts.join(" ");
-            variants.insert(spaced);
-            let reversed = camel_parts.iter().rev().cloned().collect::<Vec<_>>().join(" ");
-            variants.insert(reversed);
-            let concat = camel_parts.join("");
-            variants.insert(concat);
-        }
     }
 
     // Try CamelCase split on the ORIGINAL name (before lowercasing)
@@ -161,6 +141,13 @@ pub fn run_auto_tagger(
     progress: Option<Arc<AtomicUsize>>,
 ) {
     info!("AutoTagger thread started");
+    // Process any pending documents from DB (recovery after crash or channel drops)
+    if let Ok(pending) = tag_store.pending_auto_tags(100) {
+        for p in pending {
+            if shutdown_flag.load(Ordering::Acquire) { break; }
+            tag_document(&p.content_hash, &p.filename, "", &p.content_hash_before_tag, &tag_store, provider.as_ref(), &auto_tag_config, progress.as_deref());
+        }
+    }
     while !shutdown_flag.load(Ordering::Acquire) {
         match rx.recv_timeout(Duration::from_millis(100)) {
             Ok(request) => {
@@ -252,6 +239,7 @@ fn tag_document(
                         }
                     }
                 }
+                all_tags.truncate(config.max_tags_per_doc);
                 entities.persons = entities.persons.iter()
                     .flat_map(|n| normalize_person_name(n))
                     .collect::<std::collections::HashSet<_>>()
@@ -346,6 +334,18 @@ mod tests {
         assert!(v.contains(&"chen yang".to_string()));
         assert!(v.contains(&"yang chen".to_string()));
         assert!(v.contains(&"chenyang".to_string()));
+    }
+
+    #[test]
+    fn split_camel_case_handles_embedded_spaces() {
+        let parts = split_camel_case("YangGuo Rui").unwrap();
+        assert_eq!(parts, vec!["yang", "guo", "rui"]);
+    }
+
+    #[test]
+    fn split_camel_case_treats_spaces_as_delimiters() {
+        let parts = split_camel_case("Hello World").unwrap();
+        assert_eq!(parts, vec!["hello", "world"]);
     }
     #[test]
     fn extract_filename_tokens_strips_extension_and_splits() {
