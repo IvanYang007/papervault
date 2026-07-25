@@ -49,6 +49,8 @@ pub enum AutoTagRequest {
         text: String,
         content_hash_before_tag: String,
     },
+    /// Graceful shutdown — drain pending, then exit.
+    Shutdown,
 }
 
 /// Messages from the UI thread to the renderer thread.

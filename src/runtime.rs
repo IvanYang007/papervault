@@ -162,6 +162,9 @@ impl FolderRuntime {
 
         // Shutdown auto-tagger after indexer
         self.auto_tagger_shutdown.store(true, Ordering::Release);
+        if let Some(ref tx) = self.auto_tagger_tx {
+            let _ = tx.send(crate::app::AutoTagRequest::Shutdown);
+        }
         drop(self.auto_tagger_tx.take());
         if let Some(handle) = self.auto_tagger_handle.take() {
             let _ = handle.join();

@@ -51,6 +51,31 @@ pub struct TagResponse {
     pub entities: Entities,
 }
 
+/// A single tag suggestion with confidence metadata for UI display.
+#[derive(Debug, Clone)]
+pub struct TagSuggestion {
+    /// The tag name.
+    pub tag: String,
+    /// Confidence score from 0.0 to 1.0.
+    pub confidence: f32,
+    /// Whether this tag matches an existing tag in the user's vocabulary.
+    pub is_existing: bool,
+}
+
+impl TagResponse {
+    /// Convert this response into a flat list of TagSuggestions for UI rendering.
+    pub fn to_suggestions(&self, existing_vocabulary: &std::collections::HashSet<String>) -> Vec<TagSuggestion> {
+        self.tags
+            .iter()
+            .map(|t| TagSuggestion {
+                tag: t.clone(),
+                confidence: 0.8,
+                is_existing: existing_vocabulary.contains(t),
+            })
+            .collect()
+    }
+}
+
 /// Trait for pluggable tag generation providers.
 pub trait TagProvider: Send + Sync {
     /// Generate tags and extract entities from document text.
@@ -168,6 +193,37 @@ mod tests {
         match result {
             Err(TagError::Unavailable(msg)) => assert!(msg.contains("test error")),
             _ => panic!("expected Unavailable error"),
+        }
+    }
+
+    #[test]
+    fn tag_suggestion_flags_existing_vocabulary() {
+        let response = TagResponse {
+            tags: vec!["tax".into(), "new-topic".into()],
+            entities: Entities::default(),
+        };
+        let mut vocab = std::collections::HashSet::new();
+        vocab.insert("tax".to_string());
+
+        let suggestions = response.to_suggestions(&vocab);
+        assert_eq!(suggestions.len(), 2);
+
+        let tax_suggestion = suggestions.iter().find(|s| s.tag == "tax").unwrap();
+        assert!(tax_suggestion.is_existing, "'tax' is in vocabulary, should be flagged");
+
+        let new_suggestion = suggestions.iter().find(|s| s.tag == "new-topic").unwrap();
+        assert!(!new_suggestion.is_existing, "'new-topic' is not in vocabulary");
+    }
+
+    #[test]
+    fn tag_suggestion_confidence_in_range() {
+        let response = TagResponse {
+            tags: vec!["test".into()],
+            entities: Entities::default(),
+        };
+        let suggestions = response.to_suggestions(&std::collections::HashSet::new());
+        for s in &suggestions {
+            assert!(s.confidence >= 0.0 && s.confidence <= 1.0);
         }
     }
 }

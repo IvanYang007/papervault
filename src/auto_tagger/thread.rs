@@ -66,7 +66,8 @@ pub fn run_auto_tagger(
         match rx.recv_timeout(Duration::from_millis(500)) {
             Ok(request) => {
                 if shutdown_flag.load(Ordering::Acquire) { break; }
-                process_request(request, &tag_store, provider.as_ref(), &auto_tag_config);
+                let is_shutdown = process_request(request, &tag_store, provider.as_ref(), &auto_tag_config);
+                if is_shutdown { break; }
             }
             Err(crossbeam::channel::RecvTimeoutError::Timeout) => continue,
             Err(crossbeam::channel::RecvTimeoutError::Disconnected) => {
@@ -83,10 +84,15 @@ fn process_request(
     tag_store: &TagStore,
     provider: &dyn TagProvider,
     config: &crate::auto_tagger::config::AutoTagConfig,
-) {
+) -> bool {
     match request {
         crate::app::AutoTagRequest::TagDocument { content_hash, filename, text, content_hash_before_tag } => {
             tag_document(&content_hash, &filename, &text, &content_hash_before_tag, tag_store, provider, config);
+            false
+        }
+        crate::app::AutoTagRequest::Shutdown => {
+            info!("AutoTagger received shutdown, draining queue");
+            true
         }
     }
 }
@@ -200,5 +206,33 @@ mod tests {
         let t = extract_filename_tokens("final-draft-scan-tax-return.pdf");
         assert!(!t.contains(&"final".to_string()));
         assert!(t.contains(&"tax".to_string()));
+    }
+    #[test]
+    fn shutdown_request_returns_true() {
+        use crate::auto_tagger::config::AutoTagConfig;
+        use crate::auto_tagger::provider::{Entities, TagError, TagProvider, TagResponse};
+        use crate::tags::store::TagStore;
+        use rusqlite::Connection;
+
+        struct DummyProvider;
+        impl TagProvider for DummyProvider {
+            fn generate_tags(&self, _: &str, _: &str, _: &[String]) -> Result<TagResponse, TagError> {
+                Ok(TagResponse { tags: vec![], entities: Entities::default() })
+            }
+        }
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let conn = Connection::open(dir.path().join("test.db")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE documents (content_hash TEXT PRIMARY KEY, file_path TEXT NOT NULL, file_type TEXT NOT NULL, file_size INTEGER DEFAULT 0, modified_ts INTEGER DEFAULT 0, indexed_at TEXT DEFAULT '', last_error TEXT); CREATE TABLE tags (id INTEGER PRIMARY KEY, name TEXT UNIQUE NOT NULL); CREATE TABLE document_tags (content_hash TEXT REFERENCES documents ON DELETE CASCADE, tag_id INTEGER REFERENCES tags ON DELETE CASCADE, PRIMARY KEY(content_hash, tag_id)); CREATE TABLE auto_tag_status (content_hash TEXT PRIMARY KEY REFERENCES documents ON DELETE CASCADE, filename TEXT NOT NULL, content_hash_before_tag TEXT NOT NULL, status TEXT DEFAULT 'pending', tags_json TEXT, attempts INTEGER DEFAULT 0, last_error TEXT, created_at TEXT DEFAULT (datetime('now')), updated_at TEXT DEFAULT (datetime('now'))); CREATE TABLE auto_tag_cache (id INTEGER PRIMARY KEY AUTOINCREMENT, filename_tokens TEXT NOT NULL, tags_json TEXT NOT NULL, source_hash TEXT NOT NULL, hit_count INTEGER DEFAULT 1, created_at TEXT DEFAULT (datetime('now')), updated_at TEXT DEFAULT (datetime('now')));",
+        ).unwrap();
+        let store = TagStore::new_for_test(conn);
+        let provider = DummyProvider;
+        let config = AutoTagConfig::default();
+        let result = process_request(
+            crate::app::AutoTagRequest::Shutdown,
+            &store, &provider, &config,
+        );
+        assert!(result, "Shutdown request should return true");
     }
 }
