@@ -4,49 +4,17 @@ use serde_json::Value;
 
 use super::provider::{TagError, TagProvider, TagResponse};
 
-/// Prompt template for the DeepSeek API.
-const PROMPT_TEMPLATE: &str = r#"You are a document entity extractor and classifier. Given a filename and extracted text, perform TWO tasks:
+/// Prompt template for the DeepSeek API — kept minimal to force JSON compliance.
+const PROMPT_TEMPLATE: &str = r#"Output ONLY this JSON structure. No markdown, no explanation.
 
-TASK 1 — Classify the document. Return 3-5 purpose/type tags (lowercase, 1-3 words, hyphen-separated, no punctuation). At least one must describe the document type (e.g., "research-paper", "tax-return", "legal-contract", "invoice", "lecture-slides", "form").
+Tags: lowercase, hyphen-separated, 1-3 words. Entities: only what is clearly present.
 
-TASK 2 — Extract structured entities from the text where clearly present:
-- persons: Full names of people mentioned. Use the most complete/proper form found (e.g., "Yang Guorui" not "yang").
-- organizations: Company names, government agencies, institutions.
-- years: 4-digit years referenced as dates or tax years (not page numbers or arbitrary numbers).
-- doc_id: Document/form identifier if present (e.g., "1040", "W-2", case number, invoice number).
-- amounts: Monetary amounts with currency if detectable (e.g., "$45,000", "EUR 1200").
-
-Rules:
-- The FILENAME is the strongest signal for classification — use it first.
-- The three anchor tags derived from the filename (person name, document type, year) are the MOST IMPORTANT and MUST be included.
-- After including anchor tags, add any additional keywords you find important from the document content.
-- For entities, ONLY extract what is clearly present — do not hallucinate.
-- If OCR garbling makes a name unreadable, OMIT it rather than guessing.
-- If an entity appears in multiple forms, use the most complete/proper form.
-- Prefer existing tags from this vocabulary for classification when they fit: {{EXISTING_TAGS}}
-- For each person entity, also generate common name variations as additional person entries (e.g., for "Yang Guorui" also output "guorui yang").
-- Return ONLY valid JSON in this exact structure, nothing else:
-
-{
-  "tags": ["tax-return", "tax", "irs"],
-  "entities": {
-    "persons": ["Yang Guorui", "guorui yang"],
-    "organizations": ["Internal Revenue Service"],
-    "years": ["2023"],
-    "doc_id": ["1040"],
-    "amounts": ["$12,450"]
-  }
-}
-
-Example:
-Filename: "2023-tax-return-yang-guorui.pdf"
-Text: "Form 1040. Yang Guorui. Tax year 2023. Adjusted gross income $45,230..."
-Output: {"tags": ["tax-return", "tax", "irs", "form-1040"], "entities": {"persons": ["Yang Guorui", "guorui yang"], "organizations": ["IRS"], "years": ["2023"], "doc_id": ["1040"], "amounts": ["$45,230"]}}
+{"tags":["tax-return","tax"],"entities":{"persons":["Yang Guorui","guorui yang"],"organizations":["IRS"],"years":["2023"],"doc_id":["1040"],"amounts":["$45,230"]}}
 
 Filename: {{FILENAME}}
 Text: {{TEXT}}
 Existing tags: {{EXISTING_TAGS}}
-Output:"#;
+JSON:"#;
 
 /// Provider that calls the DeepSeek API for tag generation.
 pub struct DeepSeekProvider {
@@ -171,8 +139,8 @@ impl TagProvider for DeepSeekProvider {
                     "content": prompt
                 }
             ],
-            "temperature": 0.2,
-            "max_tokens": 256,
+            "temperature": 0.0,
+            "max_tokens": 512,
             "stream": false
         });
 
