@@ -235,7 +235,7 @@ impl PapervaultApp {
             watcher_shutdown_tx,
             cached_auto_tag_hash: None,
             cached_auto_tag_value: None,
-            auto_tag_enabled: false,
+            auto_tag_enabled: crate::auto_tagger::config::AutoTagConfig::load().enabled,
             auto_tag_progress: None,
             auto_tag_error: None,
             show_auto_tag_opt_in: false,
@@ -863,6 +863,17 @@ impl eframe::App for PapervaultApp {
                                 self.auto_tag_error = None;
                             }
                         }
+                        ui.separator();
+                    } else {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("☁ Auto-tag: disabled").size(10.0).color(Color32::GRAY));
+                            if ui.small_button("Enable").clicked() {
+                                self.auto_tag_enabled = true;
+                                let mut cfg = crate::auto_tagger::config::AutoTagConfig::load();
+                                cfg.enabled = true;
+                                let _ = cfg.save();
+                            }
+                        });
                         ui.separator();
                     }
 
