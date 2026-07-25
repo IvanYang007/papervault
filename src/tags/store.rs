@@ -317,13 +317,20 @@ impl TagStore {
     /// List all indexed documents for the file browser.
     pub fn list_all_documents(&self) -> SqlResult<Vec<DocumentInfo>> {
         self.with_conn(|conn| {
-            let mut stmt =
-                conn.prepare("SELECT file_path, file_type FROM documents ORDER BY file_path")?;
+            let mut stmt = conn.prepare(
+                "SELECT d.file_path, d.file_type, d.content_hash,
+                        CASE WHEN a.status = 'tagged' THEN 1 ELSE 0 END
+                 FROM documents d
+                 LEFT JOIN auto_tag_status a ON d.content_hash = a.content_hash
+                 ORDER BY d.file_path"
+            )?;
             let docs = stmt
                 .query_map([], |row| {
                     Ok(DocumentInfo {
                         file_path: row.get(0)?,
                         file_type: row.get(1)?,
+                        content_hash: row.get(2)?,
+                        has_auto_tags: row.get::<_, i64>(3)? != 0,
                     })
                 })?
                 .filter_map(|r| r.ok())
@@ -338,6 +345,8 @@ impl TagStore {
 pub struct DocumentInfo {
     pub file_path: String,
     pub file_type: String,
+    pub content_hash: String,
+    pub has_auto_tags: bool,
 }
 
 // ── Auto-Tag Status ──

@@ -1043,12 +1043,34 @@ impl eframe::App for PapervaultApp {
                                     "md" => "📋",
                                     _ => "📎",
                                 };
-                                let label = format!("{} {}", icon, file_name);
+                                let sparkle = if doc.has_auto_tags { "✨" } else { "" };
+                                let label = format!("{} {}{}", icon, sparkle, file_name);
                                 let is_browsed =
                                     self.browsed_file.as_deref() == Some(&doc.file_path);
-                                let resp = ui.selectable_label(is_browsed, label);
+                                let resp = ui.selectable_label(is_browsed, &label);
                                 if resp.clicked() {
+                                    // When browsing, also set selected_hash for auto-tag display
+                                    self.selected_hash = Some(doc.content_hash.clone());
                                     clicked_file = Some(doc.file_path.clone());
+                                }
+                                // Show auto-tags inline for browsed file
+                                if is_browsed && doc.has_auto_tags {
+                                    if let Some(ref store) = self.tag_store {
+                                        if let Ok(Some(status)) = store.auto_tag_status(&doc.content_hash) {
+                                            if let Some(ref json) = status.tags_json {
+                                                if let Ok(value) = serde_json::from_str::<serde_json::Value>(json) {
+                                                    if let Some(tags) = value["tags"].as_array() {
+                                                        let tag_str: Vec<&str> = tags.iter().filter_map(|t| t.as_str()).take(5).collect();
+                                                        ui.label(
+                                                            RichText::new(format!("  🏷 {}", tag_str.join(", ")))
+                                                                .size(10.0)
+                                                                .color(Color32::from_rgb(140, 160, 200)),
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         });
