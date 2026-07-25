@@ -100,6 +100,7 @@ pub struct PapervaultApp {
     auto_tag_error: Option<String>,
     show_auto_tag_opt_in: bool,
     accepted_auto_tags: std::collections::HashMap<String, std::collections::HashSet<String>>,
+    pending_retag: bool,
     search_query: String,
     search_results: Vec<SearchResult>,
     total_hits: usize,
@@ -239,6 +240,7 @@ impl PapervaultApp {
             auto_tag_error: None,
             show_auto_tag_opt_in: false,
             accepted_auto_tags: std::collections::HashMap::new(),
+            pending_retag: false,
             last_search_instant: None,
             pending_search: None,
             focus_search_next_frame: true,
@@ -612,6 +614,46 @@ impl PapervaultApp {
         self.do_search();
     }
 
+    /// Re-trigger auto-tagging for the currently selected document.
+    /// Reads the file from disk and sends it through the auto-tagger.
+    fn retag_selected(&mut self) {
+        let hash = match &self.selected_hash { Some(h) => h.clone(), None => return };
+        let tx = match &self.auto_tagger_tx { Some(t) => t.clone(), None => return };
+        let store = match &self.tag_store { Some(s) => s.clone(), None => return };
+
+        // Find the file path from search results
+        let file_path = self
+            .search_results
+            .iter()
+            .find(|r| r.content_hash == hash)
+            .map(|r| r.file_path.clone());
+
+        let Some(file_path) = file_path else { return };
+        let path = std::path::Path::new(&file_path);
+        if !path.exists() { return }
+
+        // Re-extract text from the file
+        let Ok(content) = std::fs::read_to_string(path) else { return };
+        let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+
+        let content_hash_before_tag = {
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(file_name.as_bytes());
+            hasher.update(content.as_bytes());
+            hasher.finalize().to_hex().to_string()
+        };
+
+        // Clear old cache entry so Tier 1 doesn't short-circuit
+        let _ = store.upsert_auto_tag_status(&hash, file_name, &content_hash_before_tag, "pending", None, None);
+
+        let _ = tx.send(AutoTagRequest::TagDocument {
+            content_hash: hash.clone(),
+            filename: file_name.to_string(),
+            text: content,
+            content_hash_before_tag,
+        });
+    }
+
     fn assign_tag_to_selected(&mut self, tag_id: i64) {
         let Some(ref content_hash) = self.selected_hash else {
             return;
@@ -727,6 +769,12 @@ impl PapervaultApp {
 impl eframe::App for PapervaultApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_channels(ctx);
+
+        // Process deferred retag request (set by UI during rendering)
+        if self.pending_retag {
+            self.pending_retag = false;
+            self.retag_selected();
+        }
 
         // Check if a background folder switch has completed
         let pending = self.pending_runtime.clone();
@@ -861,7 +909,12 @@ impl eframe::App for PapervaultApp {
                                             if let Some(tags) = value["tags"].as_array() {
                                                 if !tags.is_empty() {
                                                     ui.separator();
-                                                    ui.label(RichText::new("✨ Auto-tags").size(11.0).color(Color32::GRAY));
+                                                    ui.horizontal(|ui| {
+                                                        ui.label(RichText::new("✨ Auto-tags").size(11.0).color(Color32::GRAY));
+                                                        if ui.small_button("🔄 Re-tag").clicked() {
+                                                            self.pending_retag = true;
+                                                        }
+                                                    });
                                                     let mut to_dismiss: Option<String> = None;
                                                     let mut to_toggle: Option<String> = None;
                                                     let accepted = self.accepted_auto_tags
