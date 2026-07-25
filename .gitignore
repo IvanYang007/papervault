@@ -1,0 +1,16 @@
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Auto-tag config (may contain API key references)
+auto_tag.json
+
+# Build artifacts
+/target/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo

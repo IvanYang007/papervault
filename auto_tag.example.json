@@ -1,0 +1,14 @@
+# Papervault — Example Configuration
+# Copy this file to auto_tag.json and customize.
+# NEVER commit auto_tag.json with real API keys.
+
+{
+  "enabled": true,
+  "provider": "deepseek",
+  "model": "deepseek-chat",
+  "endpoint": "https://api.deepseek.com/v1/chat/completions",
+  "api_key_env": "DEEPSEEK_API_KEY",
+  "max_retries": 3,
+  "request_timeout_secs": 30,
+  "max_tags_per_doc": 8
+}
