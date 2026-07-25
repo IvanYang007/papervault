@@ -5,7 +5,7 @@
 {
   "enabled": true,
   "provider": "deepseek",
-  "model": "deepseek-chat",
+  "model": "deepseek-v4-flash",
   "endpoint": "https://api.deepseek.com/v1/chat/completions",
   "api_key_env": "DEEPSEEK_API_KEY",
   "max_retries": 3,

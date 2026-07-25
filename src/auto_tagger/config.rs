@@ -33,7 +33,7 @@ fn default_provider() -> String {
     "deepseek".into()
 }
 fn default_model() -> String {
-    "deepseek-chat".into()
+    "deepseek-v4-flash".into()
 }
 fn default_endpoint() -> String {
     "https://api.deepseek.com/v1/chat/completions".into()
@@ -114,7 +114,7 @@ mod tests {
         let config = AutoTagConfig::default();
         assert!(!config.enabled);
         assert_eq!(config.provider, "deepseek");
-        assert_eq!(config.model, "deepseek-chat");
+        assert_eq!(config.model, "deepseek-v4-flash");
         assert_eq!(config.max_retries, 3);
     }
 
