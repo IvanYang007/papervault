@@ -259,15 +259,20 @@ impl PapervaultApp {
     /// runs reconciliation, and begins watching for file changes.
     #[allow(dead_code)]
     fn start_folder_runtime(&mut self, folder: &Path) {
-        // Stop old runtime first to release Tantivy lock
+        // Stop old runtime first to release Tantivy lock.
+        // Must drop App's Arc references BEFORE calling stop() so the
+        // SearchEngine (and its IndexWriter) is fully freed.
         if let Some(old_rt) = self.folder_runtime.take() {
-            if let Err(e) = old_rt.stop() {
-                tracing::warn!("Error stopping old folder runtime: {}", e);
-            }
             self.render_request_tx = None;
             self.search_reader = None;
             self.search_fields = None;
             self.search_engine = None;
+            self.auto_tagger_tx = None;
+            if let Err(e) = old_rt.stop() {
+                tracing::warn!("Error stopping old folder runtime: {}", e);
+            }
+            // Allow Windows to release MmapDirectory handles
+            std::thread::sleep(std::time::Duration::from_millis(300));
         }
 
         let Some(ref tag_store) = self.tag_store else {
