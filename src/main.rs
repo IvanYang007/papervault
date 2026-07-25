@@ -6,6 +6,7 @@ use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
 mod app;
+mod auto_tagger;
 mod config;
 mod error;
 mod indexer;
