@@ -1421,6 +1421,16 @@ impl eframe::App for PapervaultApp {
                                 if let Some(rt) = old_runtime {
                                     let _ = rt.stop();
                                 }
+                                // Clean up old database entries and Tantivy index
+                                if let Some(ref ts) = tag_store {
+                                    let _ = ts.clear_all_documents();
+                                }
+                                // Delete old Tantivy index
+                                let index_dir = dirs_next::data_local_dir()
+                                    .unwrap_or_else(|| PathBuf::from("."))
+                                    .join("papervault")
+                                    .join("indexes");
+                                let _ = std::fs::remove_dir_all(&index_dir);
                                 // Old engine released — start new runtime
                                 if let Some(ref ts) = tag_store {
                                     match FolderRuntime::start(&new_folder, ts) {

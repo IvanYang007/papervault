@@ -338,6 +338,20 @@ impl TagStore {
             Ok(docs)
         })
     }
+
+    /// Clear all documents and related data for folder switch.
+    pub fn clear_all_documents(&self) -> SqlResult<()> {
+        self.with_conn(|conn| {
+            conn.execute_batch(
+                "DELETE FROM auto_tag_cache;
+                 DELETE FROM auto_tag_status;
+                 DELETE FROM document_tags;
+                 DELETE FROM tags;
+                 DELETE FROM documents;"
+            )?;
+            Ok(())
+        })
+    }
 }
 
 /// Lightweight document info for the file browser panel.

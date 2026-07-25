@@ -21,7 +21,7 @@ pub struct FolderRuntime {
     watcher_handle: Option<JoinHandle<()>>,
     indexer_handle: Option<JoinHandle<()>>,
     renderer_handle: Option<JoinHandle<()>>,
-    auto_tagger_handle: Option<JoinHandle<()>>,
+    auto_tagger_handles: Vec<JoinHandle<()>>,
     auto_tagger_shutdown: Arc<AtomicBool>,
     watcher_tx: Option<Sender<IndexerMessage>>,
     pub tag_tx: Option<Sender<TagUpdate>>,
@@ -56,29 +56,25 @@ impl FolderRuntime {
 
         // ── Auto-Tagger ──
         let auto_tag_config = crate::auto_tagger::config::AutoTagConfig::load();
-        let at_tag_store = tag_store.clone();
         let at_shutdown = auto_tagger_shutdown.clone();
-        let auto_tagger_handle = {
+        let num_workers = 3usize;
+        let auto_tagger_handles: Vec<_> = (0..num_workers).map(|i| {
+            let at_tag_store = tag_store.clone();
             let provider = Box::new(crate::auto_tagger::deepseek::DeepSeekProvider::new(
                 auto_tag_config.endpoint.clone(),
                 auto_tag_config.model.clone(),
                 auto_tag_config.api_key_env.clone(),
                 auto_tag_config.request_timeout_secs,
             ));
-            Some(
-                std::thread::Builder::new()
-                    .name("auto-tagger".into())
-                    .spawn(move || {
-                        thread::run_auto_tagger(
-                            auto_tagger_rx,
-                            at_tag_store,
-                            provider,
-                            auto_tag_config,
-                            at_shutdown,
-                        );
-                    })?,
-            )
-        };
+            let at_config = auto_tag_config.clone();
+            let rx = auto_tagger_rx.clone();
+            let sd = at_shutdown.clone();
+            std::thread::Builder::new()
+                .name(format!("auto-tagger-{}", i))
+                .spawn(move || {
+                    thread::run_auto_tagger(rx, at_tag_store, provider, at_config, sd);
+                })
+        }).collect::<std::io::Result<Vec<_>>>()?;
 
         // ── Background Threads ──
         let indexer_engine = engine.clone();
@@ -131,7 +127,7 @@ impl FolderRuntime {
             watcher_handle: Some(watcher_handle),
             indexer_handle: Some(indexer_handle),
             renderer_handle: Some(renderer_handle),
-            auto_tagger_handle,
+            auto_tagger_handles: auto_tagger_handles,
             auto_tagger_shutdown,
             watcher_tx: Some(watcher_tx),
             tag_tx: Some(tag_tx),
@@ -161,10 +157,12 @@ impl FolderRuntime {
         // Shutdown auto-tagger after indexer
         self.auto_tagger_shutdown.store(true, Ordering::Release);
         if let Some(ref tx) = self.auto_tagger_tx {
-            let _ = tx.send(crate::app::AutoTagRequest::Shutdown);
+            for _ in &self.auto_tagger_handles {
+                let _ = tx.send(crate::app::AutoTagRequest::Shutdown);
+            }
         }
         drop(self.auto_tagger_tx.take());
-        if let Some(handle) = self.auto_tagger_handle.take() {
+        for handle in self.auto_tagger_handles.drain(..) {
             let _ = handle.join();
         }
 
