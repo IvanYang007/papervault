@@ -39,6 +39,19 @@ pub enum TagUpdate {
     },
 }
 
+/// Messages sent from the Indexer to the AutoTagger thread.
+#[derive(Debug, Clone)]
+pub enum AutoTagRequest {
+    /// Request auto-tagging for a document.
+    TagDocument {
+        content_hash: String,
+        filename: String,
+        text: String,
+    },
+    /// Graceful shutdown signal.
+    Shutdown,
+}
+
 /// Messages from the UI thread to the renderer thread.
 #[derive(Debug, Clone)]
 pub struct RenderRequest {
