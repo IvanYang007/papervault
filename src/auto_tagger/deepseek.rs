@@ -155,10 +155,6 @@ impl DeepSeekProvider {
 }
 
 impl TagProvider for DeepSeekProvider {
-    fn name(&self) -> &str {
-        "deepseek"
-    }
-
     fn generate_tags(
         &self,
         filename: &str,
@@ -217,11 +213,6 @@ impl TagProvider for DeepSeekProvider {
         })?;
 
         Self::parse_response(&body_str)
-    }
-
-    fn health_check(&self) -> Result<(), TagError> {
-        self.api_key()?;
-        Ok(())
     }
 }
 

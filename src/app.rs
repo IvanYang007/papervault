@@ -49,8 +49,6 @@ pub enum AutoTagRequest {
         text: String,
         content_hash_before_tag: String,
     },
-    /// Graceful shutdown signal.
-    Shutdown,
 }
 
 /// Messages from the UI thread to the renderer thread.
@@ -339,12 +337,11 @@ impl PapervaultApp {
                             return;
                         }
                         self.total_hits = results.total_hits;
-                        // Pre-lowercase match terms + snippet so render_highlighted_snippet
+                        // Pre-lowercase match terms so render_highlighted_snippet
                         // doesn't allocate per-term per-frame.
                         for item in &mut results.items {
                             item.match_terms =
                                 item.match_terms.iter().map(|t| t.to_lowercase()).collect();
-                            item.lower_snippet = item.snippet.to_lowercase();
                         }
                         self.search_results = results.items;
                         // Remap stable hash to index after results change

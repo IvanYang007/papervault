@@ -63,13 +63,6 @@ pub fn run_auto_tagger(
 ) {
     info!("AutoTagger thread started");
     while !shutdown_flag.load(Ordering::Acquire) {
-        // Primary: poll pending docs from DB
-        let pending = tag_store.pending_auto_tags(10).unwrap_or_default();
-        for doc in pending {
-            if shutdown_flag.load(Ordering::Acquire) { break; }
-            process_pending(doc, &tag_store, provider.as_ref(), &auto_tag_config);
-        }
-        // Secondary: drain channel for hot-path notifications
         match rx.recv_timeout(Duration::from_millis(500)) {
             Ok(request) => {
                 if shutdown_flag.load(Ordering::Acquire) { break; }
@@ -95,20 +88,7 @@ fn process_request(
         crate::app::AutoTagRequest::TagDocument { content_hash, filename, text, content_hash_before_tag } => {
             tag_document(&content_hash, &filename, &text, &content_hash_before_tag, tag_store, provider, config);
         }
-        crate::app::AutoTagRequest::Shutdown => {
-            info!("AutoTagger received shutdown");
-        }
     }
-}
-
-fn process_pending(
-    doc: crate::tags::model::AutoTagStatus,
-    tag_store: &TagStore,
-    provider: &dyn TagProvider,
-    config: &crate::auto_tagger::config::AutoTagConfig,
-) {
-    // DB-pending docs without text can't be tagged — skip
-    if doc.tags_json.is_none() && doc.status == "pending" { return; }
 }
 
 fn tag_document(

@@ -51,26 +51,8 @@ pub struct TagResponse {
     pub entities: Entities,
 }
 
-/// A single tag suggestion with confidence metadata.
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub struct TagSuggestion {
-    /// The tag name.
-    pub tag: String,
-    /// Confidence score from 0.0 to 1.0.
-    pub confidence: f32,
-    /// Whether this tag matches an existing tag in the user's vocabulary.
-    pub is_existing: bool,
-}
-
 /// Trait for pluggable tag generation providers.
-///
-/// Implementations can call remote APIs (DeepSeek, OpenAI) or run local models.
-/// The trait is object-safe for use behind `Arc<dyn TagProvider>`.
 pub trait TagProvider: Send + Sync {
-    /// Human-readable name shown in settings UI.
-    fn name(&self) -> &str;
-
     /// Generate tags and extract entities from document text.
     ///
     /// `filename` is the document's filename (strongest signal for classification).
@@ -82,9 +64,6 @@ pub trait TagProvider: Send + Sync {
         text: &str,
         existing_tags: &[String],
     ) -> Result<TagResponse, TagError>;
-
-    /// Quick health check — is the provider reachable?
-    fn health_check(&self) -> Result<(), TagError>;
 }
 
 #[cfg(any(test, feature = "test-util"))]
@@ -124,10 +103,6 @@ mod tests {
     }
 
     impl TagProvider for MockProvider {
-        fn name(&self) -> &str {
-            "mock"
-        }
-
         fn generate_tags(
             &self,
             _filename: &str,
@@ -140,14 +115,6 @@ mod tests {
                 Err(self.fail_error.clone().unwrap())
             } else {
                 Ok(self.response.clone())
-            }
-        }
-
-        fn health_check(&self) -> Result<(), TagError> {
-            if self.should_fail {
-                Err(self.fail_error.clone().unwrap())
-            } else {
-                Ok(())
             }
         }
     }
