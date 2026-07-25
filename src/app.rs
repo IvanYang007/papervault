@@ -91,6 +91,7 @@ pub struct PapervaultApp {
     search_engine: Option<Arc<Mutex<SearchEngine>>>,
     /// Owns watcher, indexer, renderer threads and channels for folder lifecycle.
     folder_runtime: Option<FolderRuntime>,
+    auto_tagger_tx: Option<Sender<AutoTagRequest>>,
     search_query: String,
     search_results: Vec<SearchResult>,
     total_hits: usize,
@@ -173,6 +174,7 @@ impl PapervaultApp {
         watcher_shutdown_flag: Option<Arc<AtomicBool>>,
         watcher_shutdown_tx: Option<Sender<IndexerMessage>>,
         folder_runtime: Option<FolderRuntime>,
+        auto_tagger_tx: Option<Sender<AutoTagRequest>>,
     ) -> Self {
         let status = if config.watched_folder.is_some() && search_engine.is_some() {
             "Ready".to_string()
@@ -226,6 +228,7 @@ impl PapervaultApp {
             pending_search: None,
             focus_search_next_frame: true,
             folder_runtime,
+            auto_tagger_tx,
             pending_runtime: None,
             background_error: None,
             file_browser_docs: Vec::new(),

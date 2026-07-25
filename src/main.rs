@@ -93,12 +93,13 @@ fn main() -> eframe::Result {
     };
 
     // Dummy channels for app startup without a folder runtime
-    let (dummy_progress_rx, dummy_render_tx, dummy_render_rx) = {
+    let (dummy_progress_rx, dummy_render_tx, dummy_render_rx, dummy_auto_tagger_tx) = {
         use crossbeam::channel;
         let (_, prx) = channel::unbounded::<app::IndexerProgress>();
         let (rtx, _) = channel::bounded::<app::RenderRequest>(1);
         let (_, rrx) = channel::bounded::<app::RenderResult>(1);
-        (prx, rtx, rrx)
+        let (atx, _) = channel::bounded::<app::AutoTagRequest>(1);
+        (prx, rtx, rrx, atx)
     };
 
     // ── UI ──
@@ -116,19 +117,22 @@ fn main() -> eframe::Result {
         options,
         Box::new(move |_cc| {
             // Extract runtime channels (or use dummies)
-            let (progress_rx, render_tx, render_result_rx) = if let Some(ref rt) = folder_runtime {
-                (
-                    rt.progress_rx.clone(),
-                    Some(rt.render_tx.clone()),
-                    Some(rt.render_result_rx.clone()),
-                )
-            } else {
-                (
-                    dummy_progress_rx,
-                    Some(dummy_render_tx),
-                    Some(dummy_render_rx),
-                )
-            };
+            let (progress_rx, render_tx, render_result_rx, auto_tagger_tx) =
+                if let Some(ref rt) = folder_runtime {
+                    (
+                        rt.progress_rx.clone(),
+                        Some(rt.render_tx.clone()),
+                        Some(rt.render_result_rx.clone()),
+                        rt.auto_tagger_tx.clone(),
+                    )
+                } else {
+                    (
+                        dummy_progress_rx,
+                        Some(dummy_render_tx),
+                        Some(dummy_render_rx),
+                        Some(dummy_auto_tagger_tx),
+                    )
+                };
             Ok(Box::new(PapervaultApp::new(
                 app_config,
                 search_engine,
@@ -142,6 +146,7 @@ fn main() -> eframe::Result {
                 None, // watcher_shutdown_flag - populated by FolderRuntime::start
                 None, // watcher_shutdown_tx - populated by FolderRuntime::start
                 folder_runtime,
+                auto_tagger_tx,
             )))
         }),
     )?;

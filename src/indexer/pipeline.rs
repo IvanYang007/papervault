@@ -1,4 +1,4 @@
-use crate::app::{IndexerProgress, TagUpdate};
+use crate::app::{AutoTagRequest, IndexerProgress, TagUpdate};
 use crate::indexer::stages;
 use crate::search::engine::SearchEngine;
 use crate::tags::store::TagStore;
@@ -20,6 +20,7 @@ pub struct Pipeline {
     msg_rx: Receiver<IndexerMessage>,
     tag_rx: Receiver<TagUpdate>,
     progress_tx: Sender<IndexerProgress>,
+    auto_tagger_tx: Option<Sender<AutoTagRequest>>,
     pending_count: usize,
     commit_batch_size: usize,
 }
@@ -32,6 +33,7 @@ impl Pipeline {
         msg_rx: Receiver<IndexerMessage>,
         tag_rx: Receiver<TagUpdate>,
         progress_tx: Sender<IndexerProgress>,
+        auto_tagger_tx: Option<Sender<AutoTagRequest>>,
     ) -> Self {
         Self {
             search_engine,
@@ -40,6 +42,7 @@ impl Pipeline {
             msg_rx,
             tag_rx,
             progress_tx,
+            auto_tagger_tx,
             pending_count: 0,
             commit_batch_size: 10,
         }
@@ -438,6 +441,21 @@ impl Pipeline {
             )?;
         }
 
+        // Send auto-tag request after successful indexing
+        if let Some(ref tx) = self.auto_tagger_tx {
+            let request = AutoTagRequest::TagDocument {
+                content_hash: content_hash.clone(),
+                filename: file_name.clone(),
+                text: extracted.text.clone(),
+            };
+            if tx.try_send(request).is_err() {
+                tracing::warn!(
+                    "auto-tagger channel full, skipping {}",
+                    content_hash
+                );
+            }
+        }
+
         Ok(())
     }
 
@@ -789,6 +807,7 @@ mod tests {
             msg_rx,
             tag_rx,
             progress_tx,
+            None,
         );
 
         // Run should process the document, then shutdown and commit
@@ -882,6 +901,7 @@ mod tests {
             msg_rx,
             tag_rx,
             progress_tx,
+            None,
         );
 
         // Process batch with offset 0
@@ -968,6 +988,7 @@ mod tests {
             msg_rx,
             tag_rx,
             progress_tx,
+            None,
         );
 
         // Process with offset 10 (simulating second batch)
@@ -1044,6 +1065,7 @@ mod tests {
             msg_rx,
             tag_rx,
             progress_tx,
+            None,
         );
 
         // Corrupt PDF should not crash — just skip
