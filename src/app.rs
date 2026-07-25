@@ -794,6 +794,10 @@ impl eframe::App for PapervaultApp {
                 if let Some(ref tx) = self.auto_tagger_tx {
                     if let Ok(docs) = store.list_all_documents() {
                         let total = docs.len();
+                        // Reset progress counter
+                        if let Some(ref rt) = self.folder_runtime {
+                            rt.auto_tag_progress.store(0, std::sync::atomic::Ordering::Relaxed);
+                        }
                         self.auto_tag_progress = Some((0, total));
                         for doc in docs {
                             let file_name = std::path::Path::new(&doc.file_path)

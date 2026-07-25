@@ -242,13 +242,21 @@ fn tag_document(
         match provider.generate_tags(filename, text, &existing_tags) {
             Ok(response) => {
                 let mut entities = response.entities;
-                let normalized_persons: Vec<String> = entities.persons.iter()
-                    .flat_map(|n| normalize_person_name(n)).collect();
-                entities.persons = normalized_persons;
-
-                // Merge person names into tags so they appear in search results
+                // Merge person names into tags — only one canonical form each
                 let mut all_tags = response.tags.clone();
-                all_tags.extend(entities.persons.iter().cloned());
+                for person in &entities.persons {
+                    let variants = normalize_person_name(person);
+                    if let Some(canonical) = variants.first() {
+                        if !all_tags.contains(canonical) {
+                            all_tags.push(canonical.clone());
+                        }
+                    }
+                }
+                entities.persons = entities.persons.iter()
+                    .flat_map(|n| normalize_person_name(n))
+                    .collect::<std::collections::HashSet<_>>()
+                    .into_iter()
+                    .collect();
 
                 let tags_json = serde_json::json!({"tags": all_tags, "entities": entities}).to_string();
 
