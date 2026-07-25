@@ -303,6 +303,35 @@ impl Pipeline {
                 }
             }
 
+            // Trigger auto-tagging (same as process_upsert path)
+            {
+                let content_hash_before_tag = {
+                    let mut hasher = blake3::Hasher::new();
+                    hasher.update(file_name.as_bytes());
+                    hasher.update(extracted.text.as_bytes());
+                    hasher.finalize().to_hex().to_string()
+                };
+                if let Err(e) = self.tag_store.upsert_auto_tag_status(
+                    &content_hash,
+                    &file_name,
+                    &content_hash_before_tag,
+                    "pending",
+                    None,
+                    None,
+                ) {
+                    tracing::warn!("failed to write pending auto-tag status for {}: {}", content_hash, e);
+                }
+                if let Some(ref tx) = self.auto_tagger_tx {
+                    let request = AutoTagRequest::TagDocument {
+                        content_hash: content_hash.clone(),
+                        filename: file_name.clone(),
+                        text: extracted.text.clone(),
+                        content_hash_before_tag,
+                    };
+                    let _ = tx.try_send(request);
+                }
+            }
+
             processed += 1;
             self.pending_count += 1;
             let _ = self

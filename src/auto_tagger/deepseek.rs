@@ -23,7 +23,7 @@ Rules:
 - For entities, ONLY extract what is clearly present — do not hallucinate.
 - If OCR garbling makes a name unreadable, OMIT it rather than guessing.
 - If an entity appears in multiple forms, use the most complete/proper form.
-- Prefer existing tags from this vocabulary for classification when they fit: {existing_tags}
+- Prefer existing tags from this vocabulary for classification when they fit: {{EXISTING_TAGS}}
 - For each person entity, also generate common name variations as additional person entries (e.g., for "Yang Guorui" also output "guorui yang").
 - Return ONLY valid JSON in this exact structure, nothing else:
 
@@ -99,16 +99,15 @@ impl DeepSeekProvider {
 
     /// Truncate text to at most `max_text_words` words at a word boundary.
     fn truncate_text<'a>(&self, text: &'a str) -> &'a str {
-        let mut word_end = text.len();
         let mut word_count = 0;
-        for (i, _) in text.match_indices(|c: char| c.is_whitespace()) {
-            word_count += 1;
+        let mut word_end = text.len();
+        for word in text.split_whitespace() {
             if word_count >= self.max_text_words {
-                word_end = i;
+                word_end = word.as_ptr() as usize - text.as_ptr() as usize;
                 break;
             }
+            word_count += 1;
         }
-        // Trim trailing whitespace
         let trimmed = text[..word_end].trim_end();
         let trim_len = trimmed.as_ptr() as usize - text.as_ptr() as usize + trimmed.len();
         &text[..trim_len]
@@ -267,6 +266,16 @@ mod tests {
         assert!(prompt.contains("Form 1040 tax document content here"));
         assert!(prompt.contains(r#""tax""#));
         assert!(prompt.contains(r#""irs""#));
+        // Verify no unreplaced placeholders remain
+        assert!(!prompt.contains("{existing_tags"), "placeholder not replaced");
+        assert!(!prompt.contains("{{FILENAME}}"), "FILENAME not replaced");
+    }
+
+    #[test]
+    fn truncate_text_handles_consecutive_whitespace() {
+        let provider = make_provider();
+        let text = "a   b   c   d   e";
+        assert_eq!(provider.truncate_text(text), "a   b   c   d   e");
     }
 
     #[test]
