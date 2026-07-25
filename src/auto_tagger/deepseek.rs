@@ -82,29 +82,36 @@ impl DeepSeekProvider {
 
     /// Read the API key from the environment variable at request time.
     fn api_key(&self) -> Result<String, TagError> {
-        std::env::var(&self.api_key_env).map_err(|_| {
+        let key = std::env::var(&self.api_key_env).map_err(|_| {
             TagError::Auth(format!(
                 "environment variable '{}' is not set. Set it to your DeepSeek API key.",
                 self.api_key_env
             ))
-        })
+        })?;
+        if key.trim().is_empty() {
+            return Err(TagError::Auth(format!(
+                "environment variable '{}' is set but empty",
+                self.api_key_env
+            )));
+        }
+        Ok(key)
     }
 
     /// Truncate text to at most `max_text_words` words at a word boundary.
     fn truncate_text<'a>(&self, text: &'a str) -> &'a str {
-        let words: Vec<&str> = text.split_whitespace().collect();
-        if words.len() <= self.max_text_words {
-            return text;
+        let mut word_end = text.len();
+        let mut word_count = 0;
+        for (i, _) in text.match_indices(|c: char| c.is_whitespace()) {
+            word_count += 1;
+            if word_count >= self.max_text_words {
+                word_end = i;
+                break;
+            }
         }
-        let mut cutoff = words[self.max_text_words..]
-            .first()
-            .map(|w| w.as_ptr() as usize - text.as_ptr() as usize)
-            .unwrap_or(text.len());
         // Trim trailing whitespace
-        while cutoff > 0 && text.as_bytes().get(cutoff - 1) == Some(&b' ') {
-            cutoff -= 1;
-        }
-        &text[..cutoff]
+        let trimmed = text[..word_end].trim_end();
+        let trim_len = trimmed.as_ptr() as usize - text.as_ptr() as usize + trimmed.len();
+        &text[..trim_len]
     }
 
     /// Build the prompt with filename, text, and existing tags substituted.
@@ -115,11 +122,11 @@ impl DeepSeekProvider {
         } else {
             serde_json::to_string(existing_tags).unwrap_or_else(|_| "[]".to_string())
         };
-
+        // Single-pass replacement to avoid multiple intermediate allocations
         PROMPT_TEMPLATE
             .replace("{{FILENAME}}", filename)
-            .replace("{{EXISTING_TAGS}}", &existing)
             .replace("{{TEXT}}", truncated)
+            .replace("{{EXISTING_TAGS}}", &existing)
     }
 
     /// Parse the DeepSeek API response JSON into a TagResponse.

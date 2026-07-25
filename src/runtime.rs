@@ -148,7 +148,7 @@ impl FolderRuntime {
     }
 
     pub fn stop(mut self) -> Result<()> {
-        self.watcher_shutdown.store(true, Ordering::Relaxed);
+        self.watcher_shutdown.store(true, Ordering::Release);
 
         if let Some(handle) = self.watcher_handle.take() {
             let _ = handle.join();

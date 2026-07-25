@@ -473,7 +473,7 @@ impl TagStore {
         }
         self.with_conn(|conn| {
             let mut stmt =
-                conn.prepare("SELECT filename_tokens, tags_json FROM auto_tag_cache")?;
+                conn.prepare("SELECT filename_tokens, tags_json FROM auto_tag_cache ORDER BY hit_count DESC LIMIT 200")?;
             let rows: Vec<(String, String)> = stmt
                 .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
                 .filter_map(|r| r.ok())

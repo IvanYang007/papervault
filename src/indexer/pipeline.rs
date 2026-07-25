@@ -441,18 +441,35 @@ impl Pipeline {
             )?;
         }
 
-        // Send auto-tag request after successful indexing
-        if let Some(ref tx) = self.auto_tagger_tx {
-            let request = AutoTagRequest::TagDocument {
-                content_hash: content_hash.clone(),
-                filename: file_name.clone(),
-                text: extracted.text.clone(),
+        // Persist auto-tag request to DB after successful indexing
+        // (replaces the old channel-based queue that silently dropped documents)
+        {
+            let content_hash_before_tag = {
+                let mut hasher = blake3::Hasher::new();
+                hasher.update(file_name.as_bytes());
+                hasher.update(extracted.text.as_bytes());
+                hasher.finalize().to_hex().to_string()
             };
-            if tx.try_send(request).is_err() {
-                tracing::warn!(
-                    "auto-tagger channel full, skipping {}",
-                    content_hash
-                );
+            if let Err(e) = self.tag_store.upsert_auto_tag_status(
+                &content_hash,
+                &file_name,
+                &content_hash_before_tag,
+                "pending",
+                None,
+                None,
+            ) {
+                tracing::warn!("failed to write pending auto-tag status for {}: {}", content_hash, e);
+            }
+
+            // Wake the auto-tagger via a lightweight channel notification
+            if let Some(ref tx) = self.auto_tagger_tx {
+                let request = AutoTagRequest::TagDocument {
+                    content_hash: content_hash.clone(),
+                    filename: file_name.clone(),
+                    text: extracted.text.clone(),
+                    content_hash_before_tag,
+                };
+                let _ = tx.try_send(request);
             }
         }
 

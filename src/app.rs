@@ -47,6 +47,7 @@ pub enum AutoTagRequest {
         content_hash: String,
         filename: String,
         text: String,
+        content_hash_before_tag: String,
     },
     /// Graceful shutdown signal.
     Shutdown,
@@ -814,20 +815,51 @@ impl eframe::App for PapervaultApp {
                                 if let Ok(Some(auto_status)) = store.auto_tag_status(hash) {
                                     if let Some(ref json) = auto_status.tags_json {
                                         if let Ok(value) = serde_json::from_str::<serde_json::Value>(json) {
+                                            // Render topic tags
                                             if let Some(tags) = value["tags"].as_array() {
                                                 if !tags.is_empty() {
                                                     ui.separator();
-                                                    ui.label(
-                                                        RichText::new("✨ Auto-tags")
-                                                            .size(11.0)
-                                                            .color(Color32::GRAY),
-                                                    );
+                                                    ui.label(RichText::new("✨ Auto-tags").size(11.0).color(Color32::GRAY));
+                                                    let mut to_dismiss: Option<String> = None;
                                                     for tag_value in tags {
                                                         if let Some(tag_name) = tag_value.as_str() {
                                                             ui.horizontal(|ui| {
                                                                 ui.label("✨");
-                                                                ui.label(tag_name);
+                                                                if ui.selectable_label(false, tag_name).clicked() {
+                                                                    // Accept: toggle to solid (click to accept)
+                                                                }
+                                                                if ui.small_button("✕").clicked() {
+                                                                    to_dismiss = Some(tag_name.to_string());
+                                                                }
                                                             });
+                                                        }
+                                                    }
+                                                    if let Some(tag) = to_dismiss {
+                                                        if let Some(ref store) = self.tag_store {
+                                                            let _ = store.dismiss_auto_tag(hash, &tag);
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            // Render entity tags with type icons
+                                            if let Some(entities) = value["entities"].as_object() {
+                                                for (entity_type, entity_values) in entities {
+                                                    let icon = match entity_type.as_str() {
+                                                        "persons" => "👤",
+                                                        "organizations" => "🏢",
+                                                        "years" => "📅",
+                                                        "doc_id" => "📄",
+                                                        "amounts" => "💰",
+                                                        _ => "🏷",
+                                                    };
+                                                    if let Some(arr) = entity_values.as_array() {
+                                                        for ev in arr {
+                                                            if let Some(ev_name) = ev.as_str() {
+                                                                ui.horizontal(|ui| {
+                                                                    ui.label(icon);
+                                                                    ui.label(ev_name);
+                                                                });
+                                                            }
                                                         }
                                                     }
                                                 }
