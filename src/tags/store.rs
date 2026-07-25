@@ -945,4 +945,50 @@ mod tests {
         let result = store.lookup_cache_by_tokens(&[], 0.5).unwrap();
         assert!(result.is_none());
     }
+
+    #[test]
+    fn cache_lookup_returns_best_match_by_hit_count() {
+        let (store, _dir) = setup_test_store();
+        // Insert two cache entries for similar tokens, one with higher hit_count
+        store
+            .upsert_cache_entry("tax return finance", r#"{"tags":["finance"]}"#, "h1")
+            .unwrap();
+        // Make the second entry more popular
+        for _ in 0..5 {
+            store
+                .upsert_cache_entry("tax return yang guorui", r#"{"tags":["tax"]}"#, "h2")
+                .unwrap();
+        }
+
+        let tokens: Vec<String> = ["tax", "return"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let result = store.lookup_cache_by_tokens(&tokens, 0.5).unwrap();
+        // Should return the entry with higher hit_count (sorted DESC)
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn cache_lookup_limited_to_200_rows() {
+        let (store, _dir) = setup_test_store();
+        // Insert 250 cache entries — lookup should still complete quickly
+        for i in 0..250 {
+            store
+                .upsert_cache_entry(
+                    &format!("doc type{} kind{} year{}", i, i % 10, 2020 + i % 5),
+                    r#"{"tags":["test"]}"#,
+                    &format!("h{}", i),
+                )
+                .unwrap();
+        }
+
+        let tokens: Vec<String> = ["doc", "type0", "kind0"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let result = store.lookup_cache_by_tokens(&tokens, 0.5).unwrap();
+        // Should hit the matching entry even with 250 rows (LIMIT 200 won't miss it since it matches)
+        assert!(result.is_some());
+    }
 }

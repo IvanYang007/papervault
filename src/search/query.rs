@@ -53,6 +53,7 @@ pub struct SearchResult {
     pub match_terms: Vec<String>,
     pub content_hash: String,
     pub tags: Vec<String>,
+    pub lower_snippet: String,
 }
 
 /// Collection of search results with metadata.

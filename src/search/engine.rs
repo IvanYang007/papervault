@@ -228,12 +228,13 @@ pub fn search_with_reader(
     let searcher = reader.searcher();
 
     let terms: Vec<&str> = request.query.split_whitespace().collect();
-    let mut subqueries: Vec<(Occur, Box<dyn Query>)> = Vec::new();
+    let n_terms = terms.len();
+    let mut subqueries: Vec<(Occur, Box<dyn Query>)> = Vec::with_capacity(n_terms + request.tag_filters.len());
 
     for term in &terms {
         let lower = term.to_lowercase();
-        // Each term matches body OR file_name (Should = OR)
-        let mut term_subqueries: Vec<(Occur, Box<dyn Query>)> = Vec::new();
+        // Each term matches body OR file_name OR tags (Should = OR)
+        let mut term_subqueries: Vec<(Occur, Box<dyn Query>)> = Vec::with_capacity(3);
         let body_term = Term::from_field_text(fields.body, &lower);
         term_subqueries.push((
             Occur::Should,
@@ -279,7 +280,7 @@ pub fn search_with_reader(
     // Fuzzy retry: if exact search returns 0 results and fuzzy is enabled,
     // re-run with FuzzyTermQuery (Levenshtein distance 1) on body + tags.
     if total_hits == 0 && request.fuzzy {
-        let mut fuzzy_subqueries: Vec<(Occur, Box<dyn Query>)> = Vec::new();
+        let mut fuzzy_subqueries: Vec<(Occur, Box<dyn Query>)> = Vec::with_capacity(n_terms);
         for term in &terms {
             let lower = term.to_lowercase();
             let mut term_fuzzy: Vec<(Occur, Box<dyn Query>)> = Vec::new();
@@ -379,6 +380,7 @@ pub fn search_with_reader(
             file_name,
             file_path,
             file_type,
+            lower_snippet: snippet.to_lowercase(),
             snippet,
             match_count,
             match_terms: match_terms.clone(),
@@ -731,5 +733,63 @@ mod tests {
             results.total_hits, 1,
             "Should find ABC-123.pdf by token '123'"
         );
+    }
+
+    #[test]
+    fn search_result_includes_lower_snippet() {
+        let (mut engine, _dir) = create_test_engine();
+        engine
+            .index_document(
+                "hash1pdf",
+                Path::new("/test/doc.pdf"),
+                "doc.pdf",
+                "Hello World Test",
+                "pdf",
+                1700000000,
+                "hash1",
+                &[],
+            )
+            .unwrap();
+        engine.commit().unwrap();
+        engine.reload().unwrap();
+
+        let results = engine.search(&SearchRequest::new("hello".into())).unwrap();
+        assert_eq!(results.total_hits, 1);
+        // lower_snippet should be pre-computed and lowercase
+        assert_eq!(results.items[0].lower_snippet, "hello world test");
+        assert!(results.items[0].lower_snippet
+            .chars()
+            .all(|c| !c.is_uppercase()),
+            "lower_snippet must be all lowercase"
+        );
+    }
+
+    #[test]
+    fn search_matches_tags_field() {
+        let (mut engine, _dir) = create_test_engine();
+        engine
+            .index_document(
+                "hash1pdf",
+                Path::new("/test/doc.pdf"),
+                "doc.pdf",
+                "some body text",
+                "pdf",
+                1700000000,
+                "hash1",
+                &["yang-guorui".into(), "tax".into()],
+            )
+            .unwrap();
+        engine.commit().unwrap();
+        engine.reload().unwrap();
+
+        // Search by tag token should work (TEXT tokenization splits on hyphens)
+        let results = engine.search(&SearchRequest::new("yang".into())).unwrap();
+        assert_eq!(results.total_hits, 1);
+
+        let results = engine.search(&SearchRequest::new("guorui".into())).unwrap();
+        assert_eq!(results.total_hits, 1);
+
+        let results = engine.search(&SearchRequest::new("tax".into())).unwrap();
+        assert_eq!(results.total_hits, 1);
     }
 }
