@@ -789,8 +789,7 @@ impl eframe::App for PapervaultApp {
 
                     ui.separator();
 
-                    // Tag list with checkboxes — clone only names (not full Tag structs)
-                    // because toggle_tag_filter/assign_tag_to_selected need &mut self.
+                    // Tag list with checkboxes
                     ScrollArea::vertical().id_salt("tag_scroll").show(ui, |ui| {
                         let tag_names: Vec<(String, i64)> = self.tag_list_cache.clone();
                         for (tag_name, tag_id) in &tag_names {
@@ -807,6 +806,36 @@ impl eframe::App for PapervaultApp {
                                     self.assign_tag_to_selected(*tag_id);
                                 }
                             });
+                        }
+
+                        // ── Auto-tag suggestions ──
+                        if let Some(hash) = &self.selected_hash {
+                            if let Some(ref store) = self.tag_store {
+                                if let Ok(Some(auto_status)) = store.auto_tag_status(hash) {
+                                    if let Some(ref json) = auto_status.tags_json {
+                                        if let Ok(value) = serde_json::from_str::<serde_json::Value>(json) {
+                                            if let Some(tags) = value["tags"].as_array() {
+                                                if !tags.is_empty() {
+                                                    ui.separator();
+                                                    ui.label(
+                                                        RichText::new("✨ Auto-tags")
+                                                            .size(11.0)
+                                                            .color(Color32::GRAY),
+                                                    );
+                                                    for tag_value in tags {
+                                                        if let Some(tag_name) = tag_value.as_str() {
+                                                            ui.horizontal(|ui| {
+                                                                ui.label("✨");
+                                                                ui.label(tag_name);
+                                                            });
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                         }
                     });
                 });
