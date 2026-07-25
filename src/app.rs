@@ -93,11 +93,14 @@ pub struct PapervaultApp {
     /// Owns watcher, indexer, renderer threads and channels for folder lifecycle.
     folder_runtime: Option<FolderRuntime>,
     auto_tagger_tx: Option<Sender<AutoTagRequest>>,
+    #[allow(dead_code)]
     cached_auto_tag_hash: Option<String>,
+    #[allow(dead_code)]
     cached_auto_tag_value: Option<serde_json::Value>,
     auto_tag_enabled: bool,
     auto_tag_progress: Option<(usize, usize)>,
     auto_tag_error: Option<String>,
+    #[allow(dead_code)]
     show_auto_tag_opt_in: bool,
     accepted_auto_tags: std::collections::HashMap<String, std::collections::HashSet<String>>,
     pending_retag: bool,
@@ -991,7 +994,7 @@ impl eframe::App for PapervaultApp {
                                                                     .rounding(egui::Rounding::same(4.0))
                                                             } else {
                                                                 egui::Frame::default()
-                                                                    .stroke(egui::Stroke::new(1.0, Color32::from_rgb(100, 100, 100)))
+                                                                    .stroke(egui::Stroke::new(1.0_f32, Color32::from_rgb(100, 100, 100)))
                                                                     .rounding(egui::Rounding::same(4.0))
                                                             };
                                                             frame.show(ui, |ui| {

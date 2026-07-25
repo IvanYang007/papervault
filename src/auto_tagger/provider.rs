@@ -79,6 +79,7 @@ pub struct TagResponse {
 
 /// A single tag suggestion with confidence metadata for UI display.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct TagSuggestion {
     /// The tag name.
     pub tag: String,
@@ -90,6 +91,7 @@ pub struct TagSuggestion {
 
 impl TagResponse {
     /// Convert this response into a flat list of TagSuggestions for UI rendering.
+    #[allow(dead_code)]
     pub fn to_suggestions(&self, existing_vocabulary: &std::collections::HashSet<String>) -> Vec<TagSuggestion> {
         self.tags
             .iter()

@@ -108,7 +108,7 @@ pub fn normalize_person_name(name: &str) -> Vec<String> {
 
     // Also try CamelCase on individual space-separated parts (handles "YangGuo Rui")
     for part in original.split_whitespace() {
-        if let Some(sub_parts) = split_camel_case(part) {
+        if let Some(_sub_parts) = split_camel_case(part) {
             let mut all_parts: Vec<String> = Vec::new();
             for p in original.split_whitespace() {
                 if let Some(cp) = split_camel_case(p) {
