@@ -1,4 +1,4 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
 
 /// Errors that can occur during tag generation.
@@ -25,20 +25,46 @@ pub enum TagError {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Entities {
     /// Person names found in the document.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty", deserialize_with = "string_or_vec")]
     pub persons: Vec<String>,
     /// Organization names found in the document.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty", deserialize_with = "string_or_vec")]
     pub organizations: Vec<String>,
     /// Years referenced in the document (as strings, e.g., "2023").
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty", deserialize_with = "string_or_vec")]
     pub years: Vec<String>,
     /// Document/form identifiers (e.g., "1040", "W-2").
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty", deserialize_with = "string_or_vec")]
     pub doc_id: Vec<String>,
     /// Monetary amounts with currency (e.g., "$45,000", "EUR 1200").
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty", deserialize_with = "string_or_vec")]
     pub amounts: Vec<String>,
+}
+
+/// Deserialize a value that could be either a single string or an array of strings.
+fn string_or_vec<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    use serde::de;
+    struct StringOrVec;
+    impl<'de> de::Visitor<'de> for StringOrVec {
+        type Value = Vec<String>;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a string or array of strings")
+        }
+        fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
+            Ok(vec![v.to_string()])
+        }
+        fn visit_seq<A: de::SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+            let mut v = Vec::new();
+            while let Some(item) = seq.next_element::<String>()? {
+                v.push(item);
+            }
+            Ok(v)
+        }
+    }
+    deserializer.deserialize_any(StringOrVec)
 }
 
 /// The complete response from a tag provider: topic tags + extracted entities.
