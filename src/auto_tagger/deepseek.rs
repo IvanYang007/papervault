@@ -8,10 +8,11 @@ use super::provider::{TagError, TagProvider, TagResponse};
 /// Prompt template — minimal to force JSON compliance with deepseek-v4-flash.
 const PROMPT_TEMPLATE: &str = r#"Output ONLY this JSON. No other text.
 If text is empty, generate tags from the filename alone.
-{"tags":["tax-return","tax"],"entities":{"persons":["Yang Guorui","guorui yang"],"organizations":["IRS"],"years":["2023"],"doc_id":["1040"],"amounts":["$45,230"]}}
+IMPORTANT for person names: extract ALL name variations (full, partial, initials). Names may appear with/without spaces, reversed order, or CamelCase.
+{"tags":["tax-return","tax"],"entities":{"persons":["Yang Guorui","guorui yang","yangguorui","Mia"],"organizations":["IRS"],"years":["2023"],"doc_id":["1040"],"amounts":["$45,230"]}}
 
 Filename: {{FILENAME}}
-Text: {{TEXT}}
+Text (first 2 pages): {{TEXT}}
 Existing tags: {{EXISTING_TAGS}}
 JSON:"#;
 
@@ -43,7 +44,7 @@ impl DeepSeekProvider {
             model: model.into(),
             api_key_env: api_key_env.into(),
             timeout: Duration::from_secs(timeout_secs),
-            max_text_words: 2000,
+            max_text_words: 1500,   // ~2 pages of text
         }
     }
 
@@ -205,12 +206,12 @@ mod tests {
     #[test]
     fn truncate_text_at_word_boundary() {
         let provider = make_provider();
-        let words: Vec<String> = (0..2005).map(|i| format!("word{}", i)).collect();
+        let words: Vec<String> = (0..1505).map(|i| format!("word{}", i)).collect();
         let text = words.join(" ");
         let truncated = provider.truncate_text(&text);
 
         let word_count = truncated.split_whitespace().count();
-        assert_eq!(word_count, 2000);
+        assert_eq!(word_count, 1500);
         assert!(!truncated.ends_with(' '));
     }
 

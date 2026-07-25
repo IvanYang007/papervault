@@ -37,21 +37,119 @@ pub fn extract_filename_tokens(filename: &str) -> Vec<String> {
         .collect()
 }
 
+/// Split CamelCase or PascalCase into words.
+/// "YangGuoRui" → ["yang", "guo", "rui"]
+fn split_camel_case(s: &str) -> Option<Vec<String>> {
+    if !s.chars().any(|c| c.is_uppercase()) { return None; }
+    let mut parts: Vec<String> = Vec::new();
+    let mut current = String::new();
+    for c in s.chars() {
+        if c.is_uppercase() && !current.is_empty() {
+            parts.push(current.to_lowercase());
+            current = String::new();
+        }
+        current.push(c);
+    }
+    if !current.is_empty() {
+        parts.push(current.to_lowercase());
+    }
+    if parts.len() >= 2 { Some(parts) } else { None }
+}
+
+/// Normalize a person name for searchability, covering all edge cases.
+///
+/// Handles:
+/// - No spaces: "YangGuoRui" → ["yangguorui", "yang guo rui"]
+/// - Partial spaces: "YangGuo Rui" → ["yang guo rui", "yangguorui"]
+/// - Full spaces: "Yang Guo Rui" → ["yang guo rui", "guorui yang", "yangguorui"]
+/// - Single word: "Mia" → ["mia"]
+/// - Mixed case: "YANG GUORUI" → ["yang guorui", "guorui yang", "yangguorui"]
+/// - Diacritics: "José" → ["jose"]
 pub fn normalize_person_name(name: &str) -> Vec<String> {
-    let mut variants = Vec::with_capacity(3);
+    let mut variants: std::collections::HashSet<String> = std::collections::HashSet::new();
+
     let lower = name.to_lowercase();
     let ascii: String = lower.chars().filter(|c| !is_combining_mark(*c)).collect();
     let ascii = ascii.trim();
-    if ascii.is_empty() { return variants; }
-    variants.push(ascii.to_string());
+
+    if ascii.is_empty() {
+        return vec![];
+    }
+
+    // Always include the basic lowercase form
+    variants.insert(ascii.to_string());
+
+    // Split by whitespace
     let parts: Vec<&str> = ascii.split_whitespace().collect();
+
     if parts.len() >= 2 {
         let reversed = parts.iter().rev().copied().collect::<Vec<_>>().join(" ");
-        if reversed != ascii { variants.push(reversed); }
+        variants.insert(reversed);
         let concatenated: String = parts.join("");
-        if concatenated != ascii { variants.push(concatenated); }
+        variants.insert(concatenated);
     }
-    variants
+
+    // Try to split CamelCase using the ORIGINAL (non-lowered) name
+    // Handles "YangGuoRui" → ["yang", "guo", "rui"]
+    let original = name.trim();
+    if !original.contains(' ') && original.chars().any(|c| c.is_uppercase()) {
+        let mut camel_parts: Vec<String> = Vec::new();
+        let mut current = String::new();
+        for c in original.chars() {
+            if c.is_uppercase() && !current.is_empty() {
+                camel_parts.push(current.to_lowercase());
+                current = String::new();
+            }
+            current.push(c);
+        }
+        if !current.is_empty() {
+            camel_parts.push(current.to_lowercase());
+        }
+        if camel_parts.len() >= 2 {
+            let spaced = camel_parts.join(" ");
+            variants.insert(spaced);
+            let reversed = camel_parts.iter().rev().cloned().collect::<Vec<_>>().join(" ");
+            variants.insert(reversed);
+            let concat = camel_parts.join("");
+            variants.insert(concat);
+        }
+    }
+
+    // Try CamelCase split on the ORIGINAL name (before lowercasing)
+    let original = name.trim();
+    if let Some(camel_parts) = split_camel_case(original) {
+        let spaced = camel_parts.join(" ");
+        variants.insert(spaced);
+        let reversed = camel_parts.iter().rev().cloned().collect::<Vec<_>>().join(" ");
+        variants.insert(reversed);
+        let concat = camel_parts.join("");
+        variants.insert(concat);
+    }
+
+    // Also try CamelCase on individual space-separated parts (handles "YangGuo Rui")
+    for part in original.split_whitespace() {
+        if let Some(sub_parts) = split_camel_case(part) {
+            let mut all_parts: Vec<String> = Vec::new();
+            for p in original.split_whitespace() {
+                if let Some(cp) = split_camel_case(p) {
+                    all_parts.extend(cp);
+                } else {
+                    all_parts.push(p.to_lowercase());
+                }
+            }
+            if all_parts.len() > 1 {
+                let spaced = all_parts.join(" ");
+                variants.insert(spaced);
+                let reversed = all_parts.iter().rev().cloned().collect::<Vec<_>>().join(" ");
+                variants.insert(reversed);
+                let concat = all_parts.join("");
+                variants.insert(concat);
+            }
+            break; // Only need to expand once
+        }
+    }
+
+    variants.into_iter().collect()
 }
 
 pub fn run_auto_tagger(
@@ -199,6 +297,36 @@ mod tests {
     #[test]
     fn normalize_person_name_empty() {
         assert!(normalize_person_name("").is_empty());
+    }
+    #[test]
+    fn normalize_no_spaces_camelcase() {
+        let v = normalize_person_name("YangGuoRui");
+        assert!(v.contains(&"yang guo rui".to_string()), "CamelCase should be split: {:?}", v);
+        assert!(v.contains(&"yangguorui".to_string()));
+    }
+    #[test]
+    fn normalize_partial_spaces() {
+        let v = normalize_person_name("YangGuo Rui");
+        assert!(v.contains(&"yang guo rui".to_string()), "partial spaces: {:?}", v);
+        assert!(v.contains(&"yangguorui".to_string()));
+    }
+    #[test]
+    fn normalize_single_name_mia() {
+        let v = normalize_person_name("Mia");
+        assert_eq!(v, vec!["mia"]);
+    }
+    #[test]
+    fn normalize_mixed_case() {
+        let v = normalize_person_name("YANG GUORUI");
+        assert!(v.contains(&"yang guorui".to_string()));
+        assert!(v.contains(&"guorui yang".to_string()));
+    }
+    #[test]
+    fn normalize_chen_yang() {
+        let v = normalize_person_name("Chen Yang");
+        assert!(v.contains(&"chen yang".to_string()));
+        assert!(v.contains(&"yang chen".to_string()));
+        assert!(v.contains(&"chenyang".to_string()));
     }
     #[test]
     fn extract_filename_tokens_strips_extension_and_splits() {
