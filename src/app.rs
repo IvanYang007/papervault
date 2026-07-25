@@ -259,6 +259,17 @@ impl PapervaultApp {
     /// runs reconciliation, and begins watching for file changes.
     #[allow(dead_code)]
     fn start_folder_runtime(&mut self, folder: &Path) {
+        // Stop old runtime first to release Tantivy lock
+        if let Some(old_rt) = self.folder_runtime.take() {
+            if let Err(e) = old_rt.stop() {
+                tracing::warn!("Error stopping old folder runtime: {}", e);
+            }
+            self.render_request_tx = None;
+            self.search_reader = None;
+            self.search_fields = None;
+            self.search_engine = None;
+        }
+
         let Some(ref tag_store) = self.tag_store else {
             self.status_message = "Tag store not available — cannot index.".to_string();
             return;
@@ -280,6 +291,7 @@ impl PapervaultApp {
                 self.render_result_rx = Some(runtime.render_result_rx.clone());
                 self.watcher_shutdown_flag = Some(runtime.watcher_shutdown());
                 self.watcher_shutdown_tx = runtime.watcher_shutdown_tx();
+                self.auto_tagger_tx = runtime.auto_tagger_tx.clone();
                 self.folder_runtime = Some(runtime);
                 self.status_message = format!("Watching: {}", folder.display());
             }
