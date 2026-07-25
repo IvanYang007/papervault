@@ -246,7 +246,11 @@ fn tag_document(
                     .flat_map(|n| normalize_person_name(n)).collect();
                 entities.persons = normalized_persons;
 
-                let tags_json = serde_json::json!({"tags": response.tags, "entities": entities}).to_string();
+                // Merge person names into tags so they appear in search results
+                let mut all_tags = response.tags.clone();
+                all_tags.extend(entities.persons.iter().cloned());
+
+                let tags_json = serde_json::json!({"tags": all_tags, "entities": entities}).to_string();
 
                 if let Err(e) = tag_store.upsert_auto_tag_status(content_hash, filename, content_hash_before_tag, "tagged", Some(&tags_json), None) {
                     warn!("failed to write auto-tag result for {content_hash}: {e}");

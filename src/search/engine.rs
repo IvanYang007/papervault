@@ -233,22 +233,22 @@ pub fn search_with_reader(
 
     for term in &terms {
         let lower = term.to_lowercase();
-        // Each term matches body OR file_name OR tags (Should = OR)
+        // Each term matches tags OR file_name OR body (tags first = higher BM25 weight)
         let mut term_subqueries: Vec<(Occur, Box<dyn Query>)> = Vec::with_capacity(3);
-        let body_term = Term::from_field_text(fields.body, &lower);
+        let tag_term = Term::from_field_text(fields.tags, &lower);
         term_subqueries.push((
             Occur::Should,
-            Box::new(TermQuery::new(body_term, IndexRecordOption::Basic)),
+            Box::new(TermQuery::new(tag_term, IndexRecordOption::Basic)),
         ));
         let file_term = Term::from_field_text(fields.file_name, &lower);
         term_subqueries.push((
             Occur::Should,
             Box::new(TermQuery::new(file_term, IndexRecordOption::Basic)),
         ));
-        let tag_term = Term::from_field_text(fields.tags, &lower);
+        let body_term = Term::from_field_text(fields.body, &lower);
         term_subqueries.push((
             Occur::Should,
-            Box::new(TermQuery::new(tag_term, IndexRecordOption::Basic)),
+            Box::new(TermQuery::new(body_term, IndexRecordOption::Basic)),
         ));
         // Wrap in a BooleanQuery — at least one Should clause must match
         subqueries.push((Occur::Must, Box::new(BooleanQuery::new(term_subqueries))));
