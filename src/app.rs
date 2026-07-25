@@ -872,6 +872,7 @@ impl eframe::App for PapervaultApp {
                                 let mut cfg = crate::auto_tagger::config::AutoTagConfig::load();
                                 cfg.enabled = true;
                                 let _ = cfg.save();
+                                self.status_message = "Auto-tagging enabled. Re-import folder to tag existing files.".to_string();
                             }
                         });
                         ui.separator();

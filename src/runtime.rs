@@ -58,7 +58,7 @@ impl FolderRuntime {
         let auto_tag_config = crate::auto_tagger::config::AutoTagConfig::load();
         let at_tag_store = tag_store.clone();
         let at_shutdown = auto_tagger_shutdown.clone();
-        let auto_tagger_handle = if auto_tag_config.enabled {
+        let auto_tagger_handle = {
             let provider = Box::new(crate::auto_tagger::deepseek::DeepSeekProvider::new(
                 auto_tag_config.endpoint.clone(),
                 auto_tag_config.model.clone(),
@@ -78,8 +78,6 @@ impl FolderRuntime {
                         );
                     })?,
             )
-        } else {
-            None
         };
 
         // ── Background Threads ──
