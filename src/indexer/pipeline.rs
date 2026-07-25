@@ -240,12 +240,7 @@ impl Pipeline {
                     .unwrap_or("")
                     .to_string();
                 if let Some(ref tx) = self.auto_tagger_tx {
-                    let content_hash_before_tag = {
-                        let mut hasher = blake3::Hasher::new();
-                        hasher.update(file_name.as_bytes());
-                        hasher.update(b"[no text]");
-                        hasher.finalize().to_hex().to_string()
-                    };
+                    let content_hash_before_tag = compute_content_hash(&file_name, "[no text]");
                     let _ = tx.try_send(AutoTagRequest::TagDocument {
                         content_hash: format!("batch_failed_{}", file_name),
                         filename: file_name,
@@ -261,23 +256,13 @@ impl Pipeline {
                 .and_then(|e| e.to_str())
                 .unwrap_or("")
                 .to_lowercase();
-            let content_hash = {
-                let mut hasher = blake3::Hasher::new();
-                hasher.update(extracted.text.as_bytes());
-                hasher.update(file_type.as_bytes());
-                hasher.finalize().to_hex().to_string()
-            };
+            let content_hash = compute_content_hash(&extracted.text, &file_type);
 
-            // Clean up old entries
-            if let Ok(Some(old_hash)) = self.tag_store.get_hash_by_path(&path_str) {
-                if old_hash != content_hash {
-                    {
-                        let mut engine =
-                            self.search_engine.lock().unwrap_or_else(|e| e.into_inner());
-                        let _ = engine.delete_by_hash(&old_hash);
-                    }
-                    let _ = self.tag_store.delete_document_by_path(&path_str);
-                }
+            // Clean up old entries before inserting new ones
+            let old_hash_to_delete = self.tag_store.get_hash_by_path(&path_str).ok().flatten()
+                .filter(|old| old.as_str() != content_hash);
+            if old_hash_to_delete.is_some() {
+                let _ = self.tag_store.delete_document_by_path(&path_str);
             }
 
             let file_name = path
@@ -306,8 +291,12 @@ impl Pipeline {
                 continue;
             }
 
+            // Single lock scope: delete old + index new (avoids double Mutex acquire)
             {
                 let mut engine = self.search_engine.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(ref old_hash) = old_hash_to_delete {
+                    let _ = engine.delete_by_hash(old_hash);
+                }
                 if let Err(e) = engine.index_document(
                     &doc_id,
                     path,
@@ -325,12 +314,7 @@ impl Pipeline {
 
             // Trigger auto-tagging (same as process_upsert path)
             {
-                let content_hash_before_tag = {
-                    let mut hasher = blake3::Hasher::new();
-                    hasher.update(file_name.as_bytes());
-                    hasher.update(extracted.text.as_bytes());
-                    hasher.finalize().to_hex().to_string()
-                };
+                let content_hash_before_tag = compute_content_hash(&file_name, &extracted.text);
                 if let Err(e) = self.tag_store.upsert_auto_tag_status(
                     &content_hash,
                     &file_name,
@@ -415,12 +399,7 @@ impl Pipeline {
             .unwrap_or("")
             .to_lowercase();
         let extracted_text = extracted.as_ref().map(|e| e.text.as_str()).unwrap_or("[Document text could not be extracted. Use filename to determine topic.]");
-        let content_hash = {
-            let mut hasher = blake3::Hasher::new();
-            hasher.update(extracted_text.as_bytes());
-            hasher.update(file_type.as_bytes());
-            hasher.finalize().to_hex().to_string()
-        };
+        let content_hash = compute_content_hash(extracted_text, &file_type);
 
         let file_name = path
             .file_name()
@@ -432,19 +411,11 @@ impl Pipeline {
         // If the file's content changed, the old content_hash differs from the
         // new one. Both SQLite (PK=content_hash) and Tantivy (stored by hash)
         // would accumulate duplicate entries without this cleanup.
-        if let Ok(Some(old_hash)) = self.tag_store.get_hash_by_path(&path_str) {
-            if old_hash != content_hash {
-                // Remove old Tantivy document
-                {
-                    let mut engine = self.search_engine.lock().unwrap_or_else(|e| e.into_inner());
-                    if let Err(e) = engine.delete_by_hash(&old_hash) {
-                        warn!("Failed to delete old Tantivy doc {}: {}", old_hash, e);
-                    }
-                }
-                // Remove old SQLite row (different PK = different row)
-                if let Err(e) = self.tag_store.delete_document_by_path(&path_str) {
-                    warn!("Failed to delete old SQLite row for {}: {}", path_str, e);
-                }
+        let old_hash_to_delete = self.tag_store.get_hash_by_path(&path_str).ok().flatten()
+            .filter(|old| old.as_str() != content_hash);
+        if old_hash_to_delete.is_some() {
+            if let Err(e) = self.tag_store.delete_document_by_path(&path_str) {
+                warn!("Failed to delete old SQLite row for {}: {}", path_str, e);
             }
         }
 
@@ -474,13 +445,19 @@ impl Pipeline {
             modified_ts,
         )?;
 
+        // Single lock scope: delete old + index new (avoids double Mutex acquire)
         {
             let mut engine = self.search_engine.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(ref old_hash) = old_hash_to_delete {
+                if let Err(e) = engine.delete_by_hash(old_hash) {
+                    warn!("Failed to delete old Tantivy doc {}: {}", old_hash, e);
+                }
+            }
             engine.index_document(
                 &doc_id,
                 path,
                 &file_name,
-                &extracted_text,
+                extracted_text,
                 &file_type,
                 modified_ts,
                 &content_hash,
@@ -491,12 +468,7 @@ impl Pipeline {
         // Persist auto-tag request to DB after successful indexing
         // (replaces the old channel-based queue that silently dropped documents)
         {
-            let content_hash_before_tag = {
-                let mut hasher = blake3::Hasher::new();
-                hasher.update(file_name.as_bytes());
-                hasher.update(extracted_text.as_bytes());
-                hasher.finalize().to_hex().to_string()
-            };
+            let content_hash_before_tag = compute_content_hash(&file_name, extracted_text);
             if let Err(e) = self.tag_store.upsert_auto_tag_status(
                 &content_hash,
                 &file_name,
@@ -547,6 +519,15 @@ impl Pipeline {
         engine.commit()?;
         Ok(())
     }
+}
+
+/// Compute a BLAKE3 content hash from text content and file type.
+/// Deterministic: same (text, type) always produces the same hash.
+pub fn compute_content_hash(text: &str, file_type: &str) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(text.as_bytes());
+    hasher.update(file_type.as_bytes());
+    hasher.finalize().to_hex().to_string()
 }
 
 /// Run reconciliation on startup: ensure Tantivy and SQLite are consistent.

@@ -1,4 +1,5 @@
 use serde::Serialize;
+use std::sync::Arc;
 
 /// A search request with query string and options.
 #[derive(Debug, Clone)]
@@ -50,7 +51,8 @@ pub struct SearchResult {
     pub file_type: String,
     pub snippet: String,
     pub match_count: usize,
-    pub match_terms: Vec<String>,
+    #[serde(skip)]
+    pub match_terms: Arc<[String]>,
     pub content_hash: String,
     pub tags: Vec<String>,
     pub lower_snippet: String,

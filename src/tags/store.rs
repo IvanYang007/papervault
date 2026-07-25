@@ -193,14 +193,10 @@ impl TagStore {
         self.with_conn(|conn| {
             let mut result: HashMap<String, Vec<Tag>> = HashMap::new();
             for chunk in hashes.chunks(500) {
-                let placeholders: Vec<String> = chunk
-                    .iter()
-                    .enumerate()
-                    .map(|(i, _)| format!("?{}", i + 1))
-                    .collect();
+                let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
                 let sql = format!(
                     "SELECT dt.content_hash, t.id, t.name FROM document_tags dt JOIN tags t ON dt.tag_id = t.id WHERE dt.content_hash IN ({}) ORDER BY t.name",
-                    placeholders.join(", ")
+                    placeholders
                 );
                 let mut stmt = conn.prepare(&sql)?;
                 let params: Vec<&dyn rusqlite::types::ToSql> = chunk
@@ -495,6 +491,10 @@ impl TagStore {
             return Ok(None);
         }
         self.with_conn(|conn| {
+            // Build a lookup set from input tokens once (avoids per-row HashSet allocation)
+            let token_set: std::collections::HashSet<&str> =
+                tokens.iter().map(|s| s.as_str()).collect();
+
             let mut stmt =
                 conn.prepare("SELECT filename_tokens, tags_json FROM auto_tag_cache ORDER BY hit_count DESC LIMIT 200")?;
             let rows: Vec<(String, String)> = stmt
@@ -503,11 +503,9 @@ impl TagStore {
                 .collect();
 
             for (cached_tokens_str, tags_json) in &rows {
-                let cached: std::collections::HashSet<&str> =
-                    cached_tokens_str.split_whitespace().collect();
-                let overlap: usize = tokens
-                    .iter()
-                    .filter(|t| cached.contains(t.as_str()))
+                let overlap = cached_tokens_str
+                    .split_whitespace()
+                    .filter(|ct| token_set.contains(ct))
                     .count();
                 let ratio = overlap as f64 / tokens.len() as f64;
                 if ratio >= min_overlap_ratio && overlap > 0 {

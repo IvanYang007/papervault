@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tantivy::collector::{Count, MultiCollector, TopDocs};
 use tantivy::query::{BooleanQuery, FuzzyTermQuery, Occur, Query, TermQuery};
 use tantivy::schema::*;
@@ -315,11 +316,12 @@ pub fn search_with_reader(
     // Build snippet generator for context-aware, match-centered snippets
     let snippet_gen = SnippetGenerator::create(&searcher, query.as_ref(), fields.body)?;
 
-    let match_terms: Vec<String> = request
+    let match_terms: Arc<[String]> = request
         .query
         .split_whitespace()
         .map(|s| s.to_lowercase())
-        .collect();
+        .collect::<Vec<_>>()
+        .into();
 
     let mut items = Vec::with_capacity(request.limit);
     for (_score, doc_address) in top_docs {
@@ -383,7 +385,7 @@ pub fn search_with_reader(
             lower_snippet: snippet.to_lowercase(),
             snippet,
             match_count,
-            match_terms: match_terms.clone(),
+            match_terms: Arc::clone(&match_terms),
             content_hash,
             tags,
         });

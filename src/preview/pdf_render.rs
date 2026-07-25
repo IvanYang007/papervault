@@ -2,6 +2,7 @@ use anyhow::Context;
 use crossbeam::channel::{Receiver, Sender};
 use std::collections::VecDeque;
 use std::path::PathBuf;
+use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
 use crate::app::{RenderRequest, RenderResult};
@@ -22,7 +23,7 @@ pub struct PdfRenderer {
     pdfium: Option<pdfium_render::prelude::Pdfium>,
     cached_bytes: Option<(PathBuf, Vec<u8>)>,
     /// LRU page cache: most-recently-used entry is at the front.
-    page_cache: VecDeque<(PageCacheKey, Vec<u8>, u32, u32)>,
+    page_cache: VecDeque<(PageCacheKey, Arc<Vec<u8>>, u32, u32)>,
 }
 
 impl PdfRenderer {
@@ -201,7 +202,7 @@ impl PdfRenderer {
 
     /// Check the page cache for a matching render.
     /// Moves the found entry to the front (most-recently-used position).
-    fn cache_lookup(&mut self, request: &RenderRequest) -> Option<(Vec<u8>, u32, u32)> {
+    fn cache_lookup(&mut self, request: &RenderRequest) -> Option<(Arc<Vec<u8>>, u32, u32)> {
         let zoom_pct = (request.zoom * 100.0) as u32;
         let key = (request.path.clone(), request.page, zoom_pct);
         let pos = self.page_cache.iter().position(|(k, _, _, _)| *k == key);
@@ -210,7 +211,7 @@ impl PdfRenderer {
                 // Move to front to maintain true LRU ordering
                 let entry = self.page_cache.remove(idx).unwrap();
                 let (_, bytes, w, h) = &entry;
-                let result = (bytes.clone(), *w, *h);
+                let result = (Arc::clone(bytes), *w, *h);
                 self.page_cache.push_front(entry);
                 Some(result)
             }
@@ -226,7 +227,7 @@ impl PdfRenderer {
         // Remove existing entry for this key if present (move to front on re-insert)
         self.page_cache.retain(|(k, _, _, _)| *k != key);
 
-        self.page_cache.push_front((key, bytes, width, height));
+        self.page_cache.push_front((key, Arc::new(bytes), width, height));
         if self.page_cache.len() > MAX_CACHED_PAGES {
             self.page_cache.pop_back();
         }
@@ -316,7 +317,7 @@ impl PdfRenderer {
                     path: request.path.clone(),
                     page: request.page,
                     page_count: 0, // unknown from cache, UI fills from last known
-                    rgba_bytes: bytes,
+                    rgba_bytes: Arc::unwrap_or_clone(bytes),
                     width: w as usize,
                     height: h as usize,
                     is_preview: false,
