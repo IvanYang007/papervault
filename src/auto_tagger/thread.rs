@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -158,13 +158,14 @@ pub fn run_auto_tagger(
     provider: Box<dyn TagProvider>,
     auto_tag_config: crate::auto_tagger::config::AutoTagConfig,
     shutdown_flag: Arc<AtomicBool>,
+    progress: Option<Arc<AtomicUsize>>,
 ) {
     info!("AutoTagger thread started");
     while !shutdown_flag.load(Ordering::Acquire) {
         match rx.recv_timeout(Duration::from_millis(100)) {
             Ok(request) => {
                 if shutdown_flag.load(Ordering::Acquire) { break; }
-                let is_shutdown = process_request(request, &tag_store, provider.as_ref(), &auto_tag_config);
+                let is_shutdown = process_request(request, &tag_store, provider.as_ref(), &auto_tag_config, progress.as_deref());
                 if is_shutdown { break; }
             }
             Err(crossbeam::channel::RecvTimeoutError::Timeout) => continue,
@@ -182,10 +183,11 @@ fn process_request(
     tag_store: &TagStore,
     provider: &dyn TagProvider,
     config: &crate::auto_tagger::config::AutoTagConfig,
+    progress: Option<&std::sync::atomic::AtomicUsize>,
 ) -> bool {
     match request {
         crate::app::AutoTagRequest::TagDocument { content_hash, filename, text, content_hash_before_tag } => {
-            tag_document(&content_hash, &filename, &text, &content_hash_before_tag, tag_store, provider, config);
+            tag_document(&content_hash, &filename, &text, &content_hash_before_tag, tag_store, provider, config, progress);
             false
         }
         crate::app::AutoTagRequest::Shutdown => {
@@ -203,6 +205,7 @@ fn tag_document(
     tag_store: &TagStore,
     provider: &dyn TagProvider,
     config: &crate::auto_tagger::config::AutoTagConfig,
+    progress: Option<&std::sync::atomic::AtomicUsize>,
 ) {
     // Tier 1: exact BLAKE3 hash match
     if !config.enabled {
@@ -213,6 +216,7 @@ fn tag_document(
     if let Ok(Some(status)) = tag_store.auto_tag_status(content_hash) {
         if status.content_hash_before_tag == content_hash_before_tag && status.status == "tagged" {
             debug!("cache hit (tier 1) for {filename}: exact hash match");
+            if let Some(p) = progress { p.fetch_add(1, Ordering::Relaxed); }
             return;
         }
     }
@@ -224,6 +228,7 @@ fn tag_document(
             debug!("cache hit (tier 2) for {filename}: token overlap");
             let _ = tag_store.upsert_auto_tag_status(content_hash, filename, content_hash_before_tag, "tagged", Some(&cached_json), None)
                 .map_err(|e| warn!("failed to write cache result for {content_hash}: {e}"));
+            if let Some(p) = progress { p.fetch_add(1, Ordering::Relaxed); }
             return;
         }
     }
@@ -250,6 +255,7 @@ fn tag_document(
                     let _ = tag_store.upsert_cache_entry(&tokens.join(" "), &tags_json, content_hash);
                 }
                 debug!("AI tagged {filename}: {} tags", response.tags.len());
+                if let Some(p) = progress { p.fetch_add(1, Ordering::Relaxed); }
                 return;
             }
             Err(e) => {
@@ -268,6 +274,7 @@ fn tag_document(
     if let Err(e) = tag_store.upsert_auto_tag_status(content_hash, filename, content_hash_before_tag, "failed", None, Some(&last_error)) {
         error!("failed to write auto-tag failure status for {content_hash}: {e}");
     }
+    if let Some(p) = progress { p.fetch_add(1, Ordering::Relaxed); }
 }
 
 #[cfg(test)]
@@ -364,7 +371,7 @@ mod tests {
         let config = AutoTagConfig::default();
         let result = process_request(
             crate::app::AutoTagRequest::Shutdown,
-            &store, &provider, &config,
+            &store, &provider, &config, None,
         );
         assert!(result, "Shutdown request should return true");
     }

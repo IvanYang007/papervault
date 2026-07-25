@@ -773,6 +773,14 @@ impl eframe::App for PapervaultApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_channels(ctx);
 
+        // Sync auto-tag progress from the shared counter
+        if let Some(ref rt) = self.folder_runtime {
+            if let Some((_, total)) = self.auto_tag_progress {
+                let completed = rt.auto_tag_progress.load(std::sync::atomic::Ordering::Relaxed);
+                self.auto_tag_progress = Some((completed, total));
+            }
+        }
+
         // Process deferred retag request (set by UI during rendering)
         if self.pending_retag {
             self.pending_retag = false;
@@ -785,7 +793,8 @@ impl eframe::App for PapervaultApp {
             if let Some(ref store) = self.tag_store {
                 if let Some(ref tx) = self.auto_tagger_tx {
                     if let Ok(docs) = store.list_all_documents() {
-                        self.auto_tag_progress = Some((0, docs.len()));
+                        let total = docs.len();
+                        self.auto_tag_progress = Some((0, total));
                         for doc in docs {
                             let file_name = std::path::Path::new(&doc.file_path)
                                 .file_name()

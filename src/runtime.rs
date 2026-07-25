@@ -1,5 +1,5 @@
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
@@ -26,6 +26,7 @@ pub struct FolderRuntime {
     watcher_tx: Option<Sender<IndexerMessage>>,
     pub tag_tx: Option<Sender<TagUpdate>>,
     pub auto_tagger_tx: Option<Sender<AutoTagRequest>>,
+    pub auto_tag_progress: Arc<AtomicUsize>,
     pub progress_rx: Receiver<IndexerProgress>,
     pub render_tx: Sender<RenderRequest>,
     pub render_result_rx: Receiver<RenderResult>,
@@ -57,6 +58,7 @@ impl FolderRuntime {
         // ── Auto-Tagger ──
         let auto_tag_config = crate::auto_tagger::config::AutoTagConfig::load();
         let at_shutdown = auto_tagger_shutdown.clone();
+        let progress = Arc::new(AtomicUsize::new(0));
         let num_workers = 3usize;
         let auto_tagger_handles: Vec<_> = (0..num_workers).map(|i| {
             let at_tag_store = tag_store.clone();
@@ -69,10 +71,11 @@ impl FolderRuntime {
             let at_config = auto_tag_config.clone();
             let rx = auto_tagger_rx.clone();
             let sd = at_shutdown.clone();
+            let prg = progress.clone();
             std::thread::Builder::new()
                 .name(format!("auto-tagger-{}", i))
                 .spawn(move || {
-                    thread::run_auto_tagger(rx, at_tag_store, provider, at_config, sd);
+                    thread::run_auto_tagger(rx, at_tag_store, provider, at_config, sd, Some(prg));
                 })
         }).collect::<std::io::Result<Vec<_>>>()?;
 
@@ -132,6 +135,7 @@ impl FolderRuntime {
             watcher_tx: Some(watcher_tx),
             tag_tx: Some(tag_tx),
             auto_tagger_tx: Some(auto_tagger_tx),
+            auto_tag_progress: progress,
             progress_rx,
             render_tx,
             render_result_rx,
