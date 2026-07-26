@@ -1510,6 +1510,36 @@ impl eframe::App for PapervaultApp {
                 }
 
                 // ── Right column: preview / empty states ──
+
+                // ── Show tags at top of preview when a file is selected ──
+                if let Some(ref hash) = self.selected_hash.clone() {
+                    if let Some(ref store) = self.tag_store {
+                        if let Ok(Some(status)) = store.auto_tag_status(hash) {
+                            if let Some(ref json) = status.tags_json {
+                                if let Ok(value) = serde_json::from_str::<serde_json::Value>(json) {
+                                    if let Some(tags) = value["tags"].as_array() {
+                                        if !tags.is_empty() {
+                                            let tag_strs: Vec<&str> =
+                                                tags.iter().filter_map(|t| t.as_str()).collect();
+                                            columns[1].horizontal_wrapped(|ui| {
+                                                ui.label("🏷");
+                                                for tag in &tag_strs {
+                                                    ui.label(
+                                                        RichText::new(*tag).size(13.0).color(
+                                                            Color32::from_rgb(200, 220, 255),
+                                                        ),
+                                                    );
+                                                }
+                                            });
+                                            columns[1].separator();
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
                 if self.config.watched_folder.is_some() && self.search_engine.is_none() {
                     columns[1].vertical_centered(|ui| {
                         ui.add_space(40.0);

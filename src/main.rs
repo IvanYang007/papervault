@@ -123,6 +123,30 @@ fn main() -> eframe::Result {
         "Papervault",
         options,
         Box::new(move |_cc| {
+            // ── Add CJK font for Chinese character support ──
+            let mut fonts = egui::FontDefinitions::default();
+            for cjk_path in &[
+                "C:/Windows/Fonts/msyh.ttc",
+                "C:/Windows/Fonts/msjh.ttc",
+                "C:/Windows/Fonts/simsun.ttc",
+            ] {
+                if let Ok(bytes) = std::fs::read(cjk_path) {
+                    fonts
+                        .font_data
+                        .insert("CJK".to_string(), egui::FontData::from_owned(bytes).into());
+                    for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+                        fonts
+                            .families
+                            .entry(family)
+                            .or_default()
+                            .push("CJK".to_string());
+                    }
+                    info!("Loaded CJK font: {}", cjk_path);
+                    break;
+                }
+            }
+            _cc.egui_ctx.set_fonts(fonts);
+
             // Extract runtime channels (or use dummies)
             let (progress_rx, render_tx, render_result_rx, auto_tagger_tx) =
                 if let Some(ref rt) = folder_runtime {
