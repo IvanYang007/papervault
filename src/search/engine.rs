@@ -35,10 +35,11 @@ impl SearchEngine {
             std::fs::create_dir_all(&index_dir)?;
         }
 
+        // Tantivy's own meta.json signals an existing index
         let (schema, fields, index) = if index_dir.join("meta.json").exists() {
-            // Check schema version before opening
-            let meta_path = index_dir.join("meta.json");
-            let version_ok = std::fs::read_to_string(&meta_path)
+            // Check our schema version before opening (separate file from Tantivy's meta.json)
+            let version_path = index_dir.join("papervault_schema.json");
+            let version_ok = std::fs::read_to_string(&version_path)
                 .ok()
                 .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
                 .and_then(|v| v.get("schema_version")?.as_u64())
@@ -88,10 +89,10 @@ impl SearchEngine {
             (schema, fields, index)
         };
 
-        // Write/update schema version stamp
+        // Write/update schema version stamp (separate file from Tantivy's meta.json)
         let version_json = serde_json::json!({"schema_version": SCHEMA_VERSION});
         std::fs::write(
-            index_dir.join("meta.json"),
+            index_dir.join("papervault_schema.json"),
             serde_json::to_string_pretty(&version_json).unwrap_or_default(),
         )
         .unwrap_or_else(|e| tracing::warn!("Failed to write schema version stamp: {}", e));
