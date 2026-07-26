@@ -167,7 +167,9 @@ impl FolderRuntime {
             let _ = handle.join();
         }
 
-        // Shutdown auto-tagger after indexer
+        // Shutdown auto-tagger — don't block on joins (workers may be
+        // mid-DeepSeek-API-call, taking 3-5s). Signal shutdown and let
+        // threads exit on their own.
         self.auto_tagger_shutdown.store(true, Ordering::Release);
         if let Some(ref tx) = self.auto_tagger_tx {
             for _ in &self.auto_tagger_handles {
@@ -175,8 +177,11 @@ impl FolderRuntime {
             }
         }
         drop(self.auto_tagger_tx.take());
+        // Detach threads without joining — they check shutdown flag every
+        // recv_timeout(100ms) and will exit within 100ms of completing
+        // their current API call.
         for handle in self.auto_tagger_handles.drain(..) {
-            let _ = handle.join();
+            std::mem::forget(handle);
         }
 
         drop(self.render_tx);
