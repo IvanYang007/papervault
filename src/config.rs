@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub watched_folder: Option<PathBuf>,
@@ -11,8 +11,23 @@ pub struct Config {
     pub start_with_windows: bool,
 
     /// Minimize to system tray on window close instead of exiting.
-    #[serde(default)]
+    /// Defaults to true so closing the app minimizes to tray.
+    #[serde(default = "default_minimize_to_tray")]
     pub minimize_to_tray: bool,
+}
+
+fn default_minimize_to_tray() -> bool {
+    true
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            watched_folder: None,
+            start_with_windows: false,
+            minimize_to_tray: true,
+        }
+    }
 }
 
 impl Config {
@@ -100,10 +115,10 @@ mod tests {
     }
 
     #[test]
-    fn new_fields_default_to_false() {
+    fn new_fields_defaults() {
         let config = Config::default();
         assert!(!config.start_with_windows);
-        assert!(!config.minimize_to_tray);
+        assert!(config.minimize_to_tray); // defaults to true
     }
 
     #[test]
@@ -128,8 +143,9 @@ mod tests {
             config.watched_folder.unwrap(),
             PathBuf::from("/some/path")
         );
-        // New fields default to false
+        // New fields use their serde defaults when missing:
+        // start_with_windows → false, minimize_to_tray → true
         assert!(!config.start_with_windows);
-        assert!(!config.minimize_to_tray);
+        assert!(config.minimize_to_tray);
     }
 }
