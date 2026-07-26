@@ -5,6 +5,14 @@ use std::path::PathBuf;
 pub struct Config {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub watched_folder: Option<PathBuf>,
+
+    /// Launch Papervault when Windows starts.
+    #[serde(default)]
+    pub start_with_windows: bool,
+
+    /// Minimize to system tray on window close instead of exiting.
+    #[serde(default)]
+    pub minimize_to_tray: bool,
 }
 
 impl Config {
@@ -62,6 +70,7 @@ mod tests {
     fn save_and_load_round_trips() {
         let config = Config {
             watched_folder: Some(PathBuf::from("/test/path/to/folder")),
+            ..Default::default()
         };
         let json = serde_json::to_string(&config).unwrap();
         let loaded: Config = serde_json::from_str(&json).unwrap();
@@ -84,8 +93,43 @@ mod tests {
     fn watched_folder_nonexistent_path_accepted() {
         let config = Config {
             watched_folder: Some(PathBuf::from("Z:/nonexistent/path/that/does/not/exist")),
+            ..Default::default()
         };
         assert!(config.watched_folder.is_some());
         // Config stores path strings; existence validation is a UI-layer concern
+    }
+
+    #[test]
+    fn new_fields_default_to_false() {
+        let config = Config::default();
+        assert!(!config.start_with_windows);
+        assert!(!config.minimize_to_tray);
+    }
+
+    #[test]
+    fn new_fields_round_trip() {
+        let config = Config {
+            start_with_windows: true,
+            minimize_to_tray: true,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let loaded: Config = serde_json::from_str(&json).unwrap();
+        assert!(loaded.start_with_windows);
+        assert!(loaded.minimize_to_tray);
+        assert!(loaded.watched_folder.is_none());
+    }
+
+    #[test]
+    fn deserialize_old_format_without_new_fields() {
+        let old_json = r#"{"watched_folder": "/some/path"}"#;
+        let config: Config = serde_json::from_str(old_json).unwrap();
+        assert_eq!(
+            config.watched_folder.unwrap(),
+            PathBuf::from("/some/path")
+        );
+        // New fields default to false
+        assert!(!config.start_with_windows);
+        assert!(!config.minimize_to_tray);
     }
 }
