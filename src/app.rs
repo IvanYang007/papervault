@@ -169,6 +169,8 @@ pub struct PapervaultApp {
     file_browser_dirty: bool,
     /// Cooldown counter: only refresh file browser every N frames during active indexing.
     file_browser_refresh_cooldown: usize,
+    /// Periodic refresh timer: refresh every 5 seconds even when idle.
+    file_browser_periodic_timer: usize,
     /// Currently previewed file path (from file browser, not search).
     browsed_file: Option<String>,
     /// Multi-selected file paths for batch tagging (Ctrl+click in file browser).
@@ -259,6 +261,7 @@ impl PapervaultApp {
             file_browser_docs: Vec::new(),
             file_browser_dirty: true,
             file_browser_refresh_cooldown: 0,
+            file_browser_periodic_timer: 0,
             browsed_file: None,
             selected_files: HashSet::new(),
         }
@@ -1268,6 +1271,12 @@ impl eframe::App for PapervaultApp {
 
         // Tick down file browser refresh cooldown
         self.file_browser_refresh_cooldown = self.file_browser_refresh_cooldown.saturating_sub(1);
+        // Periodic refresh every 5 seconds (300 frames at 60fps) — picks up new tags
+        self.file_browser_periodic_timer += 1;
+        if self.file_browser_periodic_timer >= 300 {
+            self.file_browser_periodic_timer = 0;
+            self.file_browser_dirty = true;
+        }
 
         // ── Left panel: file browser ──
         if self.config.watched_folder.is_some() {
