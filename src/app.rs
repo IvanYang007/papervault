@@ -10,6 +10,7 @@ use crate::tags::model::Tag;
 use crate::tags::store::DocumentInfo;
 use crate::tags::store::TagStore;
 use crate::watcher::watcher::IndexerMessage;
+use raw_window_handle::HasWindowHandle;
 use tracing::warn;
 use crossbeam::channel::{Receiver, Sender};
 use egui::{
@@ -179,6 +180,8 @@ pub struct PapervaultApp {
     menu_exit_id: Option<tray_icon::menu::MenuId>,
     /// Sync auto-start on first frame.
     auto_start_synced: Option<()>,
+    /// Raw window handle for ShowWindow hide/restore.
+    hwnd: Option<isize>,
 }
 
 impl PapervaultApp {
@@ -277,6 +280,7 @@ impl PapervaultApp {
             menu_open_id,
             menu_exit_id,
             auto_start_synced: Some(()),
+            hwnd: None,
         }
     }
 
@@ -967,8 +971,7 @@ impl PapervaultApp {
                     ..
                 }
                 | TrayIconEvent::DoubleClick { .. } => {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    self.show_window();
                     self.minimized_to_tray = false;
                 }
                 _ => {}
@@ -977,8 +980,7 @@ impl PapervaultApp {
 
         while let Ok(event) = MenuEvent::receiver().try_recv() {
             if Some(&event.id) == self.menu_open_id.as_ref() {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
-                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                self.show_window();
                 self.minimized_to_tray = false;
             } else if Some(&event.id) == self.menu_exit_id.as_ref() {
                 self.should_exit = true;
@@ -1002,10 +1004,37 @@ impl PapervaultApp {
             }
         }
     }
+
+    /// Hide the window using raw Win32 ShowWindow (bypasses eframe Visible deadlock).
+    fn hide_window(&self) {
+        #[cfg(windows)]
+        if let Some(hwnd) = self.hwnd {
+            unsafe { crate::win32::ShowWindow(hwnd, crate::win32::SW_HIDE); }
+        }
+        #[cfg(not(windows))]
+        let _ = self;
+    }
+
+    /// Show and focus the window using raw Win32 ShowWindow.
+    fn show_window(&self) {
+        #[cfg(windows)]
+        if let Some(hwnd) = self.hwnd {
+            unsafe {
+                crate::win32::ShowWindow(hwnd, crate::win32::SW_SHOW);
+            }
+        }
+        #[cfg(not(windows))]
+        let _ = self;
+    }
 }
 
 impl eframe::App for PapervaultApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // ── Capture HWND on first frame ──
+        if self.hwnd.is_none() {
+            self.hwnd = extract_hwnd(_frame);
+        }
+
         // ── System tray event processing ──
         self.process_tray_events(ctx);
 
@@ -1013,7 +1042,7 @@ impl eframe::App for PapervaultApp {
         if ctx.input(|i| i.viewport().close_requested()) {
             if !self.should_exit && self.config.minimize_to_tray && self.tray_icon.is_some() {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+                self.hide_window();
                 self.minimized_to_tray = true;
             }
             self.should_exit = false;
@@ -1902,4 +1931,21 @@ impl eframe::App for PapervaultApp {
             let _ = rt.stop();
         }
     }
+}
+
+/// Extract the Win32 HWND from an eframe Frame.
+/// Returns None on non-Windows or if the handle is unavailable.
+fn extract_hwnd(frame: &eframe::Frame) -> Option<isize> {
+    #[cfg(windows)]
+    {
+        use raw_window_handle::{RawWindowHandle, Win32WindowHandle};
+        if let Ok(handle) = frame.window_handle() {
+            if let RawWindowHandle::Win32(Win32WindowHandle { hwnd, .. }) = handle.as_raw() {
+                return Some(hwnd.get() as isize);
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = frame;
+    None
 }

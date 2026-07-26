@@ -15,6 +15,8 @@ mod runtime;
 mod search;
 mod tags;
 mod watcher;
+#[cfg(windows)]
+mod win32;
 
 use app::PapervaultApp;
 use runtime::FolderRuntime;
