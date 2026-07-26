@@ -315,23 +315,18 @@ impl TagStore {
         self.with_conn(|conn| {
             let mut stmt = conn.prepare(
                 "SELECT d.file_path, d.file_type, d.content_hash,
-                        MAX(CASE WHEN a.status = 'tagged' THEN 1 ELSE 0 END) AS has_auto,
-                        MAX(CASE WHEN dt.document_hash IS NOT NULL THEN 1 ELSE 0 END) AS has_manual
+                        CASE WHEN a.status = 'tagged' THEN 1 ELSE 0 END
                  FROM documents d
                  LEFT JOIN auto_tag_status a ON d.content_hash = a.content_hash
-                 LEFT JOIN document_tags dt ON d.content_hash = dt.content_hash
-                 GROUP BY d.file_path, d.file_type, d.content_hash
                  ORDER BY d.file_path",
             )?;
             let docs = stmt
                 .query_map([], |row| {
-                    let has_auto: i64 = row.get(3)?;
-                    let has_manual: i64 = row.get(4)?;
                     Ok(DocumentInfo {
                         file_path: row.get(0)?,
                         file_type: row.get(1)?,
                         content_hash: row.get(2)?,
-                        has_tags: has_auto != 0 || has_manual != 0,
+                        has_tags: row.get::<_, i64>(3)? != 0,
                     })
                 })?
                 .filter_map(|r| r.ok())
