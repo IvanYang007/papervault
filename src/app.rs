@@ -919,24 +919,26 @@ impl eframe::App for PapervaultApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_channels(ctx);
 
-        // Sync auto-tag progress from the shared counter
+        // Sync auto-tag progress from the shared counter (reindex batch only)
+        // Manual batches via tag_selected_files() set progress locally and
+        // use try_send — no shared counter tracking needed.
         if let Some(ref rt) = self.folder_runtime {
             if let Some((prev_completed, total)) = self.auto_tag_progress {
                 let completed = rt
                     .auto_tag_progress
                     .load(std::sync::atomic::Ordering::Relaxed);
                 if completed > prev_completed {
-                    // Progress moved — refresh file browser periodically
+                    // Progress moved — refresh file browser
                     self.file_browser_dirty = true;
-                    self.auto_tag_progress = Some((completed, total));
                     if completed >= total {
-                        // Batch complete
                         self.auto_tag_progress = None;
                         self.status_message =
                             format!("Tagging complete — {} files processed", total);
                         if !self.search_query.trim().is_empty() {
                             self.do_search();
                         }
+                    } else {
+                        self.auto_tag_progress = Some((completed, total));
                     }
                 }
             }

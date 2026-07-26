@@ -43,7 +43,7 @@ impl FolderRuntime {
         let (tag_tx, tag_rx) = channel::unbounded::<TagUpdate>();
         let (render_tx, render_rx) = channel::unbounded::<RenderRequest>();
         let (render_result_tx, render_result_rx) = channel::unbounded::<RenderResult>();
-        let (auto_tagger_tx, auto_tagger_rx) = channel::bounded::<AutoTagRequest>(100);
+        let (auto_tagger_tx, auto_tagger_rx) = channel::unbounded::<AutoTagRequest>();
 
         // ── Search Engine ──
         let engine = SearchEngine::open_or_create(folder)?;
