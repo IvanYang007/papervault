@@ -440,31 +440,48 @@ impl Pipeline {
                 }
             }
 
-            // Trigger auto-tagging (same as process_upsert path)
+            // Trigger auto-tagging (same as process_upsert path).
+            // Only write "pending" if NOT already tagged with the same content.
             {
                 let content_hash_before_tag = compute_content_hash(&file_name, &extracted.text);
-                if let Err(e) = self.tag_store.upsert_auto_tag_status(
-                    &content_hash,
-                    &file_name,
-                    &content_hash_before_tag,
-                    "pending",
-                    None,
-                    None,
-                ) {
-                    tracing::warn!(
-                        "failed to write pending auto-tag status for {}: {}",
-                        content_hash,
-                        e
+                let already_tagged = self
+                    .tag_store
+                    .auto_tag_status(&content_hash)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|s| {
+                        s.status == "tagged"
+                            && s.content_hash_before_tag == content_hash_before_tag
+                    });
+                if !already_tagged {
+                    if let Err(e) = self.tag_store.upsert_auto_tag_status(
+                        &content_hash,
+                        &file_name,
+                        &content_hash_before_tag,
+                        "pending",
+                        None,
+                        None,
+                    ) {
+                        tracing::warn!(
+                            "failed to write pending auto-tag status for {}: {}",
+                            content_hash,
+                            e
+                        );
+                    }
+                    if let Some(ref tx) = self.auto_tagger_tx {
+                        let request = AutoTagRequest::TagDocument {
+                            content_hash: content_hash.clone(),
+                            filename: file_name.clone(),
+                            text: extracted.text.clone(),
+                            content_hash_before_tag,
+                        };
+                        let _ = tx.try_send(request);
+                    }
+                } else {
+                    debug!(
+                        "Auto-tag: {} already tagged — skipping",
+                        file_name
                     );
-                }
-                if let Some(ref tx) = self.auto_tagger_tx {
-                    let request = AutoTagRequest::TagDocument {
-                        content_hash: content_hash.clone(),
-                        filename: file_name.clone(),
-                        text: extracted.text.clone(),
-                        content_hash_before_tag,
-                    };
-                    let _ = tx.try_send(request);
                 }
             }
 
@@ -642,34 +659,45 @@ impl Pipeline {
             )?;
         }
 
-        // Persist auto-tag request to DB after successful indexing
-        // (replaces the old channel-based queue that silently dropped documents)
+        // Persist auto-tag request to DB after successful indexing.
+        // Only write "pending" if NOT already tagged with the same content.
         {
             let content_hash_before_tag = compute_content_hash(&file_name, extracted_text);
-            if let Err(e) = self.tag_store.upsert_auto_tag_status(
-                &content_hash,
-                &file_name,
-                &content_hash_before_tag,
-                "pending",
-                None,
-                None,
-            ) {
-                tracing::warn!(
-                    "failed to write pending auto-tag status for {}: {}",
-                    content_hash,
-                    e
-                );
-            }
+            let already_tagged = self
+                .tag_store
+                .auto_tag_status(&content_hash)
+                .ok()
+                .flatten()
+                .is_some_and(|s| {
+                    s.status == "tagged"
+                        && s.content_hash_before_tag == content_hash_before_tag
+                });
+            if !already_tagged {
+                if let Err(e) = self.tag_store.upsert_auto_tag_status(
+                    &content_hash,
+                    &file_name,
+                    &content_hash_before_tag,
+                    "pending",
+                    None,
+                    None,
+                ) {
+                    tracing::warn!(
+                        "failed to write pending auto-tag status for {}: {}",
+                        content_hash,
+                        e
+                    );
+                }
 
-            // Wake the auto-tagger via a lightweight channel notification
-            if let Some(ref tx) = self.auto_tagger_tx {
-                let request = AutoTagRequest::TagDocument {
-                    content_hash: content_hash.clone(),
-                    filename: file_name.clone(),
-                    text: extracted_text.to_string(),
-                    content_hash_before_tag,
-                };
-                let _ = tx.try_send(request);
+                // Wake the auto-tagger via a lightweight channel notification
+                if let Some(ref tx) = self.auto_tagger_tx {
+                    let request = AutoTagRequest::TagDocument {
+                        content_hash: content_hash.clone(),
+                        filename: file_name.clone(),
+                        text: extracted_text.to_string(),
+                        content_hash_before_tag,
+                    };
+                    let _ = tx.try_send(request);
+                }
             }
         }
 
