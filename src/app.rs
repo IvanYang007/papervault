@@ -769,7 +769,9 @@ impl PapervaultApp {
                 text: content,
                 content_hash_before_tag,
             }) {
-                Ok(()) => {}
+                Ok(()) => {
+                    tracing::info!("Queued for tagging: {}", file_name);
+                }
                 Err(crossbeam::channel::TrySendError::Full(_)) => {
                     tracing::warn!(
                         "Auto-tagger queue full, stopping batch at {}/{}",
