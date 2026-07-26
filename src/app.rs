@@ -1262,7 +1262,7 @@ impl eframe::App for PapervaultApp {
                 });
         }
 
-        // Tick down file browser refresh cooldown (rate-limits list_all_documents)
+        // Tick down file browser refresh cooldown
         self.file_browser_refresh_cooldown = self.file_browser_refresh_cooldown.saturating_sub(1);
 
         // ── Left panel: file browser ──
