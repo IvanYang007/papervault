@@ -352,6 +352,11 @@ fn tag_document(
                     None,
                 ) {
                     warn!("failed to write auto-tag result for {content_hash}: {e}");
+                } else {
+                    info!(
+                        "💾 Wrote to DB: {filename} → status=tagged, {} tags",
+                        all_tags.len()
+                    );
                 }
                 if !tokens.is_empty() {
                     let _ =

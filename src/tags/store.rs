@@ -1,6 +1,7 @@
 use rusqlite::{params, Connection, Result as SqlResult};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use tracing::info;
 
 use super::model::{AutoTagStatus, Tag};
 
@@ -320,7 +321,7 @@ impl TagStore {
                  LEFT JOIN auto_tag_status a ON d.content_hash = a.content_hash
                  ORDER BY d.file_path",
             )?;
-            let docs = stmt
+            let docs: Vec<DocumentInfo> = stmt
                 .query_map([], |row| {
                     Ok(DocumentInfo {
                         file_path: row.get(0)?,
@@ -331,6 +332,12 @@ impl TagStore {
                 })?
                 .filter_map(|r| r.ok())
                 .collect();
+            let with_tags = docs.iter().filter(|d| d.has_tags).count();
+            info!(
+                "📋 list_all_documents: {} docs total, {} with tags ✨",
+                docs.len(),
+                with_tags
+            );
             Ok(docs)
         })
     }

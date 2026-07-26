@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 use serde_json::Value;
+use tracing::{info, warn};
 
 use super::provider::{TagError, TagProvider, TagResponse};
 
@@ -146,6 +147,10 @@ impl TagProvider for DeepSeekProvider {
             TagError::BadRequest(format!("failed to serialize request body: {}", e))
         })?;
 
+        info!(
+            "🤖 DeepSeek API call: {filename} ({} chars of text)",
+            text.len()
+        );
         let response = self
             .agent
             .post(&self.endpoint)
@@ -175,7 +180,16 @@ impl TagProvider for DeepSeekProvider {
             TagError::Unavailable(format!("failed to read API response body: {}", e))
         })?;
 
-        Self::parse_response(&body_str)
+        let result = Self::parse_response(&body_str);
+        match &result {
+            Ok(r) => info!(
+                "📥 DeepSeek response for {filename}: {} tags, {} persons",
+                r.tags.len(),
+                r.entities.persons.len()
+            ),
+            Err(e) => warn!("📥 DeepSeek parse error for {filename}: {e}"),
+        }
+        result
     }
 }
 
