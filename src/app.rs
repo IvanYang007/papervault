@@ -1,4 +1,5 @@
 use crate::config::Config;
+use crate::indexer::extractors::Extractor;
 use crate::runtime::FolderRuntime;
 use crate::search::engine::SearchEngine;
 use crate::search::query::{SearchRequest, SearchResult};
@@ -170,6 +171,8 @@ pub struct PapervaultApp {
     file_browser_refresh_cooldown: usize,
     /// Currently previewed file path (from file browser, not search).
     browsed_file: Option<String>,
+    /// Multi-selected file paths for batch tagging (Ctrl+click in file browser).
+    selected_files: HashSet<String>,
 }
 
 impl PapervaultApp {
@@ -257,6 +260,7 @@ impl PapervaultApp {
             file_browser_dirty: true,
             file_browser_refresh_cooldown: 0,
             browsed_file: None,
+            selected_files: HashSet::new(),
         }
     }
 
@@ -678,6 +682,100 @@ impl PapervaultApp {
             text: content,
             content_hash_before_tag,
         });
+    }
+
+    /// Manually trigger auto-tagging for all currently selected files in the file browser.
+    fn tag_selected_files(&mut self) {
+        let tx = match &self.auto_tagger_tx {
+            Some(t) => t.clone(),
+            None => return,
+        };
+        let store = match &self.tag_store {
+            Some(s) => s.clone(),
+            None => return,
+        };
+
+        let files: Vec<String> = self.selected_files.iter().cloned().collect();
+        let total = files.len();
+
+        // Reset and set progress
+        if let Some(ref rt) = self.folder_runtime {
+            rt.auto_tag_progress
+                .store(0, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.auto_tag_progress = Some((0, total));
+
+        let mut completed = 0usize;
+        for file_path in &files {
+            let path = std::path::Path::new(file_path);
+            if !path.exists() {
+                tracing::warn!("Skipping missing file for tagging: {}", file_path);
+                completed += 1;
+                continue;
+            }
+
+            // Find the DocumentInfo for this path
+            let doc = match self
+                .file_browser_docs
+                .iter()
+                .find(|d| d.file_path == *file_path)
+            {
+                Some(d) => d.clone(),
+                None => {
+                    completed += 1;
+                    continue;
+                }
+            };
+
+            let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+
+            // Extract text: read directly for text files; PDFs use pdf_oxide
+            let content = if doc.file_type == PDF_TYPE {
+                let extractor = crate::indexer::extractors::pdf::PdfExtractor;
+                match extractor.extract(path) {
+                    Ok(Some(extracted)) => extracted.text,
+                    _ => {
+                        tracing::warn!("Could not extract PDF text for {}", file_path);
+                        "[Document text could not be extracted. Use filename to determine topic.]"
+                            .to_string()
+                    }
+                }
+            } else {
+                std::fs::read_to_string(path)
+                    .unwrap_or_else(|_| format!("[Could not read file: {}]", file_name))
+            };
+
+            let content_hash_before_tag = {
+                let mut hasher = blake3::Hasher::new();
+                hasher.update(file_name.as_bytes());
+                hasher.update(content.as_bytes());
+                hasher.finalize().to_hex().to_string()
+            };
+
+            // Mark as pending so Tier 1 cache doesn't short-circuit
+            let _ = store.upsert_auto_tag_status(
+                &doc.content_hash,
+                file_name,
+                &content_hash_before_tag,
+                "pending",
+                None,
+                None,
+            );
+
+            let _ = tx.send(AutoTagRequest::TagDocument {
+                content_hash: doc.content_hash.clone(),
+                filename: file_name.to_string(),
+                text: content,
+                content_hash_before_tag,
+            });
+
+            completed += 1;
+            self.auto_tag_progress = Some((completed, total));
+        }
+
+        self.selected_files.clear();
+        self.file_browser_dirty = true;
+        self.status_message = format!("Queued {} files for tagging", total);
     }
 
     fn assign_tag_to_selected(&mut self, tag_id: i64) {
@@ -1151,10 +1249,21 @@ impl eframe::App for PapervaultApp {
                 .default_width(280.0)
                 .show(ctx, |ui| {
                     ui.heading("📂 Files");
-                    ui.label(format!("{} documents", self.file_browser_docs.len()));
+                    ui.horizontal(|ui| {
+                        ui.label(format!("{} documents", self.file_browser_docs.len()));
+                        // Tag Selected button — only when files selected and auto-tagger available
+                        if !self.selected_files.is_empty() && self.auto_tagger_tx.is_some() {
+                            let n = self.selected_files.len();
+                            if ui.button(format!("🏷 Tag Selected ({})", n)).clicked() {
+                                self.tag_selected_files();
+                            }
+                        }
+                    });
                     ui.separator();
 
+                    let ctrl_held = ui.input(|i| i.modifiers.ctrl);
                     let mut clicked_file: Option<String> = None;
+                    let mut toggled_file: Option<String> = None;
                     ScrollArea::vertical()
                         .id_salt("file_browser_scroll")
                         .show(ui, |ui| {
@@ -1170,14 +1279,30 @@ impl eframe::App for PapervaultApp {
                                     _ => "📎",
                                 };
                                 let sparkle = if doc.has_auto_tags { "✨" } else { "" };
-                                let label = format!("{} {}{}", icon, sparkle, file_name);
+                                let is_selected =
+                                    self.selected_files.contains(&doc.file_path);
                                 let is_browsed =
                                     self.browsed_file.as_deref() == Some(&doc.file_path);
-                                let resp = ui.selectable_label(is_browsed, &label);
-                                if resp.clicked() {
-                                    // When browsing, also set selected_hash for auto-tag display
-                                    self.selected_hash = Some(doc.content_hash.clone());
-                                    clicked_file = Some(doc.file_path.clone());
+                                // Background for selected files
+                                let sel_bg = if is_selected {
+                                    Color32::from_rgb(40, 80, 40)
+                                } else {
+                                    Color32::TRANSPARENT
+                                };
+                                let label = format!("{} {}{}", icon, sparkle, file_name);
+                                let resp = Frame::default()
+                                    .fill(sel_bg)
+                                    .rounding(egui::Rounding::same(2.0))
+                                    .show(ui, |ui| {
+                                        ui.selectable_label(is_browsed, &label)
+                                    });
+                                if resp.inner.clicked() {
+                                    if ctrl_held {
+                                        toggled_file = Some(doc.file_path.clone());
+                                    } else {
+                                        self.selected_hash = Some(doc.content_hash.clone());
+                                        clicked_file = Some(doc.file_path.clone());
+                                    }
                                 }
                                 // Show auto-tags inline for browsed file
                                 if is_browsed && doc.has_auto_tags {
@@ -1201,7 +1326,15 @@ impl eframe::App for PapervaultApp {
                             }
                         });
                     if let Some(path) = clicked_file {
+                        self.selected_files.clear();
                         self.browse_file(&path);
+                    }
+                    if let Some(path) = toggled_file {
+                        if self.selected_files.contains(&path) {
+                            self.selected_files.remove(&path);
+                        } else {
+                            self.selected_files.insert(path);
+                        }
                     }
                 });
         }
