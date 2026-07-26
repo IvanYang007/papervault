@@ -1021,13 +1021,19 @@ impl PapervaultApp {
         #[cfg(windows)]
         if let Some(hwnd) = self.hwnd {
             unsafe {
-                let ex_style = crate::win32::GetWindowLongPtrW(hwnd, crate::win32::GWL_EXSTYLE);
+                use crate::win32::*;
+                let ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
                 let new_style = if tool {
-                    (ex_style | crate::win32::WS_EX_TOOLWINDOW) & !crate::win32::WS_EX_APPWINDOW
+                    (ex_style | WS_EX_TOOLWINDOW) & !WS_EX_APPWINDOW
                 } else {
-                    (ex_style & !crate::win32::WS_EX_TOOLWINDOW) | crate::win32::WS_EX_APPWINDOW
+                    (ex_style & !WS_EX_TOOLWINDOW) | WS_EX_APPWINDOW
                 };
-                crate::win32::SetWindowLongPtrW(hwnd, crate::win32::GWL_EXSTYLE, new_style);
+                SetWindowLongPtrW(hwnd, GWL_EXSTYLE, new_style);
+                // Apply the style change immediately
+                SetWindowPos(
+                    hwnd, 0, 0, 0, 0, 0,
+                    SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+                );
             }
         }
     }
