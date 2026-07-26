@@ -21,11 +21,18 @@ use runtime::FolderRuntime;
 use tags::store::TagStore;
 
 fn main() -> eframe::Result {
-    // Initialize tracing
+    // Initialize tracing — console output
+    let log_dir = dirs_next::data_local_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("papervault");
+    let _ = std::fs::create_dir_all(&log_dir);
+    let log_file =
+        std::fs::File::create(log_dir.join("papervault.log")).expect("failed to create log file");
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
+        .with_writer(std::sync::Mutex::new(log_file))
         .init();
 
     // Set panic hook to log panics before crashing

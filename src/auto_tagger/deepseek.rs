@@ -7,9 +7,9 @@ use super::provider::{TagError, TagProvider, TagResponse};
 /// Prompt template for the DeepSeek API — kept minimal to force JSON compliance.
 /// Prompt template — minimal to force JSON compliance with deepseek-v4-flash.
 const PROMPT_TEMPLATE: &str = r#"Output ONLY this JSON. No other text.
-If text is empty, generate tags from the filename alone.
-IMPORTANT for person names: extract ALL name variations (full, partial, initials). Names may appear with/without spaces, reversed order, or CamelCase.
-{"tags":["tax-return","tax"],"entities":{"persons":["Yang Guorui","guorui yang","yangguorui","Mia"],"organizations":["IRS"],"years":["2023"],"doc_id":["1040"],"amounts":["$45,230"]}}
+If text is empty or unextractable, generate tags from the filename alone.
+IMPORTANT for person names: extract ALL name variants (full, partial, initials). Names may appear with/without spaces, reversed order, or CamelCase.
+{"tags":["keyword1","keyword2"],"entities":{"persons":["Full Name"],"organizations":["Org Name"],"years":["2024"],"doc_id":["form-number"],"amounts":["$1,000"]}}
 
 Filename: {{FILENAME}}
 Text (first 2 pages): {{TEXT}}

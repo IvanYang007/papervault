@@ -250,15 +250,28 @@ fn tag_document(
     config: &crate::auto_tagger::config::AutoTagConfig,
     progress: Option<&std::sync::atomic::AtomicUsize>,
 ) {
-    // Tier 1: exact BLAKE3 hash match
     if !config.enabled {
         debug!("auto-tagger disabled, skipping {filename}");
         return;
     }
-    info!("Auto-tagging: {filename}");
+
+    let text_preview = if text.len() > 120 {
+        format!("{}...", &text[..120])
+    } else {
+        text.to_string()
+    };
+    info!(
+        "Auto-tagging: {filename} (text={} chars, preview='{text_preview}')",
+        text.len()
+    );
+
+    // Tier 1: exact BLAKE3 hash match (content hasn't changed)
     if let Ok(Some(status)) = tag_store.auto_tag_status(content_hash) {
         if status.content_hash_before_tag == content_hash_before_tag && status.status == "tagged" {
-            debug!("cache hit (tier 1) for {filename}: exact hash match");
+            info!(
+                "  → tier 1 (exact hash): {filename} — reusing {} byte tags_json",
+                status.tags_json.as_ref().map(|j| j.len()).unwrap_or(0)
+            );
             if let Some(p) = progress {
                 p.fetch_add(1, Ordering::Relaxed);
             }
@@ -266,11 +279,15 @@ fn tag_document(
         }
     }
 
-    // Tier 2: filename-token lookup
+    // Tier 2: filename-token lookup — only when >=5 tokens AND >=80% overlap
     let tokens = extract_filename_tokens(filename);
-    if !tokens.is_empty() {
-        if let Ok(Some(cached_json)) = tag_store.lookup_cache_by_tokens(&tokens, 0.5) {
-            debug!("cache hit (tier 2) for {filename}: token overlap");
+    info!("  tokens({}): {:?}", tokens.len(), tokens);
+    if tokens.len() >= 5 {
+        if let Ok(Some(cached_json)) = tag_store.lookup_cache_by_tokens(&tokens, 0.8) {
+            info!(
+                "  → tier 2 (token overlap): {filename} — reusing cached tags ({} bytes)",
+                cached_json.len()
+            );
             let _ = tag_store
                 .upsert_auto_tag_status(
                     content_hash,
@@ -286,9 +303,12 @@ fn tag_document(
             }
             return;
         }
+    } else if !tokens.is_empty() {
+        debug!("  skipping tier 2: only {} tokens (need >=5)", tokens.len());
     }
 
     // Tier 3: AI fallback
+    info!("  → tier 3 (AI fallback): {filename} — calling DeepSeek");
     let existing_tags: Vec<String> = tag_store
         .list_tags()
         .unwrap_or_default()
@@ -337,7 +357,10 @@ fn tag_document(
                     let _ =
                         tag_store.upsert_cache_entry(&tokens.join(" "), &tags_json, content_hash);
                 }
-                debug!("AI tagged {filename}: {} tags", response.tags.len());
+                info!(
+                    "  ✓ AI tagged {filename}: tags={:?}, persons={:?}, orgs={:?}",
+                    all_tags, entities.persons, entities.organizations
+                );
                 if let Some(p) = progress {
                     p.fetch_add(1, Ordering::Relaxed);
                 }
@@ -345,6 +368,11 @@ fn tag_document(
             }
             Err(e) => {
                 let is_retryable = matches!(&e, super::provider::TagError::Unavailable(_));
+                warn!(
+                    "  ✗ AI attempt {}/{} for {filename}: {e}",
+                    attempt + 1,
+                    config.max_retries
+                );
                 if !is_retryable || attempt + 1 >= config.max_retries {
                     last_error = e.to_string();
                     break;
