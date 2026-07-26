@@ -965,6 +965,15 @@ impl PapervaultApp {
                         self.minimized_to_tray = false;
                     }
                     crate::tray::TrayCommand::Exit => {
+                        // Immediately hide the window so it disappears from view
+                        self.set_tool_window(true);
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+                        // Move heavy cleanup (thread joins + Tantivy commit) to background
+                        if let Some(rt) = self.folder_runtime.take() {
+                            std::thread::spawn(move || {
+                                let _ = rt.stop();
+                            });
+                        }
                         self.should_exit = true;
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                     }
@@ -1939,7 +1948,9 @@ impl eframe::App for PapervaultApp {
         self.watcher_shutdown_tx = None;
         self.watcher_shutdown_flag = None;
 
-        // Gracefully stop the folder runtime (joins all background threads).
+        // Folder runtime cleanup was moved to a background thread when
+        // the user clicked Exit — to avoid a multi-second UI freeze.
+        // If still present (e.g., direct window close), do inline stop.
         if let Some(rt) = self.folder_runtime.take() {
             let _ = rt.stop();
         }
