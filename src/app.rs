@@ -999,7 +999,7 @@ impl eframe::App for PapervaultApp {
                                 hasher.update(b"reindex");
                                 hasher.finalize().to_hex().to_string()
                             };
-                            let _ = tx.send(AutoTagRequest::TagDocument {
+                            let _ = tx.try_send(AutoTagRequest::TagDocument {
                                 content_hash: doc.content_hash.clone(),
                                 filename: file_name,
                                 text: "[Document text could not be extracted. Use filename to determine topic.]".to_string(),
