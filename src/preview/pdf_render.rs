@@ -3,6 +3,7 @@ use crossbeam::channel::{Receiver, Sender};
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use tracing::{debug, error, info, warn};
 
 use crate::app::{RenderRequest, RenderResult};
@@ -63,9 +64,10 @@ impl PdfRenderer {
         #[allow(clippy::while_let_loop)]
         loop {
             // Check for normal-priority requests first (coalesce, latest-wins)
-            let request = match self.request_rx.recv() {
+            let request = match self.request_rx.recv_timeout(Duration::from_millis(500)) {
                 Ok(req) => req,
-                Err(_) => break,
+                Err(crossbeam::channel::RecvTimeoutError::Timeout) => continue,
+                Err(crossbeam::channel::RecvTimeoutError::Disconnected) => break,
             };
             if request.priority == 0 {
                 // Prefetch request — only process if no normal request waiting

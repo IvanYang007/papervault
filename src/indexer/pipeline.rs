@@ -182,12 +182,17 @@ impl Pipeline {
             }
         }
 
-        // Final commit on channel close (shutdown)
-        info!("Pipeline shutting down, committing pending documents...");
+        // Final commit on channel close (shutdown) — only if documents are pending
         if self.pending_count > 0 {
+            info!(
+                "Pipeline shutting down, committing {} pending documents...",
+                self.pending_count
+            );
             if let Err(e) = self.commit() {
                 error!("Final commit error: {}", e);
             }
+        } else {
+            info!("Pipeline shutting down (no pending documents)");
         }
 
         let _ = self.progress_tx.send(IndexerProgress::ScanComplete {
