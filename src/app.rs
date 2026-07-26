@@ -1003,8 +1003,9 @@ impl PapervaultApp {
         }
     }
 
-    /// Restore window from tray: un-minimize via eframe + raw Win32 to bring to front.
+    /// Restore window from tray: restore normal window style + un-minimize + bring to front.
     fn restore_window(&mut self, ctx: &egui::Context) {
+        self.set_tool_window(false);
         ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
         #[cfg(windows)]
         if let Some(hwnd) = self.hwnd {
@@ -1013,6 +1014,22 @@ impl PapervaultApp {
             }
         }
         self.minimized_to_tray = false;
+    }
+
+    /// Toggle WS_EX_TOOLWINDOW to remove/restore taskbar visibility.
+    fn set_tool_window(&self, tool: bool) {
+        #[cfg(windows)]
+        if let Some(hwnd) = self.hwnd {
+            unsafe {
+                let ex_style = crate::win32::GetWindowLongPtrW(hwnd, crate::win32::GWL_EXSTYLE);
+                let new_style = if tool {
+                    (ex_style | crate::win32::WS_EX_TOOLWINDOW) & !crate::win32::WS_EX_APPWINDOW
+                } else {
+                    (ex_style & !crate::win32::WS_EX_TOOLWINDOW) | crate::win32::WS_EX_APPWINDOW
+                };
+                crate::win32::SetWindowLongPtrW(hwnd, crate::win32::GWL_EXSTYLE, new_style);
+            }
+        }
     }
 }
 
@@ -1030,7 +1047,9 @@ impl eframe::App for PapervaultApp {
         if ctx.input(|i| i.viewport().close_requested()) {
             if !self.should_exit && self.config.minimize_to_tray && self.tray_icon.is_some() {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-                // Use Minimized to keep eframe event loop alive (SW_HIDE stops it on 0.30)
+                // Make the window a tool window (no taskbar entry) so Minimized
+                // hides it from view while keeping the event loop alive.
+                self.set_tool_window(true);
                 ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
                 self.minimized_to_tray = true;
             }
