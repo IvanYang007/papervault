@@ -422,7 +422,6 @@ impl PapervaultApp {
     fn browse_file(&mut self, path: &str) {
         self.browsed_file = Some(path.to_string());
         self.selected_result = None;
-        self.selected_hash = None;
         self.current_page = 1;
         self.preview_texture = None;
         self.current_pdf_page_count = 0;
