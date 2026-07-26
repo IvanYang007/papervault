@@ -945,6 +945,11 @@ impl PapervaultApp {
 
 impl eframe::App for PapervaultApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Process deferred search result click from previous frame
+        if let Some(idx) = self.clicked_index.take() {
+            self.select_result(idx);
+        }
+
         self.poll_channels(ctx);
 
         // Sync auto-tag progress from the shared counter (reindex batch only)
@@ -1467,7 +1472,7 @@ impl eframe::App for PapervaultApp {
                     ));
                 }
 
-                let mut clicked_idx = self.clicked_index.take();
+                let mut clicked_idx: Option<usize> = None;
                 let max_h = ui.available_size().y;
                 ScrollArea::vertical()
                     .id_salt("results_scroll")
@@ -1518,150 +1523,156 @@ impl eframe::App for PapervaultApp {
                         }
                     });
 
-                // Process click immediately (results + preview are in same CentralPanel)
+                // Defer to next frame's update() so SidePanel::right sees selected_hash
                 if let Some(idx) = clicked_idx {
-                    self.select_result(idx);
+                    self.clicked_index = Some(idx);
+                    ctx.request_repaint();
                 }
             }
 
-            // ── Preview / empty states (below results, in same CentralPanel) ──
-
-            // ── Show tags at top of preview when a file is selected ──
-            if let Some(ref hash) = self.selected_hash {
-                let tags = Self::query_auto_tags(&self.tag_store, hash);
-                if !tags.is_empty() {
-                    ui.horizontal_wrapped(|ui| {
-                        ui.label("🏷");
-                        for tag in &tags {
-                            ui.label(
-                                RichText::new(tag)
-                                    .size(13.0)
-                                    .color(Color32::from_rgb(200, 220, 255)),
-                            );
+            // ── Right panel: preview ──
+            SidePanel::right("preview_panel")
+                .resizable(true)
+                .default_width(ctx.screen_rect().width() * 0.45)
+                .min_width(250.0)
+                .show(ctx, |ui| {
+                    // ── Show tags at top of preview when a file is selected ──
+                    if let Some(ref hash) = self.selected_hash {
+                        let tags = Self::query_auto_tags(&self.tag_store, hash);
+                        if !tags.is_empty() {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label("🏷");
+                                for tag in &tags {
+                                    ui.label(
+                                        RichText::new(tag)
+                                            .size(13.0)
+                                            .color(Color32::from_rgb(200, 220, 255)),
+                                    );
+                                }
+                            });
+                            ui.separator();
                         }
-                    });
-                    ui.separator();
-                }
-            }
-
-            if self.config.watched_folder.is_some() && self.search_engine.is_none() {
-                ui.vertical_centered(|ui| {
-                    ui.add_space(40.0);
-                    ui.colored_label(
-                        Color32::RED,
-                        format!(
-                            "Search engine failed to initialize for {}",
-                            self.config
-                                .watched_folder
-                                .as_ref()
-                                .map(|p| p.display().to_string())
-                                .unwrap_or_default(),
-                        ),
-                    );
-                    ui.label("The index may be corrupted. Try re-selecting the folder.");
-                });
-            } else if self.config.watched_folder.is_none() {
-                ui.vertical_centered(|ui| {
-                    ui.add_space(100.0);
-                    ui.heading("Papervault");
-                    ui.label("No watched folder configured.");
-                    ui.label("Click 📁 Folder to get started.");
-                });
-            } else if self.selected_result.is_none()
-                && self.search_query.is_empty()
-                && self.browsed_file.is_none()
-            {
-                ui.vertical_centered(|ui| {
-                    ui.add_space(100.0);
-                    ui.label("Type a search query to find documents.");
-                });
-            } else if self.search_results.is_empty() && has_search_query {
-                ui.vertical_centered(|ui| {
-                    ui.add_space(40.0);
-                    ui.label(format!("No results for '{}'", self.search_query.trim()));
-                    ui.label("Try different terms or remove tag filters.");
-                });
-            } else if self.preview_texture.is_some() {
-                let is_pdf = self.preview_file_type.as_deref() == Some(PDF_TYPE);
-                let current_page = self.current_page;
-
-                // PDF page navigation (before preview borrow)
-                if is_pdf {
-                    let at_last_page = self.current_pdf_page_count > 0
-                        && self.current_page >= self.current_pdf_page_count;
-                    let mut zoom_changed = false;
-                    ui.horizontal(|ui| {
-                        if ui.button("◀ Prev").clicked() && current_page > 1 {
-                            self.current_page -= 1;
-                            self.request_page_render();
-                        }
-                        if ui.button("🔍−").clicked() && self.pdf_zoom > 0.25 {
-                            self.pdf_zoom -= 0.25;
-                            zoom_changed = true;
-                        }
-                        ui.label(format!("{}%", (self.pdf_zoom * 100.0) as i32));
-                        if ui.button("🔍+").clicked() && self.pdf_zoom < 4.0 {
-                            self.pdf_zoom += 0.25;
-                            zoom_changed = true;
-                        }
-
-                        if self.current_pdf_page_count > 0 {
-                            ui.label(format!(
-                                "Page {} / {}",
-                                self.current_page, self.current_pdf_page_count
-                            ));
-                        } else {
-                            ui.label(format!("Page {}", self.current_page));
-                        }
-                        if ui
-                            .add_enabled(!at_last_page, egui::Button::new("Next ▶"))
-                            .clicked()
-                        {
-                            self.current_page += 1;
-                            self.request_page_render();
-                        }
-                    });
-                    if zoom_changed {
-                        self.request_page_render();
                     }
-                    ui.separator();
-                }
 
-                let tex_id = self
-                    .preview_texture
-                    .as_ref()
-                    .expect("preview has texture")
-                    .id();
-                let tex_size = self
-                    .preview_texture
-                    .as_ref()
-                    .expect("preview has texture")
-                    .size_vec2();
+                    if self.config.watched_folder.is_some() && self.search_engine.is_none() {
+                        ui.vertical_centered(|ui| {
+                            ui.add_space(40.0);
+                            ui.colored_label(
+                                Color32::RED,
+                                format!(
+                                    "Search engine failed to initialize for {}",
+                                    self.config
+                                        .watched_folder
+                                        .as_ref()
+                                        .map(|p| p.display().to_string())
+                                        .unwrap_or_default(),
+                                ),
+                            );
+                            ui.label("The index may be corrupted. Try re-selecting the folder.");
+                        });
+                    } else if self.config.watched_folder.is_none() {
+                        ui.vertical_centered(|ui| {
+                            ui.add_space(100.0);
+                            ui.heading("Papervault");
+                            ui.label("No watched folder configured.");
+                            ui.label("Click 📁 Folder to get started.");
+                        });
+                    } else if self.selected_result.is_none()
+                        && self.search_query.is_empty()
+                        && self.browsed_file.is_none()
+                    {
+                        ui.vertical_centered(|ui| {
+                            ui.add_space(100.0);
+                            ui.label("Type a search query to find documents.");
+                        });
+                    } else if self.search_results.is_empty() && has_search_query {
+                        ui.vertical_centered(|ui| {
+                            ui.add_space(40.0);
+                            ui.label(format!("No results for '{}'", self.search_query.trim()));
+                            ui.label("Try different terms or remove tag filters.");
+                        });
+                    } else if self.preview_texture.is_some() {
+                        let is_pdf = self.preview_file_type.as_deref() == Some(PDF_TYPE);
+                        let current_page = self.current_page;
 
-                // Update preview panel size for display-resolution rendering
-                let avail = ui.available_size();
-                self.preview_panel_size = (avail.x as u32, avail.y as u32);
+                        // PDF page navigation (before preview borrow)
+                        if is_pdf {
+                            let at_last_page = self.current_pdf_page_count > 0
+                                && self.current_page >= self.current_pdf_page_count;
+                            let mut zoom_changed = false;
+                            ui.horizontal(|ui| {
+                                if ui.button("◀ Prev").clicked() && current_page > 1 {
+                                    self.current_page -= 1;
+                                    self.request_page_render();
+                                }
+                                if ui.button("🔍−").clicked() && self.pdf_zoom > 0.25 {
+                                    self.pdf_zoom -= 0.25;
+                                    zoom_changed = true;
+                                }
+                                ui.label(format!("{}%", (self.pdf_zoom * 100.0) as i32));
+                                if ui.button("🔍+").clicked() && self.pdf_zoom < 4.0 {
+                                    self.pdf_zoom += 0.25;
+                                    zoom_changed = true;
+                                }
 
-                ui.image(egui::ImageSource::Texture(egui::load::SizedTexture::new(
-                    tex_id, tex_size,
-                )));
-            } else if self
-                .browsed_file
-                .as_ref()
-                .is_some_and(|f| f.to_lowercase().ends_with(".pdf"))
-            {
-                ui.vertical_centered(|ui| {
-                    ui.add_space(40.0);
-                    ui.label("PDF preview not available.");
-                    ui.label("Place pdfium.dll next to papervault.exe for PDF rendering.");
+                                if self.current_pdf_page_count > 0 {
+                                    ui.label(format!(
+                                        "Page {} / {}",
+                                        self.current_page, self.current_pdf_page_count
+                                    ));
+                                } else {
+                                    ui.label(format!("Page {}", self.current_page));
+                                }
+                                if ui
+                                    .add_enabled(!at_last_page, egui::Button::new("Next ▶"))
+                                    .clicked()
+                                {
+                                    self.current_page += 1;
+                                    self.request_page_render();
+                                }
+                            });
+                            if zoom_changed {
+                                self.request_page_render();
+                            }
+                            ui.separator();
+                        }
+
+                        let tex_id = self
+                            .preview_texture
+                            .as_ref()
+                            .expect("preview has texture")
+                            .id();
+                        let tex_size = self
+                            .preview_texture
+                            .as_ref()
+                            .expect("preview has texture")
+                            .size_vec2();
+
+                        // Update preview panel size for display-resolution rendering
+                        let avail = ui.available_size();
+                        self.preview_panel_size = (avail.x as u32, avail.y as u32);
+
+                        ui.image(egui::ImageSource::Texture(egui::load::SizedTexture::new(
+                            tex_id, tex_size,
+                        )));
+                    } else if self
+                        .browsed_file
+                        .as_ref()
+                        .is_some_and(|f| f.to_lowercase().ends_with(".pdf"))
+                    {
+                        ui.vertical_centered(|ui| {
+                            ui.add_space(40.0);
+                            ui.label("PDF preview not available.");
+                            ui.label("Place pdfium.dll next to papervault.exe for PDF rendering.");
+                        });
+                    } else if let Some(ref text) = self.preview_text {
+                        ScrollArea::vertical()
+                            .id_salt("preview_scroll")
+                            .show(ui, |ui| {
+                                ui.monospace(text);
+                            });
+                    }
                 });
-            } else if let Some(ref text) = self.preview_text {
-                ScrollArea::vertical()
-                    .id_salt("preview_scroll")
-                    .show(ui, |ui| {
-                        ui.monospace(text);
-                    });
-            }
         });
 
         // ── Bottom: status bar ──
