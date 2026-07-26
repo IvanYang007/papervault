@@ -716,7 +716,7 @@ impl PapervaultApp {
         match_terms: &[String],
     ) {
         if match_terms.is_empty() {
-            ui.label(RichText::new(snippet).color(Color32::GRAY));
+            ui.label(RichText::new(snippet).size(14.0).color(Color32::GRAY));
             return;
         }
 
@@ -738,7 +738,7 @@ impl PapervaultApp {
         }
 
         if spans.is_empty() {
-            ui.label(RichText::new(snippet).color(Color32::GRAY));
+            ui.label(RichText::new(snippet).size(14.0).color(Color32::GRAY));
             return;
         }
 
@@ -1247,9 +1247,9 @@ impl eframe::App for PapervaultApp {
                 }
             });
             // Sizing constants for search results; row height relates to font sizes.
-            let result_filename_size = 32.0_f32;
-            let tag_label_size = 28.0_f32;
-            let result_row_height = 88.0_f32;
+            let result_filename_size = 14.0_f32;
+            let tag_label_size = 14.0_f32;
+            let result_row_height = 40.0_f32;
 
             // Active tag filter chips
             if !self.active_tag_filters.is_empty() {
