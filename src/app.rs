@@ -921,20 +921,23 @@ impl eframe::App for PapervaultApp {
 
         // Sync auto-tag progress from the shared counter
         if let Some(ref rt) = self.folder_runtime {
-            if let Some((_, total)) = self.auto_tag_progress {
+            if let Some((prev_completed, total)) = self.auto_tag_progress {
                 let completed = rt
                     .auto_tag_progress
                     .load(std::sync::atomic::Ordering::Relaxed);
-                if completed >= total {
-                    // Tagging batch complete — refresh UI
-                    self.auto_tag_progress = None;
+                if completed > prev_completed {
+                    // Progress moved — refresh file browser periodically
                     self.file_browser_dirty = true;
-                    if !self.search_query.trim().is_empty() {
-                        self.do_search();
-                    }
-                    self.status_message = format!("Tagging complete — {} files processed", total);
-                } else {
                     self.auto_tag_progress = Some((completed, total));
+                    if completed >= total {
+                        // Batch complete
+                        self.auto_tag_progress = None;
+                        self.status_message =
+                            format!("Tagging complete — {} files processed", total);
+                        if !self.search_query.trim().is_empty() {
+                            self.do_search();
+                        }
+                    }
                 }
             }
         }
