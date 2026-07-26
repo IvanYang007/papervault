@@ -706,6 +706,7 @@ impl PapervaultApp {
         self.auto_tag_progress = Some((0, total));
 
         let mut completed = 0usize;
+        let mut queued = 0usize;
         for file_path in &files {
             let path = std::path::Path::new(file_path);
             if !path.exists() {
@@ -762,13 +763,32 @@ impl PapervaultApp {
                 None,
             );
 
-            let _ = tx.send(AutoTagRequest::TagDocument {
+            match tx.try_send(AutoTagRequest::TagDocument {
                 content_hash: doc.content_hash.clone(),
                 filename: file_name.to_string(),
                 text: content,
                 content_hash_before_tag,
-            });
+            }) {
+                Ok(()) => {}
+                Err(crossbeam::channel::TrySendError::Full(_)) => {
+                    tracing::warn!(
+                        "Auto-tagger queue full, stopping batch at {}/{}",
+                        completed,
+                        total
+                    );
+                    self.status_message = format!(
+                        "Queue full — tagged {}/{} files (retry when current batch completes)",
+                        queued, total
+                    );
+                    break;
+                }
+                Err(crossbeam::channel::TrySendError::Disconnected(_)) => {
+                    tracing::warn!("Auto-tagger disconnected");
+                    break;
+                }
+            }
 
+            queued += 1;
             completed += 1;
             self.auto_tag_progress = Some((completed, total));
         }
