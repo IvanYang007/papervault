@@ -107,6 +107,10 @@ mod tests {
             .filter(LowerCaser)
             .build();
         index.tokenizers().register("body", tokenizer);
+        let cjk = TextAnalyzer::builder(NgramTokenizer::new(1, 2, false).unwrap())
+            .filter(LowerCaser)
+            .build();
+        index.tokenizers().register("cjk_bigram", cjk);
 
         let mut writer = index.writer(50_000_000).unwrap();
         writer
@@ -115,6 +119,7 @@ mod tests {
                 fields.file_path => "/test/doc.pdf",
                 fields.file_name => "doc.pdf",
                 fields.body => "hello world invoice march",
+            fields.body_cjk => "hello world invoice march",
                 fields.file_type => "pdf",
                 fields.modified_ts => 1700000000i64,
                 fields.content_hash => "hash1",
@@ -155,6 +160,10 @@ mod tests {
             .filter(LowerCaser)
             .build();
         index.tokenizers().register("body", tokenizer);
+        let cjk = TextAnalyzer::builder(NgramTokenizer::new(1, 2, false).unwrap())
+            .filter(LowerCaser)
+            .build();
+        index.tokenizers().register("cjk_bigram", cjk);
 
         let mut writer = index.writer(50_000_000).unwrap();
         writer
@@ -163,6 +172,8 @@ mod tests {
                 fields.file_path => "/test/doc.pdf",
                 fields.file_name => "doc.pdf",
                 fields.body => "hello world",
+                fields.body_cjk => "hello world",
+            fields.body_cjk => "hello world",
                 fields.file_type => "pdf",
                 fields.modified_ts => 1700000000i64,
                 fields.content_hash => "hash1",

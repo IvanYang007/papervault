@@ -1,12 +1,48 @@
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use crossbeam::channel::Receiver;
 use tracing::{debug, error, info, warn};
 
 use super::provider::TagProvider;
 use crate::tags::store::TagStore;
+
+/// Simple sliding-window rate limiter (30 requests/minute).
+struct RateLimiter {
+    timestamps: Vec<Instant>,
+}
+
+impl RateLimiter {
+    fn new() -> Self {
+        Self {
+            timestamps: Vec::with_capacity(32),
+        }
+    }
+
+    /// Wait until a rate-limit slot is available, then record this request.
+    /// Compute how long to wait before a rate-limit slot opens (0 if available).
+    /// Caller must sleep this duration OUTSIDE the Mutex lock.
+    fn wait_duration(&mut self) -> Duration {
+        let now = Instant::now();
+        let window = Duration::from_secs(60);
+        let max_requests = 30usize;
+
+        self.timestamps.retain(|t| now - *t < window);
+
+        if self.timestamps.len() >= max_requests {
+            let oldest = self.timestamps[0];
+            let wait = window.saturating_sub(now - oldest);
+            if !wait.is_zero() {
+                return wait;
+            }
+            let now = Instant::now();
+            self.timestamps.retain(|t| now - *t < window);
+        }
+        self.timestamps.push(Instant::now());
+        Duration::ZERO
+    }
+}
 
 fn is_combining_mark(c: char) -> bool {
     matches!(
@@ -161,6 +197,7 @@ pub fn run_auto_tagger(
     progress: Option<Arc<AtomicUsize>>,
 ) {
     info!("AutoTagger thread started");
+    let rate_limiter = Arc::new(Mutex::new(RateLimiter::new()));
     // Process any pending documents from DB (recovery after crash or channel drops)
     if let Ok(pending) = tag_store.pending_auto_tags(100) {
         for p in pending {
@@ -176,6 +213,7 @@ pub fn run_auto_tagger(
                 provider.as_ref(),
                 &auto_tag_config,
                 progress.as_deref(),
+                Some(&rate_limiter),
             );
         }
     }
@@ -191,12 +229,33 @@ pub fn run_auto_tagger(
                     provider.as_ref(),
                     &auto_tag_config,
                     progress.as_deref(),
+                    Some(&rate_limiter),
                 );
                 if is_shutdown {
                     break;
                 }
             }
-            Err(crossbeam::channel::RecvTimeoutError::Timeout) => continue,
+            Err(crossbeam::channel::RecvTimeoutError::Timeout) => {
+                // No channel message — poll DB for stranded pending entries
+                if let Ok(pending) = tag_store.pending_auto_tags(1) {
+                    for p in pending {
+                        if shutdown_flag.load(Ordering::Acquire) {
+                            break;
+                        }
+                        tag_document(
+                            &p.content_hash,
+                            &p.filename,
+                            "",
+                            &p.content_hash_before_tag,
+                            &tag_store,
+                            provider.as_ref(),
+                            &auto_tag_config,
+                            progress.as_deref(),
+                            Some(&rate_limiter),
+                        );
+                    }
+                }
+            }
             Err(crossbeam::channel::RecvTimeoutError::Disconnected) => {
                 info!("AutoTagger channel disconnected, shutting down");
                 break;
@@ -212,6 +271,7 @@ fn process_request(
     provider: &dyn TagProvider,
     config: &crate::auto_tagger::config::AutoTagConfig,
     progress: Option<&std::sync::atomic::AtomicUsize>,
+    rate_limiter: Option<&Arc<Mutex<RateLimiter>>>,
 ) -> bool {
     match request {
         crate::app::AutoTagRequest::TagDocument {
@@ -229,6 +289,7 @@ fn process_request(
                 provider,
                 config,
                 progress,
+                rate_limiter,
             );
             false
         }
@@ -249,6 +310,7 @@ fn tag_document(
     provider: &dyn TagProvider,
     config: &crate::auto_tagger::config::AutoTagConfig,
     progress: Option<&std::sync::atomic::AtomicUsize>,
+    rate_limiter: Option<&Arc<Mutex<RateLimiter>>>,
 ) {
     if !config.enabled {
         debug!("auto-tagger disabled, skipping {filename}");
@@ -318,6 +380,16 @@ fn tag_document(
 
     let mut last_error = String::new();
     for attempt in 0..config.max_retries {
+        // Rate-limit API calls (shared across all auto-tagger threads).
+        // Sleep outside the Mutex lock so other workers can acquire slots.
+        if let Some(limiter) = rate_limiter {
+            let wait = {
+                limiter.lock().unwrap_or_else(|e| e.into_inner()).wait_duration()
+            };
+            if !wait.is_zero() {
+                std::thread::sleep(wait);
+            }
+        }
         match provider.generate_tags(filename, text, &existing_tags) {
             Ok(response) => {
                 let mut entities = response.entities;
@@ -534,7 +606,31 @@ mod tests {
             &provider,
             &config,
             None,
+            None,
         );
         assert!(result, "Shutdown request should return true");
+    }
+
+    #[test]
+    fn rate_limiter_allows_under_limit() {
+        let mut rl = RateLimiter::new();
+        // 10 acquires at well under 30/min should complete instantly
+        for _ in 0..10 {
+            let wait = rl.wait_duration();
+            assert_eq!(wait, std::time::Duration::ZERO, "Under limit should not wait");
+        }
+    }
+
+    #[test]
+    fn rate_limiter_blocks_when_full() {
+        let mut rl = RateLimiter::new();
+        // Fill to 30 (the limit)
+        for _ in 0..30 {
+            let wait = rl.wait_duration();
+            assert_eq!(wait, std::time::Duration::ZERO, "First 30 should not wait");
+        }
+        // The 31st should require a wait
+        let wait = rl.wait_duration();
+        assert!(wait > std::time::Duration::ZERO, "31st request should be delayed");
     }
 }

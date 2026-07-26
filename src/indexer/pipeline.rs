@@ -26,6 +26,9 @@ pub struct Pipeline {
     commit_batch_size: usize,
     /// Shared shutdown flag — checked during initial scan to allow fast close.
     shutdown: Arc<AtomicBool>,
+    /// True when the index was rebuilt (e.g., schema version change).
+    /// When set, the metadata fast-path is bypassed so all files are re-indexed.
+    needs_full_rescan: bool,
 }
 
 impl Pipeline {
@@ -51,6 +54,7 @@ impl Pipeline {
             pending_count: 0,
             commit_batch_size: 10,
             shutdown,
+            needs_full_rescan: false,
         }
     }
 
@@ -80,6 +84,26 @@ impl Pipeline {
                 doc_count
             );
         } else {
+            // Detect index rebuild: Tantivy empty but SQLite has documents.
+            // This happens after schema version changes or index corruption recovery.
+            // When true, the metadata fast-path is bypassed so all files are re-indexed
+            // into the fresh Tantivy index while preserving SQLite tag data.
+            let sqlite_has_docs = self
+                .tag_store
+                .with_conn(|conn| {
+                    conn.query_row("SELECT COUNT(*) FROM documents", [], |r| {
+                        r.get::<_, i64>(0)
+                    })
+                })
+                .unwrap_or(0)
+                > 0;
+            if sqlite_has_docs {
+                info!(
+                    "Index is empty but SQLite has documents — index was rebuilt. Performing full rescan."
+                );
+                self.needs_full_rescan = true;
+            }
+
             info!("Running initial file scan...");
             let (scan_tx, scan_rx) = crossbeam::channel::bounded::<IndexerMessage>(256);
             let folder = self.watcher_folder.clone();
@@ -135,7 +159,7 @@ impl Pipeline {
                 self.pending_count = 0;
             }
         }
-        let _ = self.progress_tx.send(IndexerProgress::ScanComplete {
+        let _ = self.progress_tx.try_send(IndexerProgress::ScanComplete {
             total: scan_processed,
         });
         if scan_processed > 0 {
@@ -161,13 +185,13 @@ impl Pipeline {
                             Ok(()) => {
                                 total_processed += 1;
                                 self.pending_count += 1;
-                                let _ = self.progress_tx.send(IndexerProgress::Progress {
+                                let _ = self.progress_tx.try_send(IndexerProgress::Progress {
                                     processed: total_processed,
                                 });
                             }
                             Err(e) => {
                                 error!("Pipeline error for {}: {}", path.display(), e);
-                                let _ = self.progress_tx.send(IndexerProgress::Error {
+                                let _ = self.progress_tx.try_send(IndexerProgress::Error {
                                     path: path.clone(),
                                     error: e.to_string(),
                                 });
@@ -222,7 +246,7 @@ impl Pipeline {
             info!("Pipeline shutting down (no pending documents)");
         }
 
-        let _ = self.progress_tx.send(IndexerProgress::ScanComplete {
+        let _ = self.progress_tx.try_send(IndexerProgress::ScanComplete {
             total: total_processed,
         });
         info!("Pipeline stopped");
@@ -246,20 +270,57 @@ impl Pipeline {
 
     fn process_batch(&mut self, batch: &[(PathBuf, u64, u64)], offset: usize) -> usize {
         use rayon::prelude::*;
+        use std::panic::{catch_unwind, AssertUnwindSafe};
 
-        // Phase 1: Extract text in parallel (each thread creates its own extractors)
-        let results: Vec<_> = batch
-            .par_iter()
-            .map(|(path, mtime, size)| {
-                let stages = crate::indexer::stages::create_extractor_chain();
-                let extracted = match crate::indexer::stages::run_chain(path, &stages) {
-                    Ok(Some(content)) => Some(content),
-                    Ok(None) => None,
-                    Err(_) => None,
-                };
-                (path, *mtime, *size, extracted)
-            })
-            .collect();
+        // Cap parallelism to physical cores — avoids L3 cache thrashing
+        // on hyperthreaded CPUs during memory-bandwidth-heavy PDF extraction.
+        let thread_pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(num_cpus::get_physical())
+            .build()
+            .unwrap_or_else(|_| {
+                tracing::warn!("Failed to build custom thread pool — falling back to global");
+                rayon::ThreadPoolBuilder::new()
+                    .build()
+                    .unwrap_or_else(|_| rayon::ThreadPoolBuilder::new().num_threads(1).build()
+                        .expect("rayon global pool unavailable"))
+            });
+
+        // Phase 1: Extract text in parallel with per-file panic isolation.
+        // One malformed PDF must not abort the entire batch.
+        let results: Vec<_> = thread_pool.install(|| {
+            batch
+                .par_iter()
+                .map(|(path, mtime, size)| {
+                    let result = catch_unwind(AssertUnwindSafe(|| {
+                        let stages = crate::indexer::stages::create_extractor_chain();
+                        match crate::indexer::stages::run_chain(path, &stages) {
+                            Ok(Some(content)) => Some(content),
+                            Ok(None) => None,
+                            Err(_) => None,
+                        }
+                    }));
+                    let extracted = match result {
+                        Ok(content) => content,
+                        Err(panic_info) => {
+                            let msg = if let Some(s) = panic_info.downcast_ref::<String>() {
+                                s.clone()
+                            } else if let Some(s) = panic_info.downcast_ref::<&str>() {
+                                s.to_string()
+                            } else {
+                                "unknown panic".to_string()
+                            };
+                            tracing::warn!(
+                                "Extraction panicked for {}: {} — skipping",
+                                path.display(),
+                                msg
+                            );
+                            None
+                        }
+                    };
+                    (path, *mtime, *size, extracted)
+                })
+                .collect()
+        });
 
         // Phase 2: Index sequentially (Tantivy is single-writer, SQLite under Mutex)
         let mut processed = 0usize;
@@ -290,12 +351,31 @@ impl Pipeline {
                 .to_lowercase();
             let content_hash = compute_content_hash(&extracted.text, &file_type);
 
-            // Clean up old entries before inserting new ones
-            let old_hash_to_delete = self
+            // Fetch tags from the OLD hash before potentially deleting it.
+            // If the content hash changed (e.g., extraction library differs),
+            // we migrate the old tags to the new hash.
+            let old_hash = self
                 .tag_store
                 .get_hash_by_path(&path_str)
                 .ok()
-                .flatten()
+                .flatten();
+            let migrated_tags: Vec<String> = if let Some(ref old_h) = old_hash {
+                if old_h.as_str() != content_hash {
+                    self.tag_store
+                        .get_tags_for_document(old_h)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|t| t.name)
+                        .collect()
+                } else {
+                    Vec::new()
+                }
+            } else {
+                Vec::new()
+            };
+
+            // Clean up old entries before inserting new ones
+            let old_hash_to_delete = old_hash
                 .filter(|old| old.as_str() != content_hash);
             if old_hash_to_delete.is_some() {
                 let _ = self.tag_store.delete_document_by_path(&path_str);
@@ -308,13 +388,17 @@ impl Pipeline {
                 .to_string();
             let doc_id = format!("{}{}", content_hash, file_type);
             let modified_ts = *mtime as i64;
-            let tags = self
-                .tag_store
-                .get_tags_for_document(&content_hash)
-                .unwrap_or_default()
-                .into_iter()
-                .map(|t| t.name)
-                .collect::<Vec<String>>();
+            // Use migrated tags when content hash changed, otherwise look up by new hash
+            let tags = if !migrated_tags.is_empty() {
+                migrated_tags.clone()
+            } else {
+                self.tag_store
+                    .get_tags_for_document(&content_hash)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|t| t.name)
+                    .collect::<Vec<String>>()
+            };
 
             if let Err(e) = self.tag_store.upsert_document(
                 &content_hash,
@@ -325,6 +409,20 @@ impl Pipeline {
             ) {
                 error!("Batch upsert error for {}: {}", path_str, e);
                 continue;
+            }
+
+            // Re-assign migrated tags to the new content hash in SQLite
+            if !migrated_tags.is_empty() {
+                for tag_name in &migrated_tags {
+                    // Create tag if it doesn't exist, then assign
+                    if let Ok(tag) = self.tag_store.create_tag(tag_name) {
+                        let _ = self.tag_store.assign_tag(&content_hash, tag.id);
+                    } else if let Ok(tags) = self.tag_store.list_tags() {
+                        if let Some(existing) = tags.iter().find(|t| t.name == *tag_name) {
+                            let _ = self.tag_store.assign_tag(&content_hash, existing.id);
+                        }
+                    }
+                }
             }
 
             // Single lock scope: delete old + index new (avoids double Mutex acquire)
@@ -348,37 +446,54 @@ impl Pipeline {
                 }
             }
 
-            // Trigger auto-tagging (same as process_upsert path)
+            // Trigger auto-tagging (same as process_upsert path).
+            // Only write "pending" if NOT already tagged with the same content.
             {
                 let content_hash_before_tag = compute_content_hash(&file_name, &extracted.text);
-                if let Err(e) = self.tag_store.upsert_auto_tag_status(
-                    &content_hash,
-                    &file_name,
-                    &content_hash_before_tag,
-                    "pending",
-                    None,
-                    None,
-                ) {
-                    tracing::warn!(
-                        "failed to write pending auto-tag status for {}: {}",
-                        content_hash,
-                        e
+                let already_tagged = self
+                    .tag_store
+                    .auto_tag_status(&content_hash)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|s| {
+                        s.status == "tagged"
+                            && s.content_hash_before_tag == content_hash_before_tag
+                    });
+                if !already_tagged {
+                    if let Err(e) = self.tag_store.upsert_auto_tag_status(
+                        &content_hash,
+                        &file_name,
+                        &content_hash_before_tag,
+                        "pending",
+                        None,
+                        None,
+                    ) {
+                        tracing::warn!(
+                            "failed to write pending auto-tag status for {}: {}",
+                            content_hash,
+                            e
+                        );
+                    }
+                    if let Some(ref tx) = self.auto_tagger_tx {
+                        let request = AutoTagRequest::TagDocument {
+                            content_hash: content_hash.clone(),
+                            filename: file_name.clone(),
+                            text: extracted.text.clone(),
+                            content_hash_before_tag,
+                        };
+                        let _ = tx.try_send(request);
+                    }
+                } else {
+                    debug!(
+                        "Auto-tag: {} already tagged — skipping",
+                        file_name
                     );
-                }
-                if let Some(ref tx) = self.auto_tagger_tx {
-                    let request = AutoTagRequest::TagDocument {
-                        content_hash: content_hash.clone(),
-                        filename: file_name.clone(),
-                        text: extracted.text.clone(),
-                        content_hash_before_tag,
-                    };
-                    let _ = tx.try_send(request);
                 }
             }
 
             processed += 1;
             self.pending_count += 1;
-            let _ = self.progress_tx.send(IndexerProgress::Progress {
+            let _ = self.progress_tx.try_send(IndexerProgress::Progress {
                 processed: offset + processed,
             });
         }
@@ -403,10 +518,12 @@ impl Pipeline {
     ) -> anyhow::Result<()> {
         let path_str = path.display().to_string();
 
-        // Fast-path: check metadata in SQLite
-        if self
-            .tag_store
-            .already_indexed_by_metadata(&path_str, size, mtime)?
+        // Fast-path: check metadata in SQLite.
+        // Skipped when needs_full_rescan is set (index was rebuilt).
+        if !self.needs_full_rescan
+            && self
+                .tag_store
+                .already_indexed_by_metadata(&path_str, size, mtime)?
         {
             debug!("Skipping {} (unchanged metadata)", path_str);
             return Ok(());
@@ -456,11 +573,29 @@ impl Pipeline {
         // If the file's content changed, the old content_hash differs from the
         // new one. Both SQLite (PK=content_hash) and Tantivy (stored by hash)
         // would accumulate duplicate entries without this cleanup.
-        let old_hash_to_delete = self
+        let old_hash = self
             .tag_store
             .get_hash_by_path(&path_str)
             .ok()
-            .flatten()
+            .flatten();
+
+        // Fetch tags from the OLD hash before potentially deleting it
+        let migrated_tags: Vec<String> = if let Some(ref old_h) = old_hash {
+            if old_h.as_str() != content_hash {
+                self.tag_store
+                    .get_tags_for_document(old_h)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|t| t.name)
+                    .collect()
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
+
+        let old_hash_to_delete = old_hash
             .filter(|old| old.as_str() != content_hash);
         if old_hash_to_delete.is_some() {
             if let Err(e) = self.tag_store.delete_document_by_path(&path_str) {
@@ -471,14 +606,17 @@ impl Pipeline {
         let doc_id = format!("{}{}", content_hash, file_type);
         let modified_ts = mtime as i64;
 
-        // Get tags from TagStore (if any — will be empty for new docs)
-        let tags = self
-            .tag_store
-            .get_tags_for_document(&content_hash)
-            .unwrap_or_default()
-            .into_iter()
-            .map(|t| t.name)
-            .collect::<Vec<String>>();
+        // Use migrated tags when content hash changed, otherwise look up by new hash
+        let tags = if !migrated_tags.is_empty() {
+            migrated_tags.clone()
+        } else {
+            self.tag_store
+                .get_tags_for_document(&content_hash)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|t| t.name)
+                .collect::<Vec<String>>()
+        };
 
         // Write SQLite FIRST, then Tantivy.
         // If crash between writes: SQLite has doc, Tantivy doesn't. The
@@ -493,6 +631,19 @@ impl Pipeline {
             size as i64,
             modified_ts,
         )?;
+
+        // Re-assign migrated tags to the new content hash in SQLite
+        if !migrated_tags.is_empty() {
+            for tag_name in &migrated_tags {
+                if let Ok(tag) = self.tag_store.create_tag(tag_name) {
+                    let _ = self.tag_store.assign_tag(&content_hash, tag.id);
+                } else if let Ok(tags) = self.tag_store.list_tags() {
+                    if let Some(existing) = tags.iter().find(|t| t.name == *tag_name) {
+                        let _ = self.tag_store.assign_tag(&content_hash, existing.id);
+                    }
+                }
+            }
+        }
 
         // Single lock scope: delete old + index new (avoids double Mutex acquire)
         {
@@ -514,34 +665,45 @@ impl Pipeline {
             )?;
         }
 
-        // Persist auto-tag request to DB after successful indexing
-        // (replaces the old channel-based queue that silently dropped documents)
+        // Persist auto-tag request to DB after successful indexing.
+        // Only write "pending" if NOT already tagged with the same content.
         {
             let content_hash_before_tag = compute_content_hash(&file_name, extracted_text);
-            if let Err(e) = self.tag_store.upsert_auto_tag_status(
-                &content_hash,
-                &file_name,
-                &content_hash_before_tag,
-                "pending",
-                None,
-                None,
-            ) {
-                tracing::warn!(
-                    "failed to write pending auto-tag status for {}: {}",
-                    content_hash,
-                    e
-                );
-            }
+            let already_tagged = self
+                .tag_store
+                .auto_tag_status(&content_hash)
+                .ok()
+                .flatten()
+                .is_some_and(|s| {
+                    s.status == "tagged"
+                        && s.content_hash_before_tag == content_hash_before_tag
+                });
+            if !already_tagged {
+                if let Err(e) = self.tag_store.upsert_auto_tag_status(
+                    &content_hash,
+                    &file_name,
+                    &content_hash_before_tag,
+                    "pending",
+                    None,
+                    None,
+                ) {
+                    tracing::warn!(
+                        "failed to write pending auto-tag status for {}: {}",
+                        content_hash,
+                        e
+                    );
+                }
 
-            // Wake the auto-tagger via a lightweight channel notification
-            if let Some(ref tx) = self.auto_tagger_tx {
-                let request = AutoTagRequest::TagDocument {
-                    content_hash: content_hash.clone(),
-                    filename: file_name.clone(),
-                    text: extracted_text.to_string(),
-                    content_hash_before_tag,
-                };
-                let _ = tx.try_send(request);
+                // Wake the auto-tagger via a lightweight channel notification
+                if let Some(ref tx) = self.auto_tagger_tx {
+                    let request = AutoTagRequest::TagDocument {
+                        content_hash: content_hash.clone(),
+                        filename: file_name.clone(),
+                        text: extracted_text.to_string(),
+                        content_hash_before_tag,
+                    };
+                    let _ = tx.try_send(request);
+                }
             }
         }
 
@@ -613,6 +775,7 @@ pub fn reconcile(engine: Arc<std::sync::Mutex<SearchEngine>>, tag_store: &TagSto
     let eng = engine.lock().unwrap_or_else(|e| e.into_inner());
     let searcher = eng.reader.searcher();
     let mut backfill_count: usize = 0;
+    let mut ghost_hashes: Vec<String> = Vec::new();
 
     for (segment_ord, segment_reader) in searcher.segment_readers().iter().enumerate() {
         for doc_id in 0u32..segment_reader.max_doc() {
@@ -642,8 +805,9 @@ pub fn reconcile(engine: Arc<std::sync::Mutex<SearchEngine>>, tag_store: &TagSto
                 continue;
             }
 
-            // Check if file still exists on disk
+            // Ghost sweep: collect hashes for files that no longer exist on disk
             if !file_path.is_empty() && !std::path::Path::new(file_path).exists() {
+                ghost_hashes.push(content_hash.to_string());
                 continue;
             }
 
@@ -682,6 +846,34 @@ pub fn reconcile(engine: Arc<std::sync::Mutex<SearchEngine>>, tag_store: &TagSto
             "Reconciliation backfilled {} documents to SQLite (Tantivy→SQLite).",
             backfill_count
         );
+    }
+
+    // Ghost sweep: delete Tantivy documents whose files no longer exist on disk
+    if !ghost_hashes.is_empty() {
+        info!(
+            "Ghost sweep: removing {} documents whose files no longer exist on disk",
+            ghost_hashes.len()
+        );
+        // Drop the searcher's read lock before acquiring write lock
+        drop(searcher);
+        drop(eng);
+        {
+            let mut eng = engine.lock().unwrap_or_else(|e| e.into_inner());
+            for hash in &ghost_hashes {
+                if let Err(e) = eng.delete_by_hash(hash) {
+                    warn!("Ghost sweep delete failed for {}: {}", hash, e);
+                }
+            }
+            if let Err(e) = eng.commit() {
+                warn!("Ghost sweep commit failed: {}", e);
+            }
+        }
+        // Also clean up SQLite entries
+        for hash in &ghost_hashes {
+            if let Err(e) = tag_store.delete_document_by_hash(hash) {
+                warn!("Ghost sweep SQLite delete failed for {}: {}", hash, e);
+            }
+        }
     }
 
     info!("Reconciliation complete");
@@ -853,6 +1045,10 @@ mod tests {
         .filter(tantivy::tokenizer::LowerCaser)
         .build();
         index.tokenizers().register("body", tokenizer);
+        let cjk = tantivy::tokenizer::TextAnalyzer::builder(tantivy::tokenizer::NgramTokenizer::new(1, 2, false).unwrap())
+            .filter(tantivy::tokenizer::LowerCaser)
+            .build();
+        index.tokenizers().register("cjk_bigram", cjk);
         let writer = index.writer(50_000_000).unwrap();
         let reader = index
             .reader_builder()
@@ -947,6 +1143,10 @@ mod tests {
         .filter(tantivy::tokenizer::LowerCaser)
         .build();
         index.tokenizers().register("body", tokenizer);
+        let cjk = tantivy::tokenizer::TextAnalyzer::builder(tantivy::tokenizer::NgramTokenizer::new(1, 2, false).unwrap())
+            .filter(tantivy::tokenizer::LowerCaser)
+            .build();
+        index.tokenizers().register("cjk_bigram", cjk);
         let writer = index.writer(50_000_000).unwrap();
         let reader = index
             .reader_builder()
@@ -1047,6 +1247,10 @@ mod tests {
         .filter(tantivy::tokenizer::LowerCaser)
         .build();
         index.tokenizers().register("body", tokenizer);
+        let cjk = tantivy::tokenizer::TextAnalyzer::builder(tantivy::tokenizer::NgramTokenizer::new(1, 2, false).unwrap())
+            .filter(tantivy::tokenizer::LowerCaser)
+            .build();
+        index.tokenizers().register("cjk_bigram", cjk);
         let writer = index.writer(50_000_000).unwrap();
         let reader = index
             .reader_builder()
@@ -1124,6 +1328,10 @@ mod tests {
         .filter(tantivy::tokenizer::LowerCaser)
         .build();
         index.tokenizers().register("body", tokenizer);
+        let cjk = tantivy::tokenizer::TextAnalyzer::builder(tantivy::tokenizer::NgramTokenizer::new(1, 2, false).unwrap())
+            .filter(tantivy::tokenizer::LowerCaser)
+            .build();
+        index.tokenizers().register("cjk_bigram", cjk);
         let writer = index.writer(50_000_000).unwrap();
         let reader = index
             .reader_builder()

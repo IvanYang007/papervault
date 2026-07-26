@@ -279,13 +279,27 @@ impl PapervaultApp {
                 // Replace channels with ones from the new runtime
                 self.indexer_progress_rx = runtime.progress_rx.clone();
                 self.tag_update_tx = runtime.tag_tx.clone();
-                self.render_request_tx = Some(runtime.render_tx.clone());
+                self.render_request_tx = runtime.render_tx.clone();
                 self.render_result_rx = Some(runtime.render_result_rx.clone());
                 self.watcher_shutdown_flag = Some(runtime.watcher_shutdown());
                 self.watcher_shutdown_tx = runtime.watcher_shutdown_tx();
                 self.auto_tagger_tx = runtime.auto_tagger_tx.clone();
                 self.folder_runtime = Some(runtime);
                 self.status_message = format!("Watching: {}", folder.display());
+
+                // Show auto-tag progress if there are pending entries
+                if let Some(ref store) = self.tag_store {
+                    let pending = store
+                        .auto_tag_status_count("pending")
+                        .unwrap_or(0);
+                    let completed = store
+                        .auto_tag_status_count("tagged")
+                        .unwrap_or(0);
+                    let total = pending + completed;
+                    if total > 0 {
+                        self.auto_tag_progress = Some((completed, total));
+                    }
+                }
             }
             Err(e) => {
                 self.status_message = format!("Failed to start indexing: {}", e);
@@ -999,7 +1013,7 @@ impl eframe::App for PapervaultApp {
                                 hasher.update(b"reindex");
                                 hasher.finalize().to_hex().to_string()
                             };
-                            let _ = tx.send(AutoTagRequest::TagDocument {
+                            let _ = tx.try_send(AutoTagRequest::TagDocument {
                                 content_hash: doc.content_hash.clone(),
                                 filename: file_name,
                                 text: "[Document text could not be extracted. Use filename to determine topic.]".to_string(),
@@ -1022,7 +1036,7 @@ impl eframe::App for PapervaultApp {
                     self.search_engine = Some(new_rt.search_engine.clone());
                     self.indexer_progress_rx = new_rt.progress_rx.clone();
                     self.tag_update_tx = new_rt.tag_tx.clone();
-                    self.render_request_tx = Some(new_rt.render_tx.clone());
+                    self.render_request_tx = new_rt.render_tx.clone();
                     self.render_result_rx = Some(new_rt.render_result_rx.clone());
                     self.watcher_shutdown_flag = Some(new_rt.watcher_shutdown());
                     self.watcher_shutdown_tx = new_rt.watcher_shutdown_tx();

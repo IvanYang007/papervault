@@ -9,7 +9,7 @@ use tantivy::{
 };
 
 use super::query::{SearchRequest, SearchResult, SearchResults};
-use super::schema::{build_schema, SchemaFields};
+use super::schema::{build_schema, SchemaFields, SCHEMA_VERSION};
 use crate::error::Result;
 
 /// Manages the Tantivy search index lifecycle.
@@ -35,36 +35,79 @@ impl SearchEngine {
             std::fs::create_dir_all(&index_dir)?;
         }
 
-        let schema = build_schema();
-        let fields = SchemaFields::from_schema(&schema);
+        // Tantivy's own meta.json signals an existing index
+        let (schema, fields, index) = if index_dir.join("meta.json").exists() {
+            // Check our schema version before opening (separate file from Tantivy's meta.json)
+            let version_path = index_dir.join("papervault_schema.json");
+            let version_ok = std::fs::read_to_string(&version_path)
+                .ok()
+                .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                .and_then(|v| v.get("schema_version")?.as_u64())
+                .map(|v| v as u32 == SCHEMA_VERSION)
+                .unwrap_or(false);
 
-        let index = if index_dir.join("meta.json").exists() {
-            match Index::open_in_dir(&index_dir) {
-                Ok(index) => index,
-                Err(e) => {
-                    // Index is corrupted — remove it and recreate.
-                    // On Windows, MmapDirectory must be fully dropped before
-                    // remove_dir_all can succeed (file handle release).
-                    tracing::warn!(
-                        "Failed to open existing index (likely corrupted): {}. Recreating.",
-                        e
-                    );
-                    std::fs::remove_dir_all(&index_dir).unwrap_or_else(|e| {
-                        tracing::error!("Failed to remove corrupted index: {}", e)
-                    });
-                    std::fs::create_dir_all(&index_dir)?;
-                    Index::create_in_dir(&index_dir, schema.clone())?
+            if !version_ok {
+                tracing::info!(
+                    "Schema version changed — rebuilding index (current: {})",
+                    SCHEMA_VERSION
+                );
+                std::fs::remove_dir_all(&index_dir).unwrap_or_else(|e| {
+                    tracing::error!("Failed to remove old index: {}", e)
+                });
+                std::fs::create_dir_all(&index_dir)?;
+                let schema = build_schema();
+                let fields = SchemaFields::from_schema(&schema);
+                let index = Index::create_in_dir(&index_dir, schema.clone())?;
+                (schema, fields, index)
+            } else {
+                match Index::open_in_dir(&index_dir) {
+                    Ok(index) => {
+                        let schema = index.schema();
+                        let fields = SchemaFields::from_schema(&schema);
+                        (schema, fields, index)
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "Failed to open existing index (likely corrupted): {}. Recreating.",
+                            e
+                        );
+                        std::fs::remove_dir_all(&index_dir).unwrap_or_else(|e| {
+                            tracing::error!("Failed to remove corrupted index: {}", e)
+                        });
+                        std::fs::create_dir_all(&index_dir)?;
+                        let schema = build_schema();
+                        let fields = SchemaFields::from_schema(&schema);
+                        let index = Index::create_in_dir(&index_dir, schema.clone())?;
+                        (schema, fields, index)
+                    }
                 }
             }
         } else {
-            Index::create_in_dir(&index_dir, schema.clone())?
+            let schema = build_schema();
+            let fields = SchemaFields::from_schema(&schema);
+            let index = Index::create_in_dir(&index_dir, schema.clone())?;
+            (schema, fields, index)
         };
+
+        // Write/update schema version stamp (separate file from Tantivy's meta.json)
+        let version_json = serde_json::json!({"schema_version": SCHEMA_VERSION});
+        std::fs::write(
+            index_dir.join("papervault_schema.json"),
+            serde_json::to_string_pretty(&version_json).unwrap_or_default(),
+        )
+        .unwrap_or_else(|e| tracing::warn!("Failed to write schema version stamp: {}", e));
 
         // Register tokenizer under the field name — Tantivy TEXT fields look up by field name
         let tokenizer = TextAnalyzer::builder(SimpleTokenizer::default())
             .filter(LowerCaser)
             .build();
         index.tokenizers().register("body", tokenizer);
+
+        // CJK bigram tokenizer for Chinese/Japanese/Korean substring search
+        let cjk = TextAnalyzer::builder(NgramTokenizer::new(1, 2, false)?)
+            .filter(LowerCaser)
+            .build();
+        index.tokenizers().register("cjk_bigram", cjk);
 
         let tag_tokenizer = TextAnalyzer::builder(SimpleTokenizer::default())
             .filter(LowerCaser)
@@ -166,6 +209,7 @@ impl SearchEngine {
             self.fields.file_path => file_path.display().to_string(),
             self.fields.file_name => file_name,
             self.fields.body => body,
+            self.fields.body_cjk => body,
             self.fields.file_type => file_type,
             self.fields.modified_ts => modified_ts,
             self.fields.content_hash => content_hash,
@@ -235,8 +279,8 @@ pub fn search_with_reader(
 
     for term in &terms {
         let lower = term.to_lowercase();
-        // Each term matches tags OR file_name OR body (tags first = higher BM25 weight)
-        let mut term_subqueries: Vec<(Occur, Box<dyn Query>)> = Vec::with_capacity(3);
+        // Each term matches tags OR file_name OR body OR body_cjk (tags first = higher BM25 weight)
+        let mut term_subqueries: Vec<(Occur, Box<dyn Query>)> = Vec::with_capacity(4);
         let tag_term = Term::from_field_text(fields.tags, &lower);
         term_subqueries.push((
             Occur::Should,
@@ -251,6 +295,11 @@ pub fn search_with_reader(
         term_subqueries.push((
             Occur::Should,
             Box::new(TermQuery::new(body_term, IndexRecordOption::Basic)),
+        ));
+        let cjk_term = Term::from_field_text(fields.body_cjk, &lower);
+        term_subqueries.push((
+            Occur::Should,
+            Box::new(TermQuery::new(cjk_term, IndexRecordOption::Basic)),
         ));
         // Wrap in a BooleanQuery — at least one Should clause must match
         subqueries.push((Occur::Must, Box::new(BooleanQuery::new(term_subqueries))));
@@ -289,6 +338,9 @@ pub fn search_with_reader(
             let body_fuzzy =
                 FuzzyTermQuery::new(Term::from_field_text(fields.body, &lower), 1, true);
             term_fuzzy.push((Occur::Should, Box::new(body_fuzzy)));
+            let cjk_fuzzy =
+                FuzzyTermQuery::new(Term::from_field_text(fields.body_cjk, &lower), 1, true);
+            term_fuzzy.push((Occur::Should, Box::new(cjk_fuzzy)));
             let tag_fuzzy =
                 FuzzyTermQuery::new(Term::from_field_text(fields.tags, &lower), 1, true);
             term_fuzzy.push((Occur::Should, Box::new(tag_fuzzy)));
@@ -405,6 +457,11 @@ mod tests {
             .filter(tantivy::tokenizer::LowerCaser)
             .build();
         index.tokenizers().register("body", tokenizer);
+        let cjk_tokenizer =
+            TextAnalyzer::builder(tantivy::tokenizer::NgramTokenizer::new(1, 2, false).unwrap())
+                .filter(tantivy::tokenizer::LowerCaser)
+                .build();
+        index.tokenizers().register("cjk_bigram", cjk_tokenizer);
 
         let tag_tokenizer = TextAnalyzer::builder(SimpleTokenizer::default())
             .filter(LowerCaser)
@@ -598,6 +655,10 @@ mod tests {
             .filter(tantivy::tokenizer::LowerCaser)
             .build();
         index.tokenizers().register("body", tokenizer);
+        let cjk = TextAnalyzer::builder(tantivy::tokenizer::NgramTokenizer::new(1, 2, false).unwrap())
+            .filter(tantivy::tokenizer::LowerCaser)
+            .build();
+        index.tokenizers().register("cjk_bigram", cjk);
 
         {
             let mut writer = index.writer(50_000_000).unwrap();
@@ -607,6 +668,7 @@ mod tests {
                     fields.file_path => "/test/doc.pdf",
                     fields.file_name => "doc.pdf",
                     fields.body => "persistent document content",
+                fields.body_cjk => "persistent document content",
                     fields.file_type => "pdf",
                     fields.modified_ts => 1700000000i64,
                     fields.content_hash => "hash1",
@@ -651,6 +713,10 @@ mod tests {
             .filter(tantivy::tokenizer::LowerCaser)
             .build();
         index.tokenizers().register("body", tokenizer);
+        let cjk = TextAnalyzer::builder(tantivy::tokenizer::NgramTokenizer::new(1, 2, false).unwrap())
+            .filter(tantivy::tokenizer::LowerCaser)
+            .build();
+        index.tokenizers().register("cjk_bigram", cjk);
 
         let mut writer = index.writer(50_000_000).unwrap();
 
@@ -662,7 +728,8 @@ mod tests {
                     fields.doc_id => format!("hash{}pdf", i),
                     fields.file_path => format!("/test/doc{}.pdf", i),
                     fields.file_name => format!("doc{}.pdf", i),
-                    fields.body => body,
+                    fields.body => body.clone(),
+                fields.body_cjk => body,
                     fields.file_type => "pdf",
                     fields.modified_ts => (1700000000i64 + i as i64),
                     fields.content_hash => format!("hash{}", i),
@@ -790,5 +857,149 @@ mod tests {
 
         let results = engine.search(&SearchRequest::new("tax".into())).unwrap();
         assert_eq!(results.total_hits, 1);
+    }
+
+    #[test]
+    fn search_chinese_text_finds_substring_match() {
+        let (mut engine, _dir) = create_test_engine();
+        engine
+            .index_document(
+                "hash_cjk1pdf",
+                Path::new("/test/chinese.pdf"),
+                "chinese.pdf",
+                "你好世界这是一份税务文件",
+                "pdf",
+                1700000000,
+                "hash_cjk1",
+                &[],
+            )
+            .unwrap();
+        engine.commit().unwrap();
+        engine.reload().unwrap();
+
+        // Search for a bigram substring (NgramTokenizer(1,2) produces bigrams like "税务")
+        let results = engine
+            .search(&SearchRequest::new("税务".into()))
+            .unwrap();
+        assert_eq!(results.total_hits, 1, "CJK bigram search should find match");
+    }
+
+    #[test]
+    fn search_japanese_text_finds_substring_match() {
+        let (mut engine, _dir) = create_test_engine();
+        engine
+            .index_document(
+                "hash_cjk2pdf",
+                Path::new("/test/japanese.pdf"),
+                "japanese.pdf",
+                "これは税金の書類です",
+                "pdf",
+                1700000000,
+                "hash_cjk2",
+                &[],
+            )
+            .unwrap();
+        engine.commit().unwrap();
+        engine.reload().unwrap();
+
+        let results = engine
+            .search(&SearchRequest::new("税金".into()))
+            .unwrap();
+        assert_eq!(results.total_hits, 1, "Japanese substring search should find match");
+    }
+
+    #[test]
+    fn search_cjk_document_with_ascii_term_also_works() {
+        let (mut engine, _dir) = create_test_engine();
+        engine
+            .index_document(
+                "hash_cjk3pdf",
+                Path::new("/test/mixed.pdf"),
+                "mixed.pdf",
+                "你好世界 invoice 2023",
+                "pdf",
+                1700000000,
+                "hash_cjk3",
+                &[],
+            )
+            .unwrap();
+        engine.commit().unwrap();
+        engine.reload().unwrap();
+
+        // ASCII term should still work on mixed-content documents
+        let results = engine
+            .search(&SearchRequest::new("invoice".into()))
+            .unwrap();
+        assert_eq!(results.total_hits, 1);
+
+        // CJK term should also work
+        let results = engine
+            .search(&SearchRequest::new("你好".into()))
+            .unwrap();
+        assert_eq!(results.total_hits, 1);
+    }
+
+    #[test]
+    fn search_cjk_no_match_returns_empty() {
+        let (mut engine, _dir) = create_test_engine();
+        engine
+            .index_document(
+                "hash_cjk4pdf",
+                Path::new("/test/chinese.pdf"),
+                "chinese.pdf",
+                "你好世界这是一份税务文件",
+                "pdf",
+                1700000000,
+                "hash_cjk4",
+                &[],
+            )
+            .unwrap();
+        engine.commit().unwrap();
+        engine.reload().unwrap();
+
+        let results = engine
+            .search(&SearchRequest::new("银行".into()))
+            .unwrap();
+        assert_eq!(results.total_hits, 0, "Non-matching CJK term should return 0");
+    }
+
+    #[test]
+    fn search_long_cjk_document_no_token_drop() {
+        let (mut engine, _dir) = create_test_engine();
+        let long_cjk: String = std::iter::repeat("这是一份中文税务和会计财务报表文件")
+            .take(100)
+            .collect::<Vec<_>>()
+            .join("");
+        engine
+            .index_document(
+                "hash_cjk5pdf",
+                Path::new("/test/long_cjk.pdf"),
+                "long_cjk.pdf",
+                &long_cjk,
+                "pdf",
+                1700000000,
+                "hash_cjk5",
+                &[],
+            )
+            .unwrap();
+        engine.commit().unwrap();
+        engine.reload().unwrap();
+
+        // Searches for individual bigrams or single chars work with NgramTokenizer(1,2)
+        // (the tokenizer never produces the full query string as a single token)
+        let results = engine
+            .search(&SearchRequest::new("财务".into()))
+            .unwrap();
+        assert_eq!(
+            results.total_hits, 1,
+            "Bigram '财务' should match from the tokenized index"
+        );
+
+        // Single char should also match (min ngram size is 1)
+        let results = engine
+            .search(&SearchRequest::new("税".into()))
+            .unwrap();
+        assert_eq!(results.total_hits, 1,
+            "Single CJK char should match");
     }
 }
