@@ -483,6 +483,18 @@ impl TagStore {
         })
     }
 
+    /// Count auto-tag status entries by status value.
+    pub fn auto_tag_status_count(&self, status: &str) -> SqlResult<usize> {
+        self.with_conn(|conn| {
+            let count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM auto_tag_status WHERE status = ?1",
+                params![status],
+                |r| r.get(0),
+            )?;
+            Ok(count as usize)
+        })
+    }
+
     /// Remove a specific tag from the auto-tag JSON for a document.
     pub fn dismiss_auto_tag(&self, content_hash: &str, tag_name: &str) -> SqlResult<()> {
         self.with_conn(|conn| {

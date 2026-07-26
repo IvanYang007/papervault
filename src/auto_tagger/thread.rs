@@ -235,7 +235,27 @@ pub fn run_auto_tagger(
                     break;
                 }
             }
-            Err(crossbeam::channel::RecvTimeoutError::Timeout) => continue,
+            Err(crossbeam::channel::RecvTimeoutError::Timeout) => {
+                // No channel message — poll DB for stranded pending entries
+                if let Ok(pending) = tag_store.pending_auto_tags(1) {
+                    for p in pending {
+                        if shutdown_flag.load(Ordering::Acquire) {
+                            break;
+                        }
+                        tag_document(
+                            &p.content_hash,
+                            &p.filename,
+                            "",
+                            &p.content_hash_before_tag,
+                            &tag_store,
+                            provider.as_ref(),
+                            &auto_tag_config,
+                            progress.as_deref(),
+                            Some(&rate_limiter),
+                        );
+                    }
+                }
+            }
             Err(crossbeam::channel::RecvTimeoutError::Disconnected) => {
                 info!("AutoTagger channel disconnected, shutting down");
                 break;
