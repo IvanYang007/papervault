@@ -33,7 +33,11 @@ impl TagStore {
 
         let conn = Connection::open(&db_path)?;
         conn.execute_batch(
-            "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys = ON;",
+            "PRAGMA journal_mode=WAL;
+             PRAGMA synchronous=NORMAL;
+             PRAGMA mmap_size=268435456;
+             PRAGMA busy_timeout=5000;
+             PRAGMA foreign_keys = ON;",
         )?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS documents (
@@ -299,6 +303,17 @@ impl TagStore {
         })
     }
 
+    /// Delete a document by content hash (used by ghost sweep).
+    pub fn delete_document_by_hash(&self, content_hash: &str) -> SqlResult<()> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "DELETE FROM documents WHERE content_hash = ?1",
+                params![content_hash],
+            )?;
+            Ok(())
+        })
+    }
+
     pub fn get_hash_by_path(&self, path: &str) -> SqlResult<Option<String>> {
         self.with_conn(|conn| {
             let mut stmt =
@@ -354,6 +369,16 @@ impl TagStore {
             )?;
             Ok(())
         })
+    }
+
+    /// Checkpoint the WAL (call during clean shutdown to truncate).
+    pub fn wal_checkpoint(&self) {
+        if let Err(e) = self.with_conn(|conn| {
+            conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
+            Ok(())
+        }) {
+            tracing::warn!("WAL checkpoint failed: {}", e);
+        }
     }
 }
 

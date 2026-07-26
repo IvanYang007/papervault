@@ -279,7 +279,7 @@ impl PapervaultApp {
                 // Replace channels with ones from the new runtime
                 self.indexer_progress_rx = runtime.progress_rx.clone();
                 self.tag_update_tx = runtime.tag_tx.clone();
-                self.render_request_tx = Some(runtime.render_tx.clone());
+                self.render_request_tx = runtime.render_tx.clone();
                 self.render_result_rx = Some(runtime.render_result_rx.clone());
                 self.watcher_shutdown_flag = Some(runtime.watcher_shutdown());
                 self.watcher_shutdown_tx = runtime.watcher_shutdown_tx();
@@ -1022,7 +1022,7 @@ impl eframe::App for PapervaultApp {
                     self.search_engine = Some(new_rt.search_engine.clone());
                     self.indexer_progress_rx = new_rt.progress_rx.clone();
                     self.tag_update_tx = new_rt.tag_tx.clone();
-                    self.render_request_tx = Some(new_rt.render_tx.clone());
+                    self.render_request_tx = new_rt.render_tx.clone();
                     self.render_result_rx = Some(new_rt.render_result_rx.clone());
                     self.watcher_shutdown_flag = Some(new_rt.watcher_shutdown());
                     self.watcher_shutdown_tx = new_rt.watcher_shutdown_tx();

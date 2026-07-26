@@ -1,6 +1,7 @@
 use crate::indexer::extractors::SUPPORTED_EXTENSIONS;
 use crossbeam::channel::Sender;
 use notify_debouncer_full::notify::*;
+use notify_debouncer_full::notify::event::{ModifyKind, RenameMode};
 use notify_debouncer_full::DebounceEventResult;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -36,8 +37,9 @@ pub fn start_watching(
     let event_handler = move |result: DebounceEventResult| match result {
         Ok(events) => {
             for event in events {
-                match event.kind {
-                    EventKind::Create(_) | EventKind::Modify(_) => {
+                match &event.kind {
+                    EventKind::Create(_) | EventKind::Modify(ModifyKind::Data(_))
+                    | EventKind::Modify(ModifyKind::Metadata(_)) => {
                         for path in &event.paths {
                             if is_supported_extension(path) {
                                 if let Ok(meta) = std::fs::metadata(path) {
@@ -57,6 +59,44 @@ pub fn start_watching(
                                     });
                                 }
                             }
+                        }
+                    }
+                    EventKind::Modify(ModifyKind::Name(rename_mode)) => {
+                        match rename_mode {
+                            RenameMode::From => {
+                                // Old path: remove from index
+                                for path in &event.paths {
+                                    if is_supported_extension(path) {
+                                        let _ = tx.send(IndexerMessage::Delete {
+                                            path: path.clone(),
+                                        });
+                                    }
+                                }
+                            }
+                            RenameMode::To => {
+                                // New path: index fresh
+                                for path in &event.paths {
+                                    if is_supported_extension(path) {
+                                        if let Ok(meta) = std::fs::metadata(path) {
+                                            let mtime = meta
+                                                .modified()
+                                                .map(|t| {
+                                                    t.duration_since(std::time::UNIX_EPOCH)
+                                                        .unwrap_or_default()
+                                                        .as_secs()
+                                                })
+                                                .unwrap_or(0);
+                                            let size = meta.len();
+                                            let _ = tx.send(IndexerMessage::Upsert {
+                                                path: path.clone(),
+                                                mtime,
+                                                size,
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                            _ => {}
                         }
                     }
                     EventKind::Remove(_) => {

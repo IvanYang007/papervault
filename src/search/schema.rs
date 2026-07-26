@@ -1,5 +1,9 @@
 use tantivy::schema::*;
 
+/// Current schema version — bump when field definitions change.
+/// Mismatch triggers automatic index rebuild with a clear log message.
+pub const SCHEMA_VERSION: u32 = 2;
+
 /// Creates and returns the Tantivy schema for the document index.
 ///
 /// Fields:
@@ -7,6 +11,7 @@ use tantivy::schema::*;
 /// - `file_path`: Full filesystem path, stored only (display)
 /// - `file_name`: Filename for display, stored + indexed (searchable)
 /// - `body`: Full extracted text, stored + indexed as TEXT with positions (for SnippetGenerator)
+/// - `body_cjk`: CJK-aware bigram-indexed copy of body text for Chinese/Japanese/Korean search
 /// - `file_type`: "pdf" | "txt" | "md" | "log", stored + indexed
 /// - `modified_ts`: Last modification timestamp as i64 (epoch seconds), stored
 /// - `content_hash`: blake3 hex string, stored + indexed as Str (for delete_term)
@@ -19,6 +24,15 @@ pub fn build_schema() -> Schema {
     schema_builder.add_text_field("file_name", TEXT | STORED);
     // body: TEXT = INDEXED with positions, STORED for snippet generation
     schema_builder.add_text_field("body", TEXT | STORED);
+    // body_cjk: bigram-indexed for CJK substring search (n-gram 1..2)
+    let cjk_opts = TextFieldIndexing::default()
+        .set_index_option(IndexRecordOption::WithFreqsAndPositions)
+        .set_tokenizer("cjk_bigram")
+        .set_fieldnorms(true);
+    let cjk_text_opts = TextOptions::default()
+        .set_indexing_options(cjk_opts)
+        .set_stored();
+    schema_builder.add_text_field("body_cjk", cjk_text_opts);
     schema_builder.add_text_field("file_type", STRING | STORED);
     schema_builder.add_i64_field("modified_ts", STORED);
     // content_hash: STRING = raw text, Stored + Indexed for delete_term
@@ -36,6 +50,7 @@ pub struct SchemaFields {
     pub file_path: Field,
     pub file_name: Field,
     pub body: Field,
+    pub body_cjk: Field,
     pub file_type: Field,
     pub modified_ts: Field,
     pub content_hash: Field,
@@ -49,6 +64,7 @@ impl SchemaFields {
             file_path: schema.get_field("file_path").expect("file_path field"),
             file_name: schema.get_field("file_name").expect("file_name field"),
             body: schema.get_field("body").expect("body field"),
+            body_cjk: schema.get_field("body_cjk").expect("body_cjk field"),
             file_type: schema.get_field("file_type").expect("file_type field"),
             modified_ts: schema.get_field("modified_ts").expect("modified_ts field"),
             content_hash: schema

@@ -135,7 +135,7 @@ impl Pipeline {
                 self.pending_count = 0;
             }
         }
-        let _ = self.progress_tx.send(IndexerProgress::ScanComplete {
+        let _ = self.progress_tx.try_send(IndexerProgress::ScanComplete {
             total: scan_processed,
         });
         if scan_processed > 0 {
@@ -161,13 +161,13 @@ impl Pipeline {
                             Ok(()) => {
                                 total_processed += 1;
                                 self.pending_count += 1;
-                                let _ = self.progress_tx.send(IndexerProgress::Progress {
+                                let _ = self.progress_tx.try_send(IndexerProgress::Progress {
                                     processed: total_processed,
                                 });
                             }
                             Err(e) => {
                                 error!("Pipeline error for {}: {}", path.display(), e);
-                                let _ = self.progress_tx.send(IndexerProgress::Error {
+                                let _ = self.progress_tx.try_send(IndexerProgress::Error {
                                     path: path.clone(),
                                     error: e.to_string(),
                                 });
@@ -222,7 +222,7 @@ impl Pipeline {
             info!("Pipeline shutting down (no pending documents)");
         }
 
-        let _ = self.progress_tx.send(IndexerProgress::ScanComplete {
+        let _ = self.progress_tx.try_send(IndexerProgress::ScanComplete {
             total: total_processed,
         });
         info!("Pipeline stopped");
@@ -246,20 +246,51 @@ impl Pipeline {
 
     fn process_batch(&mut self, batch: &[(PathBuf, u64, u64)], offset: usize) -> usize {
         use rayon::prelude::*;
+        use std::panic::{catch_unwind, AssertUnwindSafe};
 
-        // Phase 1: Extract text in parallel (each thread creates its own extractors)
-        let results: Vec<_> = batch
-            .par_iter()
-            .map(|(path, mtime, size)| {
-                let stages = crate::indexer::stages::create_extractor_chain();
-                let extracted = match crate::indexer::stages::run_chain(path, &stages) {
-                    Ok(Some(content)) => Some(content),
-                    Ok(None) => None,
-                    Err(_) => None,
-                };
-                (path, *mtime, *size, extracted)
-            })
-            .collect();
+        // Cap parallelism to physical cores — avoids L3 cache thrashing
+        // on hyperthreaded CPUs during memory-bandwidth-heavy PDF extraction.
+        let thread_pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(num_cpus::get_physical())
+            .build()
+            .unwrap_or_else(|_| rayon::ThreadPoolBuilder::new().build().unwrap());
+
+        // Phase 1: Extract text in parallel with per-file panic isolation.
+        // One malformed PDF must not abort the entire batch.
+        let results: Vec<_> = thread_pool.install(|| {
+            batch
+                .par_iter()
+                .map(|(path, mtime, size)| {
+                    let result = catch_unwind(AssertUnwindSafe(|| {
+                        let stages = crate::indexer::stages::create_extractor_chain();
+                        match crate::indexer::stages::run_chain(path, &stages) {
+                            Ok(Some(content)) => Some(content),
+                            Ok(None) => None,
+                            Err(_) => None,
+                        }
+                    }));
+                    let extracted = match result {
+                        Ok(content) => content,
+                        Err(panic_info) => {
+                            let msg = if let Some(s) = panic_info.downcast_ref::<String>() {
+                                s.clone()
+                            } else if let Some(s) = panic_info.downcast_ref::<&str>() {
+                                s.to_string()
+                            } else {
+                                "unknown panic".to_string()
+                            };
+                            tracing::warn!(
+                                "Extraction panicked for {}: {} — skipping",
+                                path.display(),
+                                msg
+                            );
+                            None
+                        }
+                    };
+                    (path, *mtime, *size, extracted)
+                })
+                .collect()
+        });
 
         // Phase 2: Index sequentially (Tantivy is single-writer, SQLite under Mutex)
         let mut processed = 0usize;
@@ -378,7 +409,7 @@ impl Pipeline {
 
             processed += 1;
             self.pending_count += 1;
-            let _ = self.progress_tx.send(IndexerProgress::Progress {
+            let _ = self.progress_tx.try_send(IndexerProgress::Progress {
                 processed: offset + processed,
             });
         }
@@ -613,6 +644,7 @@ pub fn reconcile(engine: Arc<std::sync::Mutex<SearchEngine>>, tag_store: &TagSto
     let eng = engine.lock().unwrap_or_else(|e| e.into_inner());
     let searcher = eng.reader.searcher();
     let mut backfill_count: usize = 0;
+    let mut ghost_hashes: Vec<String> = Vec::new();
 
     for (segment_ord, segment_reader) in searcher.segment_readers().iter().enumerate() {
         for doc_id in 0u32..segment_reader.max_doc() {
@@ -642,8 +674,9 @@ pub fn reconcile(engine: Arc<std::sync::Mutex<SearchEngine>>, tag_store: &TagSto
                 continue;
             }
 
-            // Check if file still exists on disk
+            // Ghost sweep: collect hashes for files that no longer exist on disk
             if !file_path.is_empty() && !std::path::Path::new(file_path).exists() {
+                ghost_hashes.push(content_hash.to_string());
                 continue;
             }
 
@@ -682,6 +715,39 @@ pub fn reconcile(engine: Arc<std::sync::Mutex<SearchEngine>>, tag_store: &TagSto
             "Reconciliation backfilled {} documents to SQLite (Tantivy→SQLite).",
             backfill_count
         );
+    }
+
+    // Ghost sweep: delete Tantivy documents whose files no longer exist on disk
+    if !ghost_hashes.is_empty() {
+        info!(
+            "Ghost sweep: removing {} documents whose files no longer exist on disk",
+            ghost_hashes.len()
+        );
+        // Drop the searcher's read lock before acquiring write lock
+        drop(searcher);
+        drop(eng);
+        {
+            let mut eng = engine.lock().unwrap_or_else(|e| e.into_inner());
+            for hash in &ghost_hashes {
+                if let Err(e) = eng.delete_by_hash(hash) {
+                    warn!("Ghost sweep delete failed for {}: {}", hash, e);
+                }
+            }
+            if let Err(e) = eng.commit() {
+                warn!("Ghost sweep commit failed: {}", e);
+            }
+        }
+        // Also clean up SQLite entries
+        for hash in &ghost_hashes {
+            if let Some(path) = tag_store.get_hash_by_path(hash).ok().flatten() {
+                // get_hash_by_path uses file_path — for ghosts, we need to find path by hash
+                drop(path);
+            }
+            // Delete from SQLite by content_hash
+            if let Err(e) = tag_store.delete_document_by_hash(hash) {
+                warn!("Ghost sweep SQLite delete failed for {}: {}", hash, e);
+            }
+        }
     }
 
     info!("Reconciliation complete");
@@ -853,6 +919,10 @@ mod tests {
         .filter(tantivy::tokenizer::LowerCaser)
         .build();
         index.tokenizers().register("body", tokenizer);
+        let cjk = tantivy::tokenizer::TextAnalyzer::builder(tantivy::tokenizer::NgramTokenizer::new(1, 2, false).unwrap())
+            .filter(tantivy::tokenizer::LowerCaser)
+            .build();
+        index.tokenizers().register("cjk_bigram", cjk);
         let writer = index.writer(50_000_000).unwrap();
         let reader = index
             .reader_builder()
@@ -947,6 +1017,10 @@ mod tests {
         .filter(tantivy::tokenizer::LowerCaser)
         .build();
         index.tokenizers().register("body", tokenizer);
+        let cjk = tantivy::tokenizer::TextAnalyzer::builder(tantivy::tokenizer::NgramTokenizer::new(1, 2, false).unwrap())
+            .filter(tantivy::tokenizer::LowerCaser)
+            .build();
+        index.tokenizers().register("cjk_bigram", cjk);
         let writer = index.writer(50_000_000).unwrap();
         let reader = index
             .reader_builder()
@@ -1047,6 +1121,10 @@ mod tests {
         .filter(tantivy::tokenizer::LowerCaser)
         .build();
         index.tokenizers().register("body", tokenizer);
+        let cjk = tantivy::tokenizer::TextAnalyzer::builder(tantivy::tokenizer::NgramTokenizer::new(1, 2, false).unwrap())
+            .filter(tantivy::tokenizer::LowerCaser)
+            .build();
+        index.tokenizers().register("cjk_bigram", cjk);
         let writer = index.writer(50_000_000).unwrap();
         let reader = index
             .reader_builder()
@@ -1124,6 +1202,10 @@ mod tests {
         .filter(tantivy::tokenizer::LowerCaser)
         .build();
         index.tokenizers().register("body", tokenizer);
+        let cjk = tantivy::tokenizer::TextAnalyzer::builder(tantivy::tokenizer::NgramTokenizer::new(1, 2, false).unwrap())
+            .filter(tantivy::tokenizer::LowerCaser)
+            .build();
+        index.tokenizers().register("cjk_bigram", cjk);
         let writer = index.writer(50_000_000).unwrap();
         let reader = index
             .reader_builder()

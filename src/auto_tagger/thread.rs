@@ -1,12 +1,48 @@
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use crossbeam::channel::Receiver;
 use tracing::{debug, error, info, warn};
 
 use super::provider::TagProvider;
 use crate::tags::store::TagStore;
+
+/// Simple sliding-window rate limiter (30 requests/minute).
+struct RateLimiter {
+    timestamps: Vec<Instant>,
+}
+
+impl RateLimiter {
+    fn new() -> Self {
+        Self {
+            timestamps: Vec::with_capacity(32),
+        }
+    }
+
+    /// Wait until a rate-limit slot is available, then record this request.
+    fn acquire(&mut self) {
+        let now = Instant::now();
+        let window = Duration::from_secs(60);
+        let max_requests = 30usize;
+
+        // Purge expired timestamps
+        self.timestamps.retain(|t| now - *t < window);
+
+        if self.timestamps.len() >= max_requests {
+            let oldest = self.timestamps[0];
+            let wait = window.saturating_sub(now - oldest);
+            if !wait.is_zero() {
+                debug!("Rate limiter: waiting {:?} for slot", wait);
+                std::thread::sleep(wait);
+            }
+            // Purge again after sleep
+            let now = Instant::now();
+            self.timestamps.retain(|t| now - *t < window);
+        }
+        self.timestamps.push(Instant::now());
+    }
+}
 
 fn is_combining_mark(c: char) -> bool {
     matches!(
@@ -161,6 +197,7 @@ pub fn run_auto_tagger(
     progress: Option<Arc<AtomicUsize>>,
 ) {
     info!("AutoTagger thread started");
+    let rate_limiter = Arc::new(Mutex::new(RateLimiter::new()));
     // Process any pending documents from DB (recovery after crash or channel drops)
     if let Ok(pending) = tag_store.pending_auto_tags(100) {
         for p in pending {
@@ -176,6 +213,7 @@ pub fn run_auto_tagger(
                 provider.as_ref(),
                 &auto_tag_config,
                 progress.as_deref(),
+                Some(&rate_limiter),
             );
         }
     }
@@ -191,6 +229,7 @@ pub fn run_auto_tagger(
                     provider.as_ref(),
                     &auto_tag_config,
                     progress.as_deref(),
+                    Some(&rate_limiter),
                 );
                 if is_shutdown {
                     break;
@@ -212,6 +251,7 @@ fn process_request(
     provider: &dyn TagProvider,
     config: &crate::auto_tagger::config::AutoTagConfig,
     progress: Option<&std::sync::atomic::AtomicUsize>,
+    rate_limiter: Option<&Arc<Mutex<RateLimiter>>>,
 ) -> bool {
     match request {
         crate::app::AutoTagRequest::TagDocument {
@@ -229,6 +269,7 @@ fn process_request(
                 provider,
                 config,
                 progress,
+                rate_limiter,
             );
             false
         }
@@ -249,6 +290,7 @@ fn tag_document(
     provider: &dyn TagProvider,
     config: &crate::auto_tagger::config::AutoTagConfig,
     progress: Option<&std::sync::atomic::AtomicUsize>,
+    rate_limiter: Option<&Arc<Mutex<RateLimiter>>>,
 ) {
     if !config.enabled {
         debug!("auto-tagger disabled, skipping {filename}");
@@ -318,6 +360,10 @@ fn tag_document(
 
     let mut last_error = String::new();
     for attempt in 0..config.max_retries {
+        // Rate-limit API calls (shared across all auto-tagger threads)
+        if let Some(ref limiter) = rate_limiter {
+            limiter.lock().unwrap_or_else(|e| e.into_inner()).acquire();
+        }
         match provider.generate_tags(filename, text, &existing_tags) {
             Ok(response) => {
                 let mut entities = response.entities;
@@ -533,6 +579,7 @@ mod tests {
             &store,
             &provider,
             &config,
+            None,
             None,
         );
         assert!(result, "Shutdown request should return true");

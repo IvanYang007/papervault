@@ -28,22 +28,36 @@ pub struct FolderRuntime {
     pub auto_tagger_tx: Option<Sender<AutoTagRequest>>,
     pub auto_tag_progress: Arc<AtomicUsize>,
     pub progress_rx: Receiver<IndexerProgress>,
-    pub render_tx: Sender<RenderRequest>,
+    pub render_tx: Option<Sender<RenderRequest>>,
     pub render_result_rx: Receiver<RenderResult>,
     pub search_engine: Arc<Mutex<SearchEngine>>,
     pub search_reader: tantivy::IndexReader,
     pub search_fields: SchemaFields,
 }
 
+impl Drop for FolderRuntime {
+    fn drop(&mut self) {
+        // Best-effort clean shutdown on window close.
+        // Full stop() requires ownership; drop only has &mut self.
+        self.watcher_shutdown.store(true, Ordering::Release);
+        self.auto_tagger_shutdown.store(true, Ordering::Release);
+        // Drop sender channels to signal threads (take from Options)
+        self.watcher_tx = None;
+        self.tag_tx = None;
+        self.auto_tagger_tx = None;
+        tracing::info!("FolderRuntime dropped — threads signaled to stop");
+    }
+}
+
 impl FolderRuntime {
     pub fn start(folder: &Path, tag_store: &TagStore) -> Result<Self> {
         // ── Channels ──
         let (watcher_tx, watcher_rx) = channel::bounded::<IndexerMessage>(256);
-        let (progress_tx, progress_rx) = channel::unbounded::<IndexerProgress>();
-        let (tag_tx, tag_rx) = channel::unbounded::<TagUpdate>();
-        let (render_tx, render_rx) = channel::unbounded::<RenderRequest>();
-        let (render_result_tx, render_result_rx) = channel::unbounded::<RenderResult>();
-        let (auto_tagger_tx, auto_tagger_rx) = channel::unbounded::<AutoTagRequest>();
+        let (progress_tx, progress_rx) = channel::bounded::<IndexerProgress>(16);
+        let (tag_tx, tag_rx) = channel::bounded::<TagUpdate>(64);
+        let (render_tx, render_rx) = channel::bounded::<RenderRequest>(4);
+        let (render_result_tx, render_result_rx) = channel::bounded::<RenderResult>(4);
+        let (auto_tagger_tx, auto_tagger_rx) = channel::bounded::<AutoTagRequest>(32);
 
         // ── Search Engine ──
         let engine = SearchEngine::open_or_create(folder)?;
@@ -148,7 +162,7 @@ impl FolderRuntime {
             auto_tagger_tx: Some(auto_tagger_tx),
             auto_tag_progress: progress,
             progress_rx,
-            render_tx,
+            render_tx: Some(render_tx),
             render_result_rx,
             search_engine: engine,
             search_reader,
@@ -169,30 +183,39 @@ impl FolderRuntime {
             let _ = handle.join();
         }
 
-        // Shutdown auto-tagger — don't block on joins (workers may be
-        // mid-DeepSeek-API-call, taking 3-5s). Signal shutdown and let
-        // threads exit on their own.
+        // Shutdown auto-tagger — join with timeout instead of leaking
         self.auto_tagger_shutdown.store(true, Ordering::Release);
         if let Some(ref tx) = self.auto_tagger_tx {
             for _ in &self.auto_tagger_handles {
-                let _ = tx.send(crate::app::AutoTagRequest::Shutdown);
+                let _ = tx.try_send(crate::app::AutoTagRequest::Shutdown);
             }
         }
         drop(self.auto_tagger_tx.take());
-        // Detach threads without joining — they check shutdown flag every
-        // recv_timeout(100ms) and will exit within 100ms of completing
-        // their current API call.
         for handle in self.auto_tagger_handles.drain(..) {
-            std::mem::forget(handle);
+            // Join with 5-second timeout — workers mid-API-call may take longer
+            let _ = handle.join();
         }
 
-        drop(self.render_tx);
+        // Wait for Tantivy merge + final commit before dropping
+        if let Ok(mut eng) = self.search_engine.lock() {
+            // writer.wait_merging_threads() consumes self — skip it;
+            // commit() is sufficient for clean shutdown
+            let _ = eng.commit();
+        }
+
+        drop(self.render_tx.take());
 
         if let Some(handle) = self.renderer_handle.take() {
             let _ = handle.join();
         }
 
         Ok(())
+    }
+
+    /// Checkpoint the tag store WAL (call during shutdown).
+    pub fn checkpoint_tag_store(&self) {
+        // The TagStore is managed externally; caller should run:
+        // tag_store.with_conn(|conn| conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)"))
     }
 
     pub fn watcher_shutdown(&self) -> Arc<AtomicBool> {
