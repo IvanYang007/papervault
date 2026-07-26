@@ -230,7 +230,8 @@ pub fn search_with_reader(
 
     let terms: Vec<&str> = request.query.split_whitespace().collect();
     let n_terms = terms.len();
-    let mut subqueries: Vec<(Occur, Box<dyn Query>)> = Vec::with_capacity(n_terms + request.tag_filters.len());
+    let mut subqueries: Vec<(Occur, Box<dyn Query>)> =
+        Vec::with_capacity(n_terms + request.tag_filters.len());
 
     for term in &terms {
         let lower = term.to_lowercase();
@@ -285,17 +286,11 @@ pub fn search_with_reader(
         for term in &terms {
             let lower = term.to_lowercase();
             let mut term_fuzzy: Vec<(Occur, Box<dyn Query>)> = Vec::new();
-            let body_fuzzy = FuzzyTermQuery::new(
-                Term::from_field_text(fields.body, &lower),
-                1,
-                true,
-            );
+            let body_fuzzy =
+                FuzzyTermQuery::new(Term::from_field_text(fields.body, &lower), 1, true);
             term_fuzzy.push((Occur::Should, Box::new(body_fuzzy)));
-            let tag_fuzzy = FuzzyTermQuery::new(
-                Term::from_field_text(fields.tags, &lower),
-                1,
-                true,
-            );
+            let tag_fuzzy =
+                FuzzyTermQuery::new(Term::from_field_text(fields.tags, &lower), 1, true);
             term_fuzzy.push((Occur::Should, Box::new(tag_fuzzy)));
             fuzzy_subqueries.push((Occur::Must, Box::new(BooleanQuery::new(term_fuzzy))));
         }
@@ -759,9 +754,11 @@ mod tests {
         assert_eq!(results.total_hits, 1);
         // lower_snippet should be pre-computed and lowercase
         assert_eq!(results.items[0].lower_snippet, "hello world test");
-        assert!(results.items[0].lower_snippet
-            .chars()
-            .all(|c| !c.is_uppercase()),
+        assert!(
+            results.items[0]
+                .lower_snippet
+                .chars()
+                .all(|c| !c.is_uppercase()),
             "lower_snippet must be all lowercase"
         );
     }

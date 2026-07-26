@@ -227,7 +227,8 @@ impl PdfRenderer {
         // Remove existing entry for this key if present (move to front on re-insert)
         self.page_cache.retain(|(k, _, _, _)| *k != key);
 
-        self.page_cache.push_front((key, Arc::new(bytes), width, height));
+        self.page_cache
+            .push_front((key, Arc::new(bytes), width, height));
         if self.page_cache.len() > MAX_CACHED_PAGES {
             self.page_cache.pop_back();
         }

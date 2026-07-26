@@ -60,24 +60,33 @@ impl FolderRuntime {
         let at_shutdown = auto_tagger_shutdown.clone();
         let progress = Arc::new(AtomicUsize::new(0));
         let num_workers = 3usize;
-        let auto_tagger_handles: Vec<_> = (0..num_workers).map(|i| {
-            let at_tag_store = tag_store.clone();
-            let provider = Box::new(crate::auto_tagger::deepseek::DeepSeekProvider::new(
-                auto_tag_config.endpoint.clone(),
-                auto_tag_config.model.clone(),
-                auto_tag_config.api_key_env.clone(),
-                auto_tag_config.request_timeout_secs,
-            ));
-            let at_config = auto_tag_config.clone();
-            let rx = auto_tagger_rx.clone();
-            let sd = at_shutdown.clone();
-            let prg = progress.clone();
-            std::thread::Builder::new()
-                .name(format!("auto-tagger-{}", i))
-                .spawn(move || {
-                    thread::run_auto_tagger(rx, at_tag_store, provider, at_config, sd, Some(prg));
-                })
-        }).collect::<std::io::Result<Vec<_>>>()?;
+        let auto_tagger_handles: Vec<_> = (0..num_workers)
+            .map(|i| {
+                let at_tag_store = tag_store.clone();
+                let provider = Box::new(crate::auto_tagger::deepseek::DeepSeekProvider::new(
+                    auto_tag_config.endpoint.clone(),
+                    auto_tag_config.model.clone(),
+                    auto_tag_config.api_key_env.clone(),
+                    auto_tag_config.request_timeout_secs,
+                ));
+                let at_config = auto_tag_config.clone();
+                let rx = auto_tagger_rx.clone();
+                let sd = at_shutdown.clone();
+                let prg = progress.clone();
+                std::thread::Builder::new()
+                    .name(format!("auto-tagger-{}", i))
+                    .spawn(move || {
+                        thread::run_auto_tagger(
+                            rx,
+                            at_tag_store,
+                            provider,
+                            at_config,
+                            sd,
+                            Some(prg),
+                        );
+                    })
+            })
+            .collect::<std::io::Result<Vec<_>>>()?;
 
         // ── Background Threads ──
         let indexer_engine = engine.clone();
@@ -130,7 +139,7 @@ impl FolderRuntime {
             watcher_handle: Some(watcher_handle),
             indexer_handle: Some(indexer_handle),
             renderer_handle: Some(renderer_handle),
-            auto_tagger_handles: auto_tagger_handles,
+            auto_tagger_handles,
             auto_tagger_shutdown,
             watcher_tx: Some(watcher_tx),
             tag_tx: Some(tag_tx),

@@ -25,19 +25,39 @@ pub enum TagError {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Entities {
     /// Person names found in the document.
-    #[serde(default, skip_serializing_if = "Vec::is_empty", deserialize_with = "string_or_vec")]
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "string_or_vec"
+    )]
     pub persons: Vec<String>,
     /// Organization names found in the document.
-    #[serde(default, skip_serializing_if = "Vec::is_empty", deserialize_with = "string_or_vec")]
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "string_or_vec"
+    )]
     pub organizations: Vec<String>,
     /// Years referenced in the document (as strings, e.g., "2023").
-    #[serde(default, skip_serializing_if = "Vec::is_empty", deserialize_with = "string_or_vec")]
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "string_or_vec"
+    )]
     pub years: Vec<String>,
     /// Document/form identifiers (e.g., "1040", "W-2").
-    #[serde(default, skip_serializing_if = "Vec::is_empty", deserialize_with = "string_or_vec")]
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "string_or_vec"
+    )]
     pub doc_id: Vec<String>,
     /// Monetary amounts with currency (e.g., "$45,000", "EUR 1200").
-    #[serde(default, skip_serializing_if = "Vec::is_empty", deserialize_with = "string_or_vec")]
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "string_or_vec"
+    )]
     pub amounts: Vec<String>,
 }
 
@@ -92,7 +112,10 @@ pub struct TagSuggestion {
 impl TagResponse {
     /// Convert this response into a flat list of TagSuggestions for UI rendering.
     #[allow(dead_code)]
-    pub fn to_suggestions(&self, existing_vocabulary: &std::collections::HashSet<String>) -> Vec<TagSuggestion> {
+    pub fn to_suggestions(
+        &self,
+        existing_vocabulary: &std::collections::HashSet<String>,
+    ) -> Vec<TagSuggestion> {
         self.tags
             .iter()
             .map(|t| TagSuggestion {
@@ -125,6 +148,7 @@ mod tests {
 
     /// A mock provider for testing that returns fixture data.
     #[derive(Clone)]
+    #[allow(dead_code)]
     pub struct MockProvider {
         pub response: TagResponse,
         pub should_fail: bool,
@@ -132,6 +156,7 @@ mod tests {
         pub call_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     }
 
+    #[allow(dead_code)]
     impl MockProvider {
         pub fn new(response: TagResponse) -> Self {
             Self {
@@ -237,10 +262,16 @@ mod tests {
         assert_eq!(suggestions.len(), 2);
 
         let tax_suggestion = suggestions.iter().find(|s| s.tag == "tax").unwrap();
-        assert!(tax_suggestion.is_existing, "'tax' is in vocabulary, should be flagged");
+        assert!(
+            tax_suggestion.is_existing,
+            "'tax' is in vocabulary, should be flagged"
+        );
 
         let new_suggestion = suggestions.iter().find(|s| s.tag == "new-topic").unwrap();
-        assert!(!new_suggestion.is_existing, "'new-topic' is not in vocabulary");
+        assert!(
+            !new_suggestion.is_existing,
+            "'new-topic' is not in vocabulary"
+        );
     }
 
     #[test]

@@ -623,9 +623,18 @@ impl PapervaultApp {
     /// Re-trigger auto-tagging for the currently selected document.
     /// Reads the file from disk and sends it through the auto-tagger.
     fn retag_selected(&mut self) {
-        let hash = match &self.selected_hash { Some(h) => h.clone(), None => return };
-        let tx = match &self.auto_tagger_tx { Some(t) => t.clone(), None => return };
-        let store = match &self.tag_store { Some(s) => s.clone(), None => return };
+        let hash = match &self.selected_hash {
+            Some(h) => h.clone(),
+            None => return,
+        };
+        let tx = match &self.auto_tagger_tx {
+            Some(t) => t.clone(),
+            None => return,
+        };
+        let store = match &self.tag_store {
+            Some(s) => s.clone(),
+            None => return,
+        };
 
         // Find the file path from search results
         let file_path = self
@@ -636,10 +645,14 @@ impl PapervaultApp {
 
         let Some(file_path) = file_path else { return };
         let path = std::path::Path::new(&file_path);
-        if !path.exists() { return }
+        if !path.exists() {
+            return;
+        }
 
         // Re-extract text from the file
-        let Ok(content) = std::fs::read_to_string(path) else { return };
+        let Ok(content) = std::fs::read_to_string(path) else {
+            return;
+        };
         let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
 
         let content_hash_before_tag = {
@@ -650,7 +663,14 @@ impl PapervaultApp {
         };
 
         // Clear old cache entry so Tier 1 doesn't short-circuit
-        let _ = store.upsert_auto_tag_status(&hash, file_name, &content_hash_before_tag, "pending", None, None);
+        let _ = store.upsert_auto_tag_status(
+            &hash,
+            file_name,
+            &content_hash_before_tag,
+            "pending",
+            None,
+            None,
+        );
 
         let _ = tx.send(AutoTagRequest::TagDocument {
             content_hash: hash.clone(),
@@ -689,7 +709,12 @@ impl PapervaultApp {
     }
 
     /// Render a snippet with matched terms highlighted in gold.
-    fn render_highlighted_snippet(ui: &mut egui::Ui, snippet: &str, lower_snippet: &str, match_terms: &[String]) {
+    fn render_highlighted_snippet(
+        ui: &mut egui::Ui,
+        snippet: &str,
+        lower_snippet: &str,
+        match_terms: &[String],
+    ) {
         if match_terms.is_empty() {
             ui.label(RichText::new(snippet).color(Color32::GRAY));
             return;
@@ -779,7 +804,9 @@ impl eframe::App for PapervaultApp {
         // Sync auto-tag progress from the shared counter
         if let Some(ref rt) = self.folder_runtime {
             if let Some((_, total)) = self.auto_tag_progress {
-                let completed = rt.auto_tag_progress.load(std::sync::atomic::Ordering::Relaxed);
+                let completed = rt
+                    .auto_tag_progress
+                    .load(std::sync::atomic::Ordering::Relaxed);
                 self.auto_tag_progress = Some((completed, total));
             }
         }
@@ -799,7 +826,8 @@ impl eframe::App for PapervaultApp {
                         let total = docs.len();
                         // Reset progress counter
                         if let Some(ref rt) = self.folder_runtime {
-                            rt.auto_tag_progress.store(0, std::sync::atomic::Ordering::Relaxed);
+                            rt.auto_tag_progress
+                                .store(0, std::sync::atomic::Ordering::Relaxed);
                         }
                         self.auto_tag_progress = Some((0, total));
                         for doc in docs {
@@ -904,7 +932,9 @@ impl eframe::App for PapervaultApp {
                         // Progress bar
                         if let Some((completed, total)) = self.auto_tag_progress {
                             let pct = completed as f32 / total.max(1) as f32;
-                            ui.add(egui::ProgressBar::new(pct).text(format!("{completed}/{total}")));
+                            ui.add(
+                                egui::ProgressBar::new(pct).text(format!("{completed}/{total}")),
+                            );
                             if completed >= total {
                                 self.auto_tag_progress = None;
                             }
@@ -919,13 +949,19 @@ impl eframe::App for PapervaultApp {
                         ui.separator();
                     } else {
                         ui.horizontal(|ui| {
-                            ui.label(RichText::new("☁ Auto-tag: disabled").size(10.0).color(Color32::GRAY));
+                            ui.label(
+                                RichText::new("☁ Auto-tag: disabled")
+                                    .size(10.0)
+                                    .color(Color32::GRAY),
+                            );
                             if ui.small_button("Enable").clicked() {
                                 self.auto_tag_enabled = true;
                                 let mut cfg = crate::auto_tagger::config::AutoTagConfig::load();
                                 cfg.enabled = true;
                                 let _ = cfg.save();
-                                self.status_message = "Auto-tagging enabled. Re-import folder to tag existing files.".to_string();
+                                self.status_message =
+                                    "Auto-tagging enabled. Re-import folder to tag existing files."
+                                        .to_string();
                             }
                         });
                         ui.separator();
@@ -969,44 +1005,79 @@ impl eframe::App for PapervaultApp {
                             if let Some(ref store) = self.tag_store {
                                 if let Ok(Some(auto_status)) = store.auto_tag_status(hash) {
                                     if let Some(ref json) = auto_status.tags_json {
-                                        if let Ok(value) = serde_json::from_str::<serde_json::Value>(json) {
+                                        if let Ok(value) =
+                                            serde_json::from_str::<serde_json::Value>(json)
+                                        {
                                             // Render topic tags
                                             if let Some(tags) = value["tags"].as_array() {
                                                 if !tags.is_empty() {
                                                     ui.separator();
                                                     ui.horizontal(|ui| {
-                                                        ui.label(RichText::new("✨ Auto-tags").size(11.0).color(Color32::GRAY));
-                                                        if ui.small_button("🔄 Re-tag").clicked() {
+                                                        ui.label(
+                                                            RichText::new("✨ Auto-tags")
+                                                                .size(11.0)
+                                                                .color(Color32::GRAY),
+                                                        );
+                                                        if ui.small_button("🔄 Re-tag").clicked()
+                                                        {
                                                             self.pending_retag = true;
                                                         }
                                                     });
                                                     let mut to_dismiss: Option<String> = None;
                                                     let mut to_toggle: Option<String> = None;
-                                                    let accepted = self.accepted_auto_tags
+                                                    let accepted = self
+                                                        .accepted_auto_tags
                                                         .entry(hash.clone())
                                                         .or_default();
                                                     for tag_value in tags {
                                                         if let Some(tag_name) = tag_value.as_str() {
-                                                            let is_accepted = accepted.contains(tag_name);
+                                                            let is_accepted =
+                                                                accepted.contains(tag_name);
                                                             let frame = if is_accepted {
                                                                 egui::Frame::default()
-                                                                    .fill(Color32::from_rgb(40, 80, 40))
-                                                                    .rounding(egui::Rounding::same(4.0))
+                                                                    .fill(Color32::from_rgb(
+                                                                        40, 80, 40,
+                                                                    ))
+                                                                    .rounding(egui::Rounding::same(
+                                                                        4.0,
+                                                                    ))
                                                             } else {
                                                                 egui::Frame::default()
-                                                                    .stroke(egui::Stroke::new(1.0_f32, Color32::from_rgb(100, 100, 100)))
-                                                                    .rounding(egui::Rounding::same(4.0))
+                                                                    .stroke(egui::Stroke::new(
+                                                                        1.0_f32,
+                                                                        Color32::from_rgb(
+                                                                            100, 100, 100,
+                                                                        ),
+                                                                    ))
+                                                                    .rounding(egui::Rounding::same(
+                                                                        4.0,
+                                                                    ))
                                                             };
                                                             frame.show(ui, |ui| {
                                                                 ui.horizontal(|ui| {
                                                                     ui.label("✨");
-                                                                    if ui.selectable_label(is_accepted, tag_name)
-                                                                        .on_hover_text(format!("AI tag for \"{}\"", auto_status.filename))
-                                                                        .clicked() {
-                                                                        to_toggle = Some(tag_name.to_string());
+                                                                    if ui
+                                                                        .selectable_label(
+                                                                            is_accepted,
+                                                                            tag_name,
+                                                                        )
+                                                                        .on_hover_text(format!(
+                                                                            "AI tag for \"{}\"",
+                                                                            auto_status.filename
+                                                                        ))
+                                                                        .clicked()
+                                                                    {
+                                                                        to_toggle = Some(
+                                                                            tag_name.to_string(),
+                                                                        );
                                                                     }
-                                                                    if ui.small_button("✕").clicked() {
-                                                                        to_dismiss = Some(tag_name.to_string());
+                                                                    if ui
+                                                                        .small_button("✕")
+                                                                        .clicked()
+                                                                    {
+                                                                        to_dismiss = Some(
+                                                                            tag_name.to_string(),
+                                                                        );
                                                                     }
                                                                 });
                                                             });
@@ -1022,7 +1093,8 @@ impl eframe::App for PapervaultApp {
                                                     if let Some(tag) = to_dismiss {
                                                         accepted.remove(&tag);
                                                         if let Some(ref store) = self.tag_store {
-                                                            let _ = store.dismiss_auto_tag(hash, &tag);
+                                                            let _ =
+                                                                store.dismiss_auto_tag(hash, &tag);
                                                         }
                                                     }
                                                 }
@@ -1185,9 +1257,7 @@ impl eframe::App for PapervaultApp {
                     let filters: Vec<&str> =
                         self.active_tag_filters.iter().map(|s| s.as_str()).collect();
                     for tag in &filters {
-                        ui.label(
-                            RichText::new(format!("🔖 {}", tag)).size(tag_label_size),
-                        );
+                        ui.label(RichText::new(format!("🔖 {}", tag)).size(tag_label_size));
                     }
                 });
             }
@@ -1242,7 +1312,8 @@ impl eframe::App for PapervaultApp {
                                         ui.horizontal(|ui| {
                                             for t in &result.tags {
                                                 ui.label(
-                                                    RichText::new(format!("🏷{}", t)).size(tag_label_size),
+                                                    RichText::new(format!("🏷{}", t))
+                                                        .size(tag_label_size),
                                                 );
                                             }
                                         });
@@ -1362,9 +1433,9 @@ impl eframe::App for PapervaultApp {
                     let avail = columns[1].available_size();
                     self.preview_panel_size = (avail.x as u32, avail.y as u32);
 
-                    columns[1].image(egui::ImageSource::Texture(
-                        egui::load::SizedTexture::new(tex_id, tex_size),
-                    ));
+                    columns[1].image(egui::ImageSource::Texture(egui::load::SizedTexture::new(
+                        tex_id, tex_size,
+                    )));
                 } else if self
                     .browsed_file
                     .as_ref()

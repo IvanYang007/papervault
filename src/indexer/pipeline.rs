@@ -259,7 +259,11 @@ impl Pipeline {
             let content_hash = compute_content_hash(&extracted.text, &file_type);
 
             // Clean up old entries before inserting new ones
-            let old_hash_to_delete = self.tag_store.get_hash_by_path(&path_str).ok().flatten()
+            let old_hash_to_delete = self
+                .tag_store
+                .get_hash_by_path(&path_str)
+                .ok()
+                .flatten()
                 .filter(|old| old.as_str() != content_hash);
             if old_hash_to_delete.is_some() {
                 let _ = self.tag_store.delete_document_by_path(&path_str);
@@ -323,7 +327,11 @@ impl Pipeline {
                     None,
                     None,
                 ) {
-                    tracing::warn!("failed to write pending auto-tag status for {}: {}", content_hash, e);
+                    tracing::warn!(
+                        "failed to write pending auto-tag status for {}: {}",
+                        content_hash,
+                        e
+                    );
                 }
                 if let Some(ref tx) = self.auto_tagger_tx {
                     let request = AutoTagRequest::TagDocument {
@@ -338,11 +346,9 @@ impl Pipeline {
 
             processed += 1;
             self.pending_count += 1;
-            let _ = self
-                .progress_tx
-                .send(IndexerProgress::Progress {
-                    processed: offset + processed,
-                });
+            let _ = self.progress_tx.send(IndexerProgress::Progress {
+                processed: offset + processed,
+            });
         }
 
         // Commit after each batch
@@ -385,7 +391,11 @@ impl Pipeline {
                 None
             }
             Err(e) => {
-                warn!("Extraction failed for {}: {} — indexing filename only", path.display(), e);
+                warn!(
+                    "Extraction failed for {}: {} — indexing filename only",
+                    path.display(),
+                    e
+                );
                 None
             }
         };
@@ -398,7 +408,10 @@ impl Pipeline {
             .and_then(|e| e.to_str())
             .unwrap_or("")
             .to_lowercase();
-        let extracted_text = extracted.as_ref().map(|e| e.text.as_str()).unwrap_or("[Document text could not be extracted. Use filename to determine topic.]");
+        let extracted_text = extracted
+            .as_ref()
+            .map(|e| e.text.as_str())
+            .unwrap_or("[Document text could not be extracted. Use filename to determine topic.]");
         let content_hash = compute_content_hash(extracted_text, &file_type);
 
         let file_name = path
@@ -411,7 +424,11 @@ impl Pipeline {
         // If the file's content changed, the old content_hash differs from the
         // new one. Both SQLite (PK=content_hash) and Tantivy (stored by hash)
         // would accumulate duplicate entries without this cleanup.
-        let old_hash_to_delete = self.tag_store.get_hash_by_path(&path_str).ok().flatten()
+        let old_hash_to_delete = self
+            .tag_store
+            .get_hash_by_path(&path_str)
+            .ok()
+            .flatten()
             .filter(|old| old.as_str() != content_hash);
         if old_hash_to_delete.is_some() {
             if let Err(e) = self.tag_store.delete_document_by_path(&path_str) {
@@ -477,7 +494,11 @@ impl Pipeline {
                 None,
                 None,
             ) {
-                tracing::warn!("failed to write pending auto-tag status for {}: {}", content_hash, e);
+                tracing::warn!(
+                    "failed to write pending auto-tag status for {}: {}",
+                    content_hash,
+                    e
+                );
             }
 
             // Wake the auto-tagger via a lightweight channel notification
@@ -884,8 +905,7 @@ mod tests {
         let index_dir = tempfile::TempDir::new().unwrap();
         let schema = crate::search::schema::build_schema();
         let fields = crate::search::schema::SchemaFields::from_schema(&schema);
-        let index =
-            tantivy::Index::create_in_dir(index_dir.path(), schema.clone()).unwrap();
+        let index = tantivy::Index::create_in_dir(index_dir.path(), schema.clone()).unwrap();
         let tokenizer = tantivy::tokenizer::TextAnalyzer::builder(
             tantivy::tokenizer::SimpleTokenizer::default(),
         )
@@ -934,10 +954,7 @@ mod tests {
         let size1 = m1.len();
         let size2 = m2.len();
 
-        let batch = vec![
-            (f1.clone(), mtime1, size1),
-            (f2.clone(), mtime2, size2),
-        ];
+        let batch = vec![(f1.clone(), mtime1, size1), (f2.clone(), mtime2, size2)];
 
         let mut pipeline = Pipeline::new(
             engine.clone(),
@@ -987,8 +1004,7 @@ mod tests {
         let index_dir = tempfile::TempDir::new().unwrap();
         let schema = crate::search::schema::build_schema();
         let fields = crate::search::schema::SchemaFields::from_schema(&schema);
-        let index =
-            tantivy::Index::create_in_dir(index_dir.path(), schema.clone()).unwrap();
+        let index = tantivy::Index::create_in_dir(index_dir.path(), schema.clone()).unwrap();
         let tokenizer = tantivy::tokenizer::TextAnalyzer::builder(
             tantivy::tokenizer::SimpleTokenizer::default(),
         )
@@ -1064,8 +1080,7 @@ mod tests {
         let index_dir = tempfile::TempDir::new().unwrap();
         let schema = crate::search::schema::build_schema();
         let fields = crate::search::schema::SchemaFields::from_schema(&schema);
-        let index =
-            tantivy::Index::create_in_dir(index_dir.path(), schema.clone()).unwrap();
+        let index = tantivy::Index::create_in_dir(index_dir.path(), schema.clone()).unwrap();
         let tokenizer = tantivy::tokenizer::TextAnalyzer::builder(
             tantivy::tokenizer::SimpleTokenizer::default(),
         )
@@ -1119,6 +1134,10 @@ mod tests {
 
         let mut eng = engine.lock().unwrap_or_else(|e| e.into_inner());
         eng.reload().unwrap();
-        assert_eq!(eng.doc_count().unwrap(), 0, "No docs should be indexed from corrupt file");
+        assert_eq!(
+            eng.doc_count().unwrap(),
+            0,
+            "No docs should be indexed from corrupt file"
+        );
     }
 }

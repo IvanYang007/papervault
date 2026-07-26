@@ -44,7 +44,7 @@ impl DeepSeekProvider {
             model: model.into(),
             api_key_env: api_key_env.into(),
             timeout: Duration::from_secs(timeout_secs),
-            max_text_words: 1500,   // ~2 pages of text
+            max_text_words: 1500, // ~2 pages of text
         }
     }
 
@@ -67,14 +67,12 @@ impl DeepSeekProvider {
 
     /// Truncate text to at most `max_text_words` words at a word boundary.
     fn truncate_text<'a>(&self, text: &'a str) -> &'a str {
-        let mut word_count = 0;
         let mut word_end = text.len();
-        for word in text.split_whitespace() {
+        for (word_count, word) in text.split_whitespace().enumerate() {
             if word_count >= self.max_text_words {
                 word_end = word.as_ptr() as usize - text.as_ptr() as usize;
                 break;
             }
-            word_count += 1;
         }
         let trimmed = text[..word_end].trim_end();
         let trim_len = trimmed.as_ptr() as usize - text.as_ptr() as usize + trimmed.len();
@@ -155,23 +153,21 @@ impl TagProvider for DeepSeekProvider {
             .set("Content-Type", "application/json")
             .timeout(self.timeout)
             .send_string(&body_str)
-            .map_err(|e| {
-                match &e {
-                    ureq::Error::Status(401 | 403, _) => {
-                        TagError::Auth(format!("DeepSeek API auth failed: {}", e))
-                    }
-                    ureq::Error::Status(429, _) => {
-                        TagError::Unavailable(format!("DeepSeek API rate limited: {}", e))
-                    }
-                    ureq::Error::Status(code, _) if *code >= 400 && *code < 500 => {
-                        TagError::BadRequest(format!("DeepSeek API bad request ({}): {}", code, e))
-                    }
-                    ureq::Error::Status(_, _) => {
-                        TagError::Unavailable(format!("DeepSeek API server error: {}", e))
-                    }
-                    ureq::Error::Transport(_) => {
-                        TagError::Unavailable(format!("DeepSeek API unreachable: {}", e))
-                    }
+            .map_err(|e| match &e {
+                ureq::Error::Status(401 | 403, _) => {
+                    TagError::Auth(format!("DeepSeek API auth failed: {}", e))
+                }
+                ureq::Error::Status(429, _) => {
+                    TagError::Unavailable(format!("DeepSeek API rate limited: {}", e))
+                }
+                ureq::Error::Status(code, _) if *code >= 400 && *code < 500 => {
+                    TagError::BadRequest(format!("DeepSeek API bad request ({}): {}", code, e))
+                }
+                ureq::Error::Status(_, _) => {
+                    TagError::Unavailable(format!("DeepSeek API server error: {}", e))
+                }
+                ureq::Error::Transport(_) => {
+                    TagError::Unavailable(format!("DeepSeek API unreachable: {}", e))
                 }
             })?;
 
@@ -235,7 +231,10 @@ mod tests {
         assert!(prompt.contains(r#""tax""#));
         assert!(prompt.contains(r#""irs""#));
         // Verify no unreplaced placeholders remain
-        assert!(!prompt.contains("{existing_tags"), "placeholder not replaced");
+        assert!(
+            !prompt.contains("{existing_tags"),
+            "placeholder not replaced"
+        );
         assert!(!prompt.contains("{{FILENAME}}"), "FILENAME not replaced");
     }
 

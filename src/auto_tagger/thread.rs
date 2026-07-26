@@ -26,9 +26,13 @@ fn is_combining_mark(c: char) -> bool {
 
 pub fn extract_filename_tokens(filename: &str) -> Vec<String> {
     let stopwords: &[&str] = &[
-        "copy", "final", "v1", "v2", "v3", "draft", "scan", "scanned", "ocr", "new", "old", "revised",
+        "copy", "final", "v1", "v2", "v3", "draft", "scan", "scanned", "ocr", "new", "old",
+        "revised",
     ];
-    let stem = filename.rsplit_once('.').map(|(s, _)| s).unwrap_or(filename);
+    let stem = filename
+        .rsplit_once('.')
+        .map(|(s, _)| s)
+        .unwrap_or(filename);
     stem.split(|c: char| c == '-' || c == '_' || c == '.' || c.is_whitespace())
         .map(|s| s.to_lowercase())
         .filter(|s| !s.is_empty())
@@ -39,7 +43,9 @@ pub fn extract_filename_tokens(filename: &str) -> Vec<String> {
 
 /// Split CamelCase or PascalCase into words, treating spaces as delimiters.
 fn split_camel_case(s: &str) -> Option<Vec<String>> {
-    if !s.chars().any(|c| c.is_uppercase()) { return None; }
+    if !s.chars().any(|c| c.is_uppercase()) {
+        return None;
+    }
     let mut parts: Vec<String> = Vec::new();
     let mut current = String::new();
     for c in s.chars() {
@@ -59,7 +65,11 @@ fn split_camel_case(s: &str) -> Option<Vec<String>> {
     if !current.is_empty() {
         parts.push(current.to_lowercase());
     }
-    if parts.len() >= 2 { Some(parts) } else { None }
+    if parts.len() >= 2 {
+        Some(parts)
+    } else {
+        None
+    }
 }
 
 /// Normalize a person name for searchability, covering all edge cases.
@@ -100,7 +110,12 @@ pub fn normalize_person_name(name: &str) -> Vec<String> {
     if let Some(camel_parts) = split_camel_case(original) {
         let spaced = camel_parts.join(" ");
         variants.insert(spaced);
-        let reversed = camel_parts.iter().rev().cloned().collect::<Vec<_>>().join(" ");
+        let reversed = camel_parts
+            .iter()
+            .rev()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(" ");
         variants.insert(reversed);
         let concat = camel_parts.join("");
         variants.insert(concat);
@@ -120,7 +135,12 @@ pub fn normalize_person_name(name: &str) -> Vec<String> {
             if all_parts.len() > 1 {
                 let spaced = all_parts.join(" ");
                 variants.insert(spaced);
-                let reversed = all_parts.iter().rev().cloned().collect::<Vec<_>>().join(" ");
+                let reversed = all_parts
+                    .iter()
+                    .rev()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(" ");
                 variants.insert(reversed);
                 let concat = all_parts.join("");
                 variants.insert(concat);
@@ -144,16 +164,37 @@ pub fn run_auto_tagger(
     // Process any pending documents from DB (recovery after crash or channel drops)
     if let Ok(pending) = tag_store.pending_auto_tags(100) {
         for p in pending {
-            if shutdown_flag.load(Ordering::Acquire) { break; }
-            tag_document(&p.content_hash, &p.filename, "", &p.content_hash_before_tag, &tag_store, provider.as_ref(), &auto_tag_config, progress.as_deref());
+            if shutdown_flag.load(Ordering::Acquire) {
+                break;
+            }
+            tag_document(
+                &p.content_hash,
+                &p.filename,
+                "",
+                &p.content_hash_before_tag,
+                &tag_store,
+                provider.as_ref(),
+                &auto_tag_config,
+                progress.as_deref(),
+            );
         }
     }
     while !shutdown_flag.load(Ordering::Acquire) {
         match rx.recv_timeout(Duration::from_millis(100)) {
             Ok(request) => {
-                if shutdown_flag.load(Ordering::Acquire) { break; }
-                let is_shutdown = process_request(request, &tag_store, provider.as_ref(), &auto_tag_config, progress.as_deref());
-                if is_shutdown { break; }
+                if shutdown_flag.load(Ordering::Acquire) {
+                    break;
+                }
+                let is_shutdown = process_request(
+                    request,
+                    &tag_store,
+                    provider.as_ref(),
+                    &auto_tag_config,
+                    progress.as_deref(),
+                );
+                if is_shutdown {
+                    break;
+                }
             }
             Err(crossbeam::channel::RecvTimeoutError::Timeout) => continue,
             Err(crossbeam::channel::RecvTimeoutError::Disconnected) => {
@@ -173,8 +214,22 @@ fn process_request(
     progress: Option<&std::sync::atomic::AtomicUsize>,
 ) -> bool {
     match request {
-        crate::app::AutoTagRequest::TagDocument { content_hash, filename, text, content_hash_before_tag } => {
-            tag_document(&content_hash, &filename, &text, &content_hash_before_tag, tag_store, provider, config, progress);
+        crate::app::AutoTagRequest::TagDocument {
+            content_hash,
+            filename,
+            text,
+            content_hash_before_tag,
+        } => {
+            tag_document(
+                &content_hash,
+                &filename,
+                &text,
+                &content_hash_before_tag,
+                tag_store,
+                provider,
+                config,
+                progress,
+            );
             false
         }
         crate::app::AutoTagRequest::Shutdown => {
@@ -184,6 +239,7 @@ fn process_request(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn tag_document(
     content_hash: &str,
     filename: &str,
@@ -203,7 +259,9 @@ fn tag_document(
     if let Ok(Some(status)) = tag_store.auto_tag_status(content_hash) {
         if status.content_hash_before_tag == content_hash_before_tag && status.status == "tagged" {
             debug!("cache hit (tier 1) for {filename}: exact hash match");
-            if let Some(p) = progress { p.fetch_add(1, Ordering::Relaxed); }
+            if let Some(p) = progress {
+                p.fetch_add(1, Ordering::Relaxed);
+            }
             return;
         }
     }
@@ -213,16 +271,30 @@ fn tag_document(
     if !tokens.is_empty() {
         if let Ok(Some(cached_json)) = tag_store.lookup_cache_by_tokens(&tokens, 0.5) {
             debug!("cache hit (tier 2) for {filename}: token overlap");
-            let _ = tag_store.upsert_auto_tag_status(content_hash, filename, content_hash_before_tag, "tagged", Some(&cached_json), None)
+            let _ = tag_store
+                .upsert_auto_tag_status(
+                    content_hash,
+                    filename,
+                    content_hash_before_tag,
+                    "tagged",
+                    Some(&cached_json),
+                    None,
+                )
                 .map_err(|e| warn!("failed to write cache result for {content_hash}: {e}"));
-            if let Some(p) = progress { p.fetch_add(1, Ordering::Relaxed); }
+            if let Some(p) = progress {
+                p.fetch_add(1, Ordering::Relaxed);
+            }
             return;
         }
     }
 
     // Tier 3: AI fallback
-    let existing_tags: Vec<String> = tag_store.list_tags().unwrap_or_default()
-        .into_iter().map(|t| t.name).collect();
+    let existing_tags: Vec<String> = tag_store
+        .list_tags()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|t| t.name)
+        .collect();
 
     let mut last_error = String::new();
     for attempt in 0..config.max_retries {
@@ -240,22 +312,35 @@ fn tag_document(
                     }
                 }
                 all_tags.truncate(config.max_tags_per_doc);
-                entities.persons = entities.persons.iter()
+                entities.persons = entities
+                    .persons
+                    .iter()
                     .flat_map(|n| normalize_person_name(n))
                     .collect::<std::collections::HashSet<_>>()
                     .into_iter()
                     .collect();
 
-                let tags_json = serde_json::json!({"tags": all_tags, "entities": entities}).to_string();
+                let tags_json =
+                    serde_json::json!({"tags": all_tags, "entities": entities}).to_string();
 
-                if let Err(e) = tag_store.upsert_auto_tag_status(content_hash, filename, content_hash_before_tag, "tagged", Some(&tags_json), None) {
+                if let Err(e) = tag_store.upsert_auto_tag_status(
+                    content_hash,
+                    filename,
+                    content_hash_before_tag,
+                    "tagged",
+                    Some(&tags_json),
+                    None,
+                ) {
                     warn!("failed to write auto-tag result for {content_hash}: {e}");
                 }
                 if !tokens.is_empty() {
-                    let _ = tag_store.upsert_cache_entry(&tokens.join(" "), &tags_json, content_hash);
+                    let _ =
+                        tag_store.upsert_cache_entry(&tokens.join(" "), &tags_json, content_hash);
                 }
                 debug!("AI tagged {filename}: {} tags", response.tags.len());
-                if let Some(p) = progress { p.fetch_add(1, Ordering::Relaxed); }
+                if let Some(p) = progress {
+                    p.fetch_add(1, Ordering::Relaxed);
+                }
                 return;
             }
             Err(e) => {
@@ -264,17 +349,30 @@ fn tag_document(
                     last_error = e.to_string();
                     break;
                 }
-                debug!("retry {}/{} for {filename}: {e}", attempt + 1, config.max_retries);
+                debug!(
+                    "retry {}/{} for {filename}: {e}",
+                    attempt + 1,
+                    config.max_retries
+                );
                 std::thread::sleep(Duration::from_secs(2u64.saturating_pow(attempt)));
             }
         }
     }
 
     warn!("auto-tag failed for {content_hash}: {last_error}");
-    if let Err(e) = tag_store.upsert_auto_tag_status(content_hash, filename, content_hash_before_tag, "failed", None, Some(&last_error)) {
+    if let Err(e) = tag_store.upsert_auto_tag_status(
+        content_hash,
+        filename,
+        content_hash_before_tag,
+        "failed",
+        None,
+        Some(&last_error),
+    ) {
         error!("failed to write auto-tag failure status for {content_hash}: {e}");
     }
-    if let Some(p) = progress { p.fetch_add(1, Ordering::Relaxed); }
+    if let Some(p) = progress {
+        p.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 #[cfg(test)]
@@ -308,13 +406,21 @@ mod tests {
     #[test]
     fn normalize_no_spaces_camelcase() {
         let v = normalize_person_name("YangGuoRui");
-        assert!(v.contains(&"yang guo rui".to_string()), "CamelCase should be split: {:?}", v);
+        assert!(
+            v.contains(&"yang guo rui".to_string()),
+            "CamelCase should be split: {:?}",
+            v
+        );
         assert!(v.contains(&"yangguorui".to_string()));
     }
     #[test]
     fn normalize_partial_spaces() {
         let v = normalize_person_name("YangGuo Rui");
-        assert!(v.contains(&"yang guo rui".to_string()), "partial spaces: {:?}", v);
+        assert!(
+            v.contains(&"yang guo rui".to_string()),
+            "partial spaces: {:?}",
+            v
+        );
         assert!(v.contains(&"yangguorui".to_string()));
     }
     #[test]
@@ -368,8 +474,16 @@ mod tests {
 
         struct DummyProvider;
         impl TagProvider for DummyProvider {
-            fn generate_tags(&self, _: &str, _: &str, _: &[String]) -> Result<TagResponse, TagError> {
-                Ok(TagResponse { tags: vec![], entities: Entities::default() })
+            fn generate_tags(
+                &self,
+                _: &str,
+                _: &str,
+                _: &[String],
+            ) -> Result<TagResponse, TagError> {
+                Ok(TagResponse {
+                    tags: vec![],
+                    entities: Entities::default(),
+                })
             }
         }
 
@@ -383,7 +497,10 @@ mod tests {
         let config = AutoTagConfig::default();
         let result = process_request(
             crate::app::AutoTagRequest::Shutdown,
-            &store, &provider, &config, None,
+            &store,
+            &provider,
+            &config,
+            None,
         );
         assert!(result, "Shutdown request should return true");
     }

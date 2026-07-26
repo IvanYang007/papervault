@@ -318,7 +318,7 @@ impl TagStore {
                         CASE WHEN a.status = 'tagged' THEN 1 ELSE 0 END
                  FROM documents d
                  LEFT JOIN auto_tag_status a ON d.content_hash = a.content_hash
-                 ORDER BY d.file_path"
+                 ORDER BY d.file_path",
             )?;
             let docs = stmt
                 .query_map([], |row| {
@@ -343,7 +343,7 @@ impl TagStore {
                  DELETE FROM auto_tag_status;
                  DELETE FROM document_tags;
                  DELETE FROM tags;
-                 DELETE FROM documents;"
+                 DELETE FROM documents;",
             )?;
             Ok(())
         })
@@ -800,10 +800,7 @@ mod tests {
         assert_eq!(status.filename, "doc.pdf");
         assert_eq!(status.content_hash_before_tag, "abc123def");
         assert_eq!(status.status, "tagged");
-        assert_eq!(
-            status.tags_json.unwrap(),
-            r#"{"tags":["tax","irs"]}"#
-        );
+        assert_eq!(status.tags_json.unwrap(), r#"{"tags":["tax","irs"]}"#);
     }
 
     #[test]
@@ -816,15 +813,9 @@ mod tests {
     #[test]
     fn pending_auto_tags_returns_only_pending() {
         let (store, _dir) = setup_test_store();
-        store
-            .upsert_document("h1", "/a.pdf", "pdf", 0, 0)
-            .unwrap();
-        store
-            .upsert_document("h2", "/b.pdf", "pdf", 0, 0)
-            .unwrap();
-        store
-            .upsert_document("h3", "/c.pdf", "pdf", 0, 0)
-            .unwrap();
+        store.upsert_document("h1", "/a.pdf", "pdf", 0, 0).unwrap();
+        store.upsert_document("h2", "/b.pdf", "pdf", 0, 0).unwrap();
+        store.upsert_document("h3", "/c.pdf", "pdf", 0, 0).unwrap();
 
         store
             .upsert_auto_tag_status("h1", "a.pdf", "x", "pending", None, None)
@@ -852,7 +843,14 @@ mod tests {
             .upsert_auto_tag_status("hash1", "doc.pdf", "x", "pending", None, None)
             .unwrap();
         store
-            .upsert_auto_tag_status("hash1", "doc.pdf", "y", "tagged", Some(r#"{"tags":["ok"]}"#), None)
+            .upsert_auto_tag_status(
+                "hash1",
+                "doc.pdf",
+                "y",
+                "tagged",
+                Some(r#"{"tags":["ok"]}"#),
+                None,
+            )
             .unwrap();
 
         let status = store.auto_tag_status("hash1").unwrap().unwrap();
@@ -880,8 +878,7 @@ mod tests {
         store.dismiss_auto_tag("hash1", "irs").unwrap();
 
         let status = store.auto_tag_status("hash1").unwrap().unwrap();
-        let json: serde_json::Value =
-            serde_json::from_str(&status.tags_json.unwrap()).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&status.tags_json.unwrap()).unwrap();
         let tags: Vec<&str> = json["tags"]
             .as_array()
             .unwrap()
@@ -949,10 +946,9 @@ mod tests {
             .upsert_cache_entry("tax return", r#"{"tags":["tax"]}"#, "h2")
             .unwrap();
 
-        let result = store.lookup_cache_by_tokens(
-            &["tax".into(), "return".into()],
-            0.5,
-        ).unwrap();
+        let result = store
+            .lookup_cache_by_tokens(&["tax".into(), "return".into()], 0.5)
+            .unwrap();
         assert!(result.is_some());
     }
 
@@ -981,10 +977,7 @@ mod tests {
                 .unwrap();
         }
 
-        let tokens: Vec<String> = ["tax", "return"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
+        let tokens: Vec<String> = ["tax", "return"].iter().map(|s| s.to_string()).collect();
         let result = store.lookup_cache_by_tokens(&tokens, 0.5).unwrap();
         // Should return the entry with higher hit_count (sorted DESC)
         assert!(result.is_some());
