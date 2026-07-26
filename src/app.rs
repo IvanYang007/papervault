@@ -945,6 +945,11 @@ impl PapervaultApp {
 
 impl eframe::App for PapervaultApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Process deferred search result click from previous frame
+        if let Some(idx) = self.clicked_index.take() {
+            self.select_result(idx);
+        }
+
         self.poll_channels(ctx);
 
         // Sync auto-tag progress from the shared counter (reindex batch only)
@@ -1467,7 +1472,7 @@ impl eframe::App for PapervaultApp {
                     ));
                 }
 
-                let mut clicked_idx = self.clicked_index.take();
+                let mut clicked_idx: Option<usize> = None;
                 let max_h = ui.available_size().y;
                 ScrollArea::vertical()
                     .id_salt("results_scroll")
@@ -1518,8 +1523,10 @@ impl eframe::App for PapervaultApp {
                         }
                     });
 
+                // Defer to next frame's update() so SidePanel::right sees selected_hash
                 if let Some(idx) = clicked_idx {
-                    self.select_result(idx);
+                    self.clicked_index = Some(idx);
+                    ctx.request_repaint();
                 }
             }
 
