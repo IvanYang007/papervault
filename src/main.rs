@@ -156,13 +156,13 @@ fn main() -> eframe::Result {
 
             // ── System tray icon (raw Shell_NotifyIconW in background thread) ──
             let tray_cmd_rx = {
-                let icon_path = std::path::PathBuf::from("assets/tray-icon.png");
+                let icon_path = std::path::PathBuf::from("assets/tray-icon.ico");
                 let icon_path = if icon_path.exists() {
                     icon_path
                 } else {
                     std::env::current_exe()
                         .ok()
-                        .and_then(|p| p.parent().map(|d| d.join("assets").join("tray-icon.png")))
+                        .and_then(|p| p.parent().map(|d| d.join("assets").join("tray-icon.ico")))
                         .unwrap_or(icon_path)
                 };
                 let icon_str = icon_path.display().to_string();

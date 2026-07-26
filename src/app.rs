@@ -10,17 +10,17 @@ use crate::tags::model::Tag;
 use crate::tags::store::DocumentInfo;
 use crate::tags::store::TagStore;
 use crate::watcher::watcher::IndexerMessage;
-use raw_window_handle::HasWindowHandle;
-use tracing::warn;
 use crossbeam::channel::{Receiver, Sender};
 use egui::{
     CentralPanel, Color32, Frame, RichText, ScrollArea, SidePanel, TextEdit, TopBottomPanel,
 };
+use raw_window_handle::HasWindowHandle;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
+use tracing::warn;
 
 /// Messages from the indexer thread to the UI thread.
 #[derive(Debug, Clone)]
@@ -975,7 +975,9 @@ impl PapervaultApp {
     fn hide_window(&self) {
         #[cfg(windows)]
         if let Some(hwnd) = self.hwnd {
-            unsafe { crate::win32::ShowWindow(hwnd, crate::win32::SW_HIDE); }
+            unsafe {
+                crate::win32::ShowWindow(hwnd, crate::win32::SW_HIDE);
+            }
         }
     }
 
@@ -1775,22 +1777,24 @@ impl eframe::App for PapervaultApp {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let mut changed = false;
                     if ui
-                        .add(egui::Checkbox::new(&mut self.config.minimize_to_tray, "Minimize to tray"))
+                        .add(egui::Checkbox::new(
+                            &mut self.config.minimize_to_tray,
+                            "Minimize to tray",
+                        ))
                         .changed()
                     {
                         changed = true;
                     }
-                    if self.auto_launch.is_some() {
-                        if ui
+                    if self.auto_launch.is_some()
+                        && ui
                             .add(egui::Checkbox::new(
                                 &mut self.config.start_with_windows,
                                 "Start with Windows",
                             ))
                             .changed()
-                        {
-                            self.sync_auto_start();
-                            changed = true;
-                        }
+                    {
+                        self.sync_auto_start();
+                        changed = true;
                     }
                     if changed {
                         if let Err(e) = self.config.save() {

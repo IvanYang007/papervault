@@ -2,7 +2,7 @@
 //! used in main.rs for CreateMutexW. Avoids pulling in the full `windows` crate.
 
 #![cfg(windows)]
-#![allow(non_snake_case, dead_code)]
+#![allow(non_snake_case, dead_code, clippy::upper_case_acronyms)]
 
 use std::ffi::c_void;
 
@@ -176,12 +176,22 @@ extern "system" {
         lpClassName: PCWSTR,
         lpWindowName: PCWSTR,
         dwStyle: DWORD,
-        X: i32, Y: i32, nWidth: i32, nHeight: i32,
-        hWndParent: HWND, hMenu: HMENU,
-        hInstance: HINSTANCE, lpParam: *mut c_void,
+        X: i32,
+        Y: i32,
+        nWidth: i32,
+        nHeight: i32,
+        hWndParent: HWND,
+        hMenu: HMENU,
+        hInstance: HINSTANCE,
+        lpParam: *mut c_void,
     ) -> HWND;
     pub fn DefWindowProcW(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) -> LRESULT;
-    pub fn GetMessageW(lpMsg: *mut MSG, hWnd: HWND, wMsgFilterMin: UINT, wMsgFilterMax: UINT) -> BOOL;
+    pub fn GetMessageW(
+        lpMsg: *mut MSG,
+        hWnd: HWND,
+        wMsgFilterMin: UINT,
+        wMsgFilterMax: UINT,
+    ) -> BOOL;
     pub fn TranslateMessage(lpMsg: *const MSG) -> BOOL;
     pub fn DispatchMessageW(lpMsg: *const MSG) -> LRESULT;
     pub fn PostQuitMessage(nExitCode: i32);
@@ -189,25 +199,35 @@ extern "system" {
     pub fn GetWindowLongPtrW(hWnd: HWND, nIndex: i32) -> isize;
     pub fn SetWindowLongPtrW(hWnd: HWND, nIndex: i32, dwNewLong: isize) -> isize;
     pub fn SetWindowPos(
-        hWnd: HWND, hWndInsertAfter: HWND,
-        X: i32, Y: i32, cx: i32, cy: i32, uFlags: UINT,
+        hWnd: HWND,
+        hWndInsertAfter: HWND,
+        X: i32,
+        Y: i32,
+        cx: i32,
+        cy: i32,
+        uFlags: UINT,
     ) -> BOOL;
     pub fn ShowWindow(hWnd: HWND, nCmdShow: i32) -> BOOL;
     pub fn SetForegroundWindow(hWnd: HWND) -> BOOL;
     pub fn Shell_NotifyIconW(dwMessage: DWORD, lpData: *const NOTIFYICONDATAW) -> BOOL;
     pub fn LoadImageW(
-        hInst: HINSTANCE, name: PCWSTR, typ: UINT,
-        cx: i32, cy: i32, fuLoad: UINT,
+        hInst: HINSTANCE,
+        name: PCWSTR,
+        typ: UINT,
+        cx: i32,
+        cy: i32,
+        fuLoad: UINT,
     ) -> HMODULE;
     pub fn CreatePopupMenu() -> HMENU;
-    pub fn AppendMenuW(
-        hMenu: HMENU, uFlags: UINT, uIDNewItem: usize,
-        lpNewItem: PCWSTR,
-    ) -> BOOL;
+    pub fn AppendMenuW(hMenu: HMENU, uFlags: UINT, uIDNewItem: usize, lpNewItem: PCWSTR) -> BOOL;
     pub fn DestroyMenu(hMenu: HMENU) -> BOOL;
     pub fn TrackPopupMenuEx(
-        hMenu: HMENU, uFlags: UINT, x: i32, y: i32,
-        hWnd: HWND, lptpm: *mut c_void,
+        hMenu: HMENU,
+        uFlags: UINT,
+        x: i32,
+        y: i32,
+        hWnd: HWND,
+        lptpm: *mut c_void,
     ) -> BOOL;
     pub fn GetCursorPos(lpPoint: *mut POINT) -> BOOL;
 }

@@ -5,8 +5,8 @@
 use crate::win32::*;
 use anyhow::Result;
 use crossbeam::channel::{Receiver, Sender};
-use tracing::{error, info, warn};
 use std::thread;
+use tracing::{error, info, warn};
 
 /// Commands from the tray icon back to the main application.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,10 +28,7 @@ fn to_wide(s: &str) -> Vec<u16> {
 
 /// Spawn the tray icon in a background thread with its own message pump.
 /// Returns a receiver for tray commands.
-pub fn spawn(
-    icon_path: &str,
-    tooltip: &str,
-) -> Result<Receiver<TrayCommand>> {
+pub fn spawn(icon_path: &str, tooltip: &str) -> Result<Receiver<TrayCommand>> {
     let wide_path = to_wide(icon_path);
 
     // Load the icon
@@ -57,23 +54,17 @@ pub fn spawn(
     let (tx, rx) = crossbeam::channel::bounded::<TrayCommand>(8);
     let tooltip = tooltip.to_string();
 
-    thread::Builder::new()
-        .name("tray".into())
-        .spawn(move || {
-            if let Err(e) = tray_thread(&tooltip, hicon, tx) {
-                error!("Tray thread error: {}", e);
-            }
-        })?;
+    thread::Builder::new().name("tray".into()).spawn(move || {
+        if let Err(e) = tray_thread(&tooltip, hicon, tx) {
+            error!("Tray thread error: {}", e);
+        }
+    })?;
 
     Ok(rx)
 }
 
 /// The tray icon thread body.
-fn tray_thread(
-    tooltip: &str,
-    hicon: isize,
-    tx: Sender<TrayCommand>,
-) -> Result<()> {
+fn tray_thread(tooltip: &str, hicon: isize, tx: Sender<TrayCommand>) -> Result<()> {
     let class_name = to_wide("PapervaultTray");
 
     let wc = WNDCLASSEXW {
@@ -99,8 +90,12 @@ fn tray_thread(
             PCWSTR(class_name.as_ptr()),
             PCWSTR(window_name.as_ptr()),
             WS_OVERLAPPED,
-            CW_USEDEFAULT, CW_USEDEFAULT, 0, 0,
-            0, 0,
+            CW_USEDEFAULT,
+            CW_USEDEFAULT,
+            0,
+            0,
+            0,
+            0,
             0,
             std::ptr::null_mut(),
         )
@@ -128,7 +123,7 @@ fn tray_thread(
         uID: uid,
         uFlags: NIF_ICON | NIF_MESSAGE | NIF_TIP,
         uCallbackMessage: callback_msg,
-        hIcon: hicon as isize,
+        hIcon: hicon,
         ..Default::default()
     };
 
