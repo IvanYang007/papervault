@@ -971,8 +971,7 @@ impl PapervaultApp {
                     ..
                 }
                 | TrayIconEvent::DoubleClick { .. } => {
-                    self.show_window();
-                    self.minimized_to_tray = false;
+                    self.restore_window(ctx);
                 }
                 _ => {}
             }
@@ -980,8 +979,7 @@ impl PapervaultApp {
 
         while let Ok(event) = MenuEvent::receiver().try_recv() {
             if Some(&event.id) == self.menu_open_id.as_ref() {
-                self.show_window();
-                self.minimized_to_tray = false;
+                self.restore_window(ctx);
             } else if Some(&event.id) == self.menu_exit_id.as_ref() {
                 self.should_exit = true;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -1005,27 +1003,16 @@ impl PapervaultApp {
         }
     }
 
-    /// Hide the window using raw Win32 ShowWindow (bypasses eframe Visible deadlock).
-    fn hide_window(&self) {
-        #[cfg(windows)]
-        if let Some(hwnd) = self.hwnd {
-            unsafe { crate::win32::ShowWindow(hwnd, crate::win32::SW_HIDE); }
-        }
-        #[cfg(not(windows))]
-        let _ = self;
-    }
-
-    /// Show and focus the window using raw Win32 ShowWindow.
-    fn show_window(&self) {
+    /// Restore window from tray: un-minimize via eframe + raw Win32 to bring to front.
+    fn restore_window(&mut self, ctx: &egui::Context) {
+        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
         #[cfg(windows)]
         if let Some(hwnd) = self.hwnd {
             unsafe {
-                crate::win32::ShowWindow(hwnd, crate::win32::SW_RESTORE);
                 crate::win32::SetForegroundWindow(hwnd);
             }
         }
-        #[cfg(not(windows))]
-        let _ = self;
+        self.minimized_to_tray = false;
     }
 }
 
@@ -1043,7 +1030,8 @@ impl eframe::App for PapervaultApp {
         if ctx.input(|i| i.viewport().close_requested()) {
             if !self.should_exit && self.config.minimize_to_tray && self.tray_icon.is_some() {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-                self.hide_window();
+                // Use Minimized to keep eframe event loop alive (SW_HIDE stops it on 0.30)
+                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
                 self.minimized_to_tray = true;
             }
             self.should_exit = false;
@@ -1052,6 +1040,11 @@ impl eframe::App for PapervaultApp {
         // ── Sync auto-start on first frame ──
         if self.auto_start_synced.take().is_some() {
             self.sync_auto_start();
+        }
+
+        // ── Keep eframe ticking when minimized to tray ──
+        if self.minimized_to_tray {
+            ctx.request_repaint_after(std::time::Duration::from_millis(200));
         }
 
         // Process deferred search result click from previous frame
