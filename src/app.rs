@@ -178,7 +178,7 @@ pub struct PapervaultApp {
     menu_open_id: Option<tray_icon::menu::MenuId>,
     menu_exit_id: Option<tray_icon::menu::MenuId>,
     /// Sync auto-start on first frame.
-    first_frame: bool,
+    auto_start_synced: Option<()>,
 }
 
 impl PapervaultApp {
@@ -276,7 +276,7 @@ impl PapervaultApp {
             should_exit: false,
             menu_open_id,
             menu_exit_id,
-            first_frame: true,
+            auto_start_synced: Some(()),
         }
     }
 
@@ -1016,13 +1016,11 @@ impl eframe::App for PapervaultApp {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
                 self.minimized_to_tray = true;
             }
-            // Reset should_exit so next close attempt works normally
             self.should_exit = false;
         }
 
         // ── Sync auto-start on first frame ──
-        if self.first_frame {
-            self.first_frame = false;
+        if self.auto_start_synced.take().is_some() {
             self.sync_auto_start();
         }
 
@@ -1776,16 +1774,7 @@ impl eframe::App for PapervaultApp {
                             ))
                             .changed()
                         {
-                            // Sync registry immediately on toggle
-                            if let Some(ref auto) = self.auto_launch {
-                                if self.config.start_with_windows {
-                                    if let Err(e) = auto.enable() {
-                                        warn!("Failed to enable auto-start: {}", e);
-                                    }
-                                } else if let Err(e) = auto.disable() {
-                                    warn!("Failed to disable auto-start: {}", e);
-                                }
-                            }
+                            self.sync_auto_start();
                             changed = true;
                         }
                     }
