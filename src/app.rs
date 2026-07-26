@@ -802,6 +802,30 @@ impl PapervaultApp {
         self.status_message = format!("Queued {} files for tagging", total);
     }
 
+    /// Get auto-tags for a document from the store. Returns empty vec if no tags.
+    fn query_auto_tags(store: &Option<TagStore>, content_hash: &str) -> Vec<String> {
+        let Some(ref store) = store else {
+            return Vec::new();
+        };
+        let Ok(Some(status)) = store.auto_tag_status(content_hash) else {
+            return Vec::new();
+        };
+        let Some(ref json) = status.tags_json else {
+            return Vec::new();
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(json) else {
+            return Vec::new();
+        };
+        value["tags"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|t| t.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     fn assign_tag_to_selected(&mut self, tag_id: i64) {
         let Some(ref content_hash) = self.selected_hash else {
             return;
@@ -1324,8 +1348,7 @@ impl eframe::App for PapervaultApp {
                                     _ => "📎",
                                 };
                                 let sparkle = if doc.has_tags { "✨" } else { "" };
-                                let is_selected =
-                                    self.selected_files.contains(&doc.file_path);
+                                let is_selected = self.selected_files.contains(&doc.file_path);
                                 let is_browsed =
                                     self.browsed_file.as_deref() == Some(&doc.file_path);
                                 // Background for selected files
@@ -1338,9 +1361,7 @@ impl eframe::App for PapervaultApp {
                                 let resp = Frame::default()
                                     .fill(sel_bg)
                                     .rounding(egui::Rounding::same(2.0))
-                                    .show(ui, |ui| {
-                                        ui.selectable_label(is_browsed, &label)
-                                    });
+                                    .show(ui, |ui| ui.selectable_label(is_browsed, &label));
                                 if resp.inner.clicked() {
                                     if ctrl_held {
                                         toggled_file = Some(doc.file_path.clone());
@@ -1351,21 +1372,16 @@ impl eframe::App for PapervaultApp {
                                 }
                                 // Show auto-tags inline for browsed file
                                 if is_browsed && doc.has_tags {
-                                    if let Some(ref store) = self.tag_store {
-                                        if let Ok(Some(status)) = store.auto_tag_status(&doc.content_hash) {
-                                            if let Some(ref json) = status.tags_json {
-                                                if let Ok(value) = serde_json::from_str::<serde_json::Value>(json) {
-                                                    if let Some(tags) = value["tags"].as_array() {
-                                                        let tag_str: Vec<&str> = tags.iter().filter_map(|t| t.as_str()).take(5).collect();
-                                                        ui.label(
-                                                            RichText::new(format!("  🏷 {}", tag_str.join(", ")))
-                                                                .size(10.0)
-                                                                .color(Color32::from_rgb(140, 160, 200)),
-                                                        );
-                                                    }
-                                                }
-                                            }
-                                        }
+                                    let tags =
+                                        Self::query_auto_tags(&self.tag_store, &doc.content_hash);
+                                    if !tags.is_empty() {
+                                        let preview: Vec<&str> =
+                                            tags.iter().map(|s| s.as_str()).take(5).collect();
+                                        ui.label(
+                                            RichText::new(format!("  🏷 {}", preview.join(", ")))
+                                                .size(10.0)
+                                                .color(Color32::from_rgb(140, 160, 200)),
+                                        );
                                     }
                                 }
                             }
@@ -1511,31 +1527,20 @@ impl eframe::App for PapervaultApp {
                 // ── Right column: preview / empty states ──
 
                 // ── Show tags at top of preview when a file is selected ──
-                if let Some(ref hash) = self.selected_hash.clone() {
-                    if let Some(ref store) = self.tag_store {
-                        if let Ok(Some(status)) = store.auto_tag_status(hash) {
-                            if let Some(ref json) = status.tags_json {
-                                if let Ok(value) = serde_json::from_str::<serde_json::Value>(json) {
-                                    if let Some(tags) = value["tags"].as_array() {
-                                        if !tags.is_empty() {
-                                            let tag_strs: Vec<&str> =
-                                                tags.iter().filter_map(|t| t.as_str()).collect();
-                                            columns[1].horizontal_wrapped(|ui| {
-                                                ui.label("🏷");
-                                                for tag in &tag_strs {
-                                                    ui.label(
-                                                        RichText::new(*tag).size(13.0).color(
-                                                            Color32::from_rgb(200, 220, 255),
-                                                        ),
-                                                    );
-                                                }
-                                            });
-                                            columns[1].separator();
-                                        }
-                                    }
-                                }
+                if let Some(ref hash) = self.selected_hash {
+                    let tags = Self::query_auto_tags(&self.tag_store, hash);
+                    if !tags.is_empty() {
+                        columns[1].horizontal_wrapped(|ui| {
+                            ui.label("🏷");
+                            for tag in &tags {
+                                ui.label(
+                                    RichText::new(tag)
+                                        .size(13.0)
+                                        .color(Color32::from_rgb(200, 220, 255)),
+                                );
                             }
-                        }
+                        });
+                        columns[1].separator();
                     }
                 }
 
