@@ -774,13 +774,13 @@ impl PapervaultApp {
                 if cursor < *start {
                     ui.label(
                         RichText::new(&snippet[cursor..*start])
-                            .small()
+                            .size(16.0)
                             .color(Color32::GRAY),
                     );
                 }
                 ui.label(
                     RichText::new(&snippet[*start..*end])
-                        .small()
+                        .size(16.0)
                         .color(Color32::BLACK)
                         .background_color(Color32::from_rgb(255, 215, 0)),
                 );
@@ -789,7 +789,7 @@ impl PapervaultApp {
             if cursor < snippet.len() {
                 ui.label(
                     RichText::new(&snippet[cursor..])
-                        .small()
+                        .size(16.0)
                         .color(Color32::GRAY),
                 );
             }
@@ -1247,7 +1247,7 @@ impl eframe::App for PapervaultApp {
                 }
             });
             // Sizing constants for search results; row height relates to font sizes.
-            let result_filename_size = 14.0_f32;
+            let result_filename_size = 11.0_f32;
             let tag_label_size = 14.0_f32;
 
             // Active tag filter chips
