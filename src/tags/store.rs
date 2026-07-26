@@ -315,9 +315,11 @@ impl TagStore {
         self.with_conn(|conn| {
             let mut stmt = conn.prepare(
                 "SELECT d.file_path, d.file_type, d.content_hash,
-                        CASE WHEN a.status = 'tagged' THEN 1 ELSE 0 END
+                        (SELECT COUNT(*) FROM auto_tag_status a WHERE a.content_hash = d.content_hash AND a.status = 'tagged')
+                        +
+                        (SELECT COUNT(*) FROM document_tags dt WHERE dt.document_hash = d.content_hash)
+                        AS tag_indicator
                  FROM documents d
-                 LEFT JOIN auto_tag_status a ON d.content_hash = a.content_hash
                  ORDER BY d.file_path",
             )?;
             let docs = stmt
@@ -326,7 +328,7 @@ impl TagStore {
                         file_path: row.get(0)?,
                         file_type: row.get(1)?,
                         content_hash: row.get(2)?,
-                        has_auto_tags: row.get::<_, i64>(3)? != 0,
+                        has_auto_tags: row.get::<_, i64>(3)? > 0,
                     })
                 })?
                 .filter_map(|r| r.ok())
