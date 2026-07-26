@@ -317,7 +317,7 @@ impl TagStore {
                 "SELECT d.file_path, d.file_type, d.content_hash,
                         (SELECT COUNT(*) FROM auto_tag_status a WHERE a.content_hash = d.content_hash AND a.status = 'tagged')
                         +
-                        (SELECT COUNT(*) FROM document_tags dt WHERE dt.document_hash = d.content_hash)
+                        (SELECT COUNT(*) FROM document_tags dt WHERE dt.content_hash = d.content_hash)
                         AS tag_indicator
                  FROM documents d
                  ORDER BY d.file_path",
@@ -328,7 +328,7 @@ impl TagStore {
                         file_path: row.get(0)?,
                         file_type: row.get(1)?,
                         content_hash: row.get(2)?,
-                        has_auto_tags: row.get::<_, i64>(3)? > 0,
+                        has_tags: row.get::<_, i64>(3)? > 0,
                     })
                 })?
                 .filter_map(|r| r.ok())
@@ -358,7 +358,8 @@ pub struct DocumentInfo {
     pub file_path: String,
     pub file_type: String,
     pub content_hash: String,
-    pub has_auto_tags: bool,
+    /// True when the document has any tags (auto-tag or manually assigned).
+    pub has_tags: bool,
 }
 
 // ── Auto-Tag Status ──

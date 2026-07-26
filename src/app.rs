@@ -1311,7 +1311,7 @@ impl eframe::App for PapervaultApp {
                                     "md" => "📋",
                                     _ => "📎",
                                 };
-                                let sparkle = if doc.has_auto_tags { "✨" } else { "" };
+                                let sparkle = if doc.has_tags { "✨" } else { "" };
                                 let is_selected =
                                     self.selected_files.contains(&doc.file_path);
                                 let is_browsed =
@@ -1338,7 +1338,7 @@ impl eframe::App for PapervaultApp {
                                     }
                                 }
                                 // Show auto-tags inline for browsed file
-                                if is_browsed && doc.has_auto_tags {
+                                if is_browsed && doc.has_tags {
                                     if let Some(ref store) = self.tag_store {
                                         if let Ok(Some(status)) = store.auto_tag_status(&doc.content_hash) {
                                             if let Some(ref json) = status.tags_json {
