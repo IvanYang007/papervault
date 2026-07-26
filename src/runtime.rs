@@ -94,6 +94,7 @@ impl FolderRuntime {
         let progress_tx_clone = progress_tx.clone();
         let watcher_folder = folder.to_path_buf();
         let indexer_auto_tagger_tx = auto_tagger_tx.clone();
+        let indexer_shutdown = watcher_shutdown.clone();
         let indexer_handle =
             std::thread::Builder::new()
                 .name("indexer".into())
@@ -106,6 +107,7 @@ impl FolderRuntime {
                         tag_rx,
                         progress_tx_clone,
                         Some(indexer_auto_tagger_tx),
+                        indexer_shutdown,
                     );
                     p.run();
                 })?;

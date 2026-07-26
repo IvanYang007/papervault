@@ -5,6 +5,7 @@ use crate::tags::store::TagStore;
 use crate::watcher::watcher::IndexerMessage;
 use crossbeam::channel::{Receiver, Sender};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tantivy::schema::Value;
@@ -23,6 +24,8 @@ pub struct Pipeline {
     auto_tagger_tx: Option<Sender<AutoTagRequest>>,
     pending_count: usize,
     commit_batch_size: usize,
+    /// Shared shutdown flag — checked during initial scan to allow fast close.
+    shutdown: Arc<AtomicBool>,
 }
 
 impl Pipeline {
@@ -34,6 +37,7 @@ impl Pipeline {
         tag_rx: Receiver<TagUpdate>,
         progress_tx: Sender<IndexerProgress>,
         auto_tagger_tx: Option<Sender<AutoTagRequest>>,
+        shutdown: Arc<AtomicBool>,
     ) -> Self {
         Self {
             search_engine,
@@ -45,6 +49,7 @@ impl Pipeline {
             auto_tagger_tx,
             pending_count: 0,
             commit_batch_size: 10,
+            shutdown,
         }
     }
 
@@ -81,6 +86,14 @@ impl Pipeline {
         let mut batch: Vec<(PathBuf, u64, u64)> = Vec::with_capacity(PARALLEL_BATCH);
 
         for msg in scan_rx {
+            // Check shutdown flag periodically — allows fast close during scan
+            if self.shutdown.load(Ordering::Relaxed) {
+                info!(
+                    "Initial scan interrupted by shutdown at {} files",
+                    scan_processed
+                );
+                break;
+            }
             match msg {
                 IndexerMessage::Upsert { path, mtime, size } => {
                     batch.push((path, mtime, size));
@@ -665,6 +678,7 @@ mod tests {
     use super::*;
     use crate::tags::store::TagStore;
     use rusqlite::Connection;
+    use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
 
     fn setup_tag_store() -> (TagStore, tempfile::TempDir) {
@@ -870,6 +884,7 @@ mod tests {
         drop(msg_tx);
         drop(tag_tx);
 
+        let shutdown = Arc::new(AtomicBool::new(false));
         // Create pipeline — it will process the Upsert then hit Disconnected
         let mut pipeline = Pipeline::new(
             engine.clone(),
@@ -879,6 +894,7 @@ mod tests {
             tag_rx,
             progress_tx,
             None,
+            shutdown,
         );
 
         // Run should process the document, then shutdown and commit
@@ -969,6 +985,7 @@ mod tests {
             tag_rx,
             progress_tx,
             None,
+            Arc::new(AtomicBool::new(false)),
         );
 
         // Process batch with offset 0
@@ -1055,6 +1072,7 @@ mod tests {
             tag_rx,
             progress_tx,
             None,
+            Arc::new(AtomicBool::new(false)),
         );
 
         // Process with offset 10 (simulating second batch)
@@ -1131,6 +1149,7 @@ mod tests {
             tag_rx,
             progress_tx,
             None,
+            Arc::new(AtomicBool::new(false)),
         );
 
         // Corrupt PDF should not crash — just skip
