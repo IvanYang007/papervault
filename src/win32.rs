@@ -7,8 +7,9 @@
 pub type HWND = isize;
 
 pub const SW_HIDE: i32 = 0;
-pub const SW_SHOW: i32 = 5;
+pub const SW_RESTORE: i32 = 9;
 
 extern "system" {
     pub fn ShowWindow(hWnd: HWND, nCmdShow: i32) -> i32;
+    pub fn SetForegroundWindow(hWnd: HWND) -> i32;
 }

@@ -1020,7 +1020,8 @@ impl PapervaultApp {
         #[cfg(windows)]
         if let Some(hwnd) = self.hwnd {
             unsafe {
-                crate::win32::ShowWindow(hwnd, crate::win32::SW_SHOW);
+                crate::win32::ShowWindow(hwnd, crate::win32::SW_RESTORE);
+                crate::win32::SetForegroundWindow(hwnd);
             }
         }
         #[cfg(not(windows))]
