@@ -29,6 +29,7 @@ pub struct Pipeline {
 }
 
 impl Pipeline {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         search_engine: Arc<std::sync::Mutex<SearchEngine>>,
         tag_store: TagStore,
@@ -66,67 +67,80 @@ impl Pipeline {
         crate::indexer::pipeline::reconcile(self.search_engine.clone(), &self.tag_store);
         info!("Reconciliation complete.");
 
-        // Run initial file scan on the pipeline thread (not the watcher) so
-        // the watcher never blocks on a bounded channel and always responds
-        // to shutdown signals.
-        info!("Running initial file scan...");
-        let (scan_tx, scan_rx) = crossbeam::channel::bounded::<IndexerMessage>(256);
-        let folder = self.watcher_folder.clone();
-        std::thread::spawn(move || {
-            if let Err(e) = crate::watcher::watcher::emit_initial_scan(&folder, &scan_tx) {
-                tracing::error!("Initial scan failed: {}", e);
-            }
-        });
+        // Check if the index already has documents — if so, skip initial scan.
+        // Subsequent file changes are handled by the watcher.
+        let doc_count = {
+            let eng = self.search_engine.lock().unwrap_or_else(|e| e.into_inner());
+            eng.doc_count().unwrap_or(0)
+        };
         let mut scan_processed = 0usize;
+        if doc_count > 0 {
+            info!(
+                "Index already has {} documents — skipping initial scan",
+                doc_count
+            );
+        } else {
+            info!("Running initial file scan...");
+            let (scan_tx, scan_rx) = crossbeam::channel::bounded::<IndexerMessage>(256);
+            let folder = self.watcher_folder.clone();
+            std::thread::spawn(move || {
+                if let Err(e) = crate::watcher::watcher::emit_initial_scan(&folder, &scan_tx) {
+                    tracing::error!("Initial scan failed: {}", e);
+                }
+            });
+            scan_processed = 0;
 
-        // Batch files for parallel extraction (Tantivy writes stay sequential).
-        // Larger batch = better parallelism, but also more memory for extracted text.
-        // 32 files × ~50KB avg text = ~1.6MB per batch — well within desktop memory.
-        const PARALLEL_BATCH: usize = 32;
-        let mut batch: Vec<(PathBuf, u64, u64)> = Vec::with_capacity(PARALLEL_BATCH);
+            // Batch files for parallel extraction (Tantivy writes stay sequential).
+            // Larger batch = better parallelism, but also more memory for extracted text.
+            // 32 files × ~50KB avg text = ~1.6MB per batch — well within desktop memory.
+            const PARALLEL_BATCH: usize = 32;
+            let mut batch: Vec<(PathBuf, u64, u64)> = Vec::with_capacity(PARALLEL_BATCH);
 
-        for msg in scan_rx {
-            // Check shutdown flag periodically — allows fast close during scan
-            if self.shutdown.load(Ordering::Relaxed) {
-                info!(
-                    "Initial scan interrupted by shutdown at {} files",
-                    scan_processed
-                );
-                break;
-            }
-            match msg {
-                IndexerMessage::Upsert { path, mtime, size } => {
-                    batch.push((path, mtime, size));
-                    if batch.len() >= PARALLEL_BATCH {
-                        let batch_start = scan_processed;
-                        scan_processed += self.process_batch(&batch, batch_start);
-                        batch.clear();
+            for msg in scan_rx {
+                // Check shutdown flag periodically — allows fast close during scan
+                if self.shutdown.load(Ordering::Relaxed) {
+                    info!(
+                        "Initial scan interrupted by shutdown at {} files",
+                        scan_processed
+                    );
+                    break;
+                }
+                match msg {
+                    IndexerMessage::Upsert { path, mtime, size } => {
+                        batch.push((path, mtime, size));
+                        if batch.len() >= PARALLEL_BATCH {
+                            let batch_start = scan_processed;
+                            scan_processed += self.process_batch(&batch, batch_start);
+                            batch.clear();
+                        }
+                    }
+                    IndexerMessage::Delete { path } => {
+                        debug!("Pipeline delete: {}", path.display());
+                        if let Err(e) = self.process_delete(&path) {
+                            error!("Delete error for {}: {}", path.display(), e);
+                        }
                     }
                 }
-                IndexerMessage::Delete { path } => {
-                    debug!("Pipeline delete: {}", path.display());
-                    if let Err(e) = self.process_delete(&path) {
-                        error!("Delete error for {}: {}", path.display(), e);
-                    }
+            }
+            // Process remaining batch
+            if !batch.is_empty() {
+                let batch_start = scan_processed;
+                scan_processed += self.process_batch(&batch, batch_start);
+            }
+            // Commit any pending files from the initial scan
+            if self.pending_count > 0 {
+                if let Err(e) = self.commit() {
+                    error!("Initial scan commit error: {}", e);
                 }
+                self.pending_count = 0;
             }
-        }
-        // Process remaining batch
-        if !batch.is_empty() {
-            let batch_start = scan_processed;
-            scan_processed += self.process_batch(&batch, batch_start);
-        }
-        // Commit any pending files from the initial scan
-        if self.pending_count > 0 {
-            if let Err(e) = self.commit() {
-                error!("Initial scan commit error: {}", e);
-            }
-            self.pending_count = 0;
         }
         let _ = self.progress_tx.send(IndexerProgress::ScanComplete {
             total: scan_processed,
         });
-        info!("Initial scan complete: {} files indexed", scan_processed);
+        if scan_processed > 0 {
+            info!("Initial scan complete: {} files indexed", scan_processed);
+        }
 
         let mut total_processed: usize = scan_processed;
         let mut last_commit = Instant::now();
