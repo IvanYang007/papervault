@@ -192,7 +192,9 @@ impl FolderRuntime {
         }
         drop(self.auto_tagger_tx.take());
         for handle in self.auto_tagger_handles.drain(..) {
-            // Join with 5-second timeout — workers mid-API-call may take longer
+            // Workers check the shutdown flag every recv_timeout(100ms) and
+            // will exit within 100ms of completing their current API call.
+            // ureq's timeout_read ensures no call holds longer than configured.
             let _ = handle.join();
         }
 

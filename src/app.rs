@@ -289,14 +289,15 @@ impl PapervaultApp {
 
                 // Show auto-tag progress if there are pending entries
                 if let Some(ref store) = self.tag_store {
-                    if let Ok(pending) = store.pending_auto_tags(0) {
-                        let completed = store
-                            .auto_tag_status_count("tagged")
-                            .unwrap_or(0);
-                        let total = pending.len() + completed;
-                        if total > 0 {
-                            self.auto_tag_progress = Some((completed, total));
-                        }
+                    let pending = store
+                        .auto_tag_status_count("pending")
+                        .unwrap_or(0);
+                    let completed = store
+                        .auto_tag_status_count("tagged")
+                        .unwrap_or(0);
+                    let total = pending + completed;
+                    if total > 0 {
+                        self.auto_tag_progress = Some((completed, total));
                     }
                 }
             }

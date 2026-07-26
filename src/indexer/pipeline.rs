@@ -277,7 +277,13 @@ impl Pipeline {
         let thread_pool = rayon::ThreadPoolBuilder::new()
             .num_threads(num_cpus::get_physical())
             .build()
-            .unwrap_or_else(|_| rayon::ThreadPoolBuilder::new().build().unwrap());
+            .unwrap_or_else(|_| {
+                tracing::warn!("Failed to build custom thread pool — falling back to global");
+                rayon::ThreadPoolBuilder::new()
+                    .build()
+                    .unwrap_or_else(|_| rayon::ThreadPoolBuilder::new().num_threads(1).build()
+                        .expect("rayon global pool unavailable"))
+            });
 
         // Phase 1: Extract text in parallel with per-file panic isolation.
         // One malformed PDF must not abort the entire batch.
@@ -864,11 +870,6 @@ pub fn reconcile(engine: Arc<std::sync::Mutex<SearchEngine>>, tag_store: &TagSto
         }
         // Also clean up SQLite entries
         for hash in &ghost_hashes {
-            if let Some(path) = tag_store.get_hash_by_path(hash).ok().flatten() {
-                // get_hash_by_path uses file_path — for ghosts, we need to find path by hash
-                drop(path);
-            }
-            // Delete from SQLite by content_hash
             if let Err(e) = tag_store.delete_document_by_hash(hash) {
                 warn!("Ghost sweep SQLite delete failed for {}: {}", hash, e);
             }

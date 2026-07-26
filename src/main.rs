@@ -41,8 +41,14 @@ fn try_acquire_single_instance() -> bool {
             .chain(std::iter::once(0))
             .collect();
         unsafe {
-            let _handle = CreateMutexW(std::ptr::null_mut(), 1, name.as_ptr());
-            GetLastError() != ERROR_ALREADY_EXISTS
+            let handle = CreateMutexW(std::ptr::null_mut(), 1, name.as_ptr());
+            if GetLastError() == ERROR_ALREADY_EXISTS {
+                return false;
+            }
+            // Must NOT drop this handle — it keeps the kernel mutex alive.
+            // Leaking is intentional: the OS cleans up when the process exits.
+            std::mem::forget(handle);
+            true
         }
     }
     #[cfg(not(windows))]

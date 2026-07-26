@@ -287,9 +287,18 @@ impl TagStore {
         modified_ts: i64,
     ) -> SqlResult<()> {
         self.with_conn(|conn| {
+            // Use INSERT … ON CONFLICT UPDATE to avoid CASCADE DELETE on REPLACE.
+            // INSERT OR REPLACE would delete the old row (cascading to document_tags
+            // and auto_tag_status), then insert a new row — losing all tag associations.
             conn.execute(
-                "INSERT OR REPLACE INTO documents (content_hash, file_path, file_type, file_size, modified_ts, indexed_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, datetime('now'))",
+                "INSERT INTO documents (content_hash, file_path, file_type, file_size, modified_ts, indexed_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, datetime('now'))
+                 ON CONFLICT(content_hash) DO UPDATE SET
+                     file_path = excluded.file_path,
+                     file_type = excluded.file_type,
+                     file_size = excluded.file_size,
+                     modified_ts = excluded.modified_ts,
+                     indexed_at = datetime('now')",
                 params![content_hash, file_path, file_type, file_size, modified_ts],
             )?;
             Ok(())
@@ -397,6 +406,7 @@ pub struct DocumentInfo {
 
 impl TagStore {
     /// Insert or update auto-tagging status for a document.
+    /// Preserves created_at and increments attempts on conflict.
     pub fn upsert_auto_tag_status(
         &self,
         content_hash: &str,
@@ -408,9 +418,17 @@ impl TagStore {
     ) -> SqlResult<()> {
         self.with_conn(|conn| {
             conn.execute(
-                "INSERT OR REPLACE INTO auto_tag_status
-                 (content_hash, filename, content_hash_before_tag, status, tags_json, last_error, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, datetime('now'))",
+                "INSERT INTO auto_tag_status
+                 (content_hash, filename, content_hash_before_tag, status, tags_json, last_error, attempts, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, datetime('now'))
+                 ON CONFLICT(content_hash) DO UPDATE SET
+                     filename = excluded.filename,
+                     content_hash_before_tag = excluded.content_hash_before_tag,
+                     status = excluded.status,
+                     tags_json = excluded.tags_json,
+                     last_error = excluded.last_error,
+                     attempts = auto_tag_status.attempts + 1,
+                     updated_at = datetime('now')",
                 params![
                     content_hash,
                     filename,

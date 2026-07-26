@@ -21,26 +21,26 @@ impl RateLimiter {
     }
 
     /// Wait until a rate-limit slot is available, then record this request.
-    fn acquire(&mut self) {
+    /// Compute how long to wait before a rate-limit slot opens (0 if available).
+    /// Caller must sleep this duration OUTSIDE the Mutex lock.
+    fn wait_duration(&mut self) -> Duration {
         let now = Instant::now();
         let window = Duration::from_secs(60);
         let max_requests = 30usize;
 
-        // Purge expired timestamps
         self.timestamps.retain(|t| now - *t < window);
 
         if self.timestamps.len() >= max_requests {
             let oldest = self.timestamps[0];
             let wait = window.saturating_sub(now - oldest);
             if !wait.is_zero() {
-                debug!("Rate limiter: waiting {:?} for slot", wait);
-                std::thread::sleep(wait);
+                return wait;
             }
-            // Purge again after sleep
             let now = Instant::now();
             self.timestamps.retain(|t| now - *t < window);
         }
         self.timestamps.push(Instant::now());
+        Duration::ZERO
     }
 }
 
@@ -380,9 +380,15 @@ fn tag_document(
 
     let mut last_error = String::new();
     for attempt in 0..config.max_retries {
-        // Rate-limit API calls (shared across all auto-tagger threads)
-        if let Some(ref limiter) = rate_limiter {
-            limiter.lock().unwrap_or_else(|e| e.into_inner()).acquire();
+        // Rate-limit API calls (shared across all auto-tagger threads).
+        // Sleep outside the Mutex lock so other workers can acquire slots.
+        if let Some(limiter) = rate_limiter {
+            let wait = {
+                limiter.lock().unwrap_or_else(|e| e.into_inner()).wait_duration()
+            };
+            if !wait.is_zero() {
+                std::thread::sleep(wait);
+            }
         }
         match provider.generate_tags(filename, text, &existing_tags) {
             Ok(response) => {
@@ -603,5 +609,28 @@ mod tests {
             None,
         );
         assert!(result, "Shutdown request should return true");
+    }
+
+    #[test]
+    fn rate_limiter_allows_under_limit() {
+        let mut rl = RateLimiter::new();
+        // 10 acquires at well under 30/min should complete instantly
+        for _ in 0..10 {
+            let wait = rl.wait_duration();
+            assert_eq!(wait, std::time::Duration::ZERO, "Under limit should not wait");
+        }
+    }
+
+    #[test]
+    fn rate_limiter_blocks_when_full() {
+        let mut rl = RateLimiter::new();
+        // Fill to 30 (the limit)
+        for _ in 0..30 {
+            let wait = rl.wait_duration();
+            assert_eq!(wait, std::time::Duration::ZERO, "First 30 should not wait");
+        }
+        // The 31st should require a wait
+        let wait = rl.wait_duration();
+        assert!(wait > std::time::Duration::ZERO, "31st request should be delayed");
     }
 }

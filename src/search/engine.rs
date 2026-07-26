@@ -858,4 +858,148 @@ mod tests {
         let results = engine.search(&SearchRequest::new("tax".into())).unwrap();
         assert_eq!(results.total_hits, 1);
     }
+
+    #[test]
+    fn search_chinese_text_finds_substring_match() {
+        let (mut engine, _dir) = create_test_engine();
+        engine
+            .index_document(
+                "hash_cjk1pdf",
+                Path::new("/test/chinese.pdf"),
+                "chinese.pdf",
+                "你好世界这是一份税务文件",
+                "pdf",
+                1700000000,
+                "hash_cjk1",
+                &[],
+            )
+            .unwrap();
+        engine.commit().unwrap();
+        engine.reload().unwrap();
+
+        // Search for a bigram substring (NgramTokenizer(1,2) produces bigrams like "税务")
+        let results = engine
+            .search(&SearchRequest::new("税务".into()))
+            .unwrap();
+        assert_eq!(results.total_hits, 1, "CJK bigram search should find match");
+    }
+
+    #[test]
+    fn search_japanese_text_finds_substring_match() {
+        let (mut engine, _dir) = create_test_engine();
+        engine
+            .index_document(
+                "hash_cjk2pdf",
+                Path::new("/test/japanese.pdf"),
+                "japanese.pdf",
+                "これは税金の書類です",
+                "pdf",
+                1700000000,
+                "hash_cjk2",
+                &[],
+            )
+            .unwrap();
+        engine.commit().unwrap();
+        engine.reload().unwrap();
+
+        let results = engine
+            .search(&SearchRequest::new("税金".into()))
+            .unwrap();
+        assert_eq!(results.total_hits, 1, "Japanese substring search should find match");
+    }
+
+    #[test]
+    fn search_cjk_document_with_ascii_term_also_works() {
+        let (mut engine, _dir) = create_test_engine();
+        engine
+            .index_document(
+                "hash_cjk3pdf",
+                Path::new("/test/mixed.pdf"),
+                "mixed.pdf",
+                "你好世界 invoice 2023",
+                "pdf",
+                1700000000,
+                "hash_cjk3",
+                &[],
+            )
+            .unwrap();
+        engine.commit().unwrap();
+        engine.reload().unwrap();
+
+        // ASCII term should still work on mixed-content documents
+        let results = engine
+            .search(&SearchRequest::new("invoice".into()))
+            .unwrap();
+        assert_eq!(results.total_hits, 1);
+
+        // CJK term should also work
+        let results = engine
+            .search(&SearchRequest::new("你好".into()))
+            .unwrap();
+        assert_eq!(results.total_hits, 1);
+    }
+
+    #[test]
+    fn search_cjk_no_match_returns_empty() {
+        let (mut engine, _dir) = create_test_engine();
+        engine
+            .index_document(
+                "hash_cjk4pdf",
+                Path::new("/test/chinese.pdf"),
+                "chinese.pdf",
+                "你好世界这是一份税务文件",
+                "pdf",
+                1700000000,
+                "hash_cjk4",
+                &[],
+            )
+            .unwrap();
+        engine.commit().unwrap();
+        engine.reload().unwrap();
+
+        let results = engine
+            .search(&SearchRequest::new("银行".into()))
+            .unwrap();
+        assert_eq!(results.total_hits, 0, "Non-matching CJK term should return 0");
+    }
+
+    #[test]
+    fn search_long_cjk_document_no_token_drop() {
+        let (mut engine, _dir) = create_test_engine();
+        let long_cjk: String = std::iter::repeat("这是一份中文税务和会计财务报表文件")
+            .take(100)
+            .collect::<Vec<_>>()
+            .join("");
+        engine
+            .index_document(
+                "hash_cjk5pdf",
+                Path::new("/test/long_cjk.pdf"),
+                "long_cjk.pdf",
+                &long_cjk,
+                "pdf",
+                1700000000,
+                "hash_cjk5",
+                &[],
+            )
+            .unwrap();
+        engine.commit().unwrap();
+        engine.reload().unwrap();
+
+        // Searches for individual bigrams or single chars work with NgramTokenizer(1,2)
+        // (the tokenizer never produces the full query string as a single token)
+        let results = engine
+            .search(&SearchRequest::new("财务".into()))
+            .unwrap();
+        assert_eq!(
+            results.total_hits, 1,
+            "Bigram '财务' should match from the tokenized index"
+        );
+
+        // Single char should also match (min ngram size is 1)
+        let results = engine
+            .search(&SearchRequest::new("税".into()))
+            .unwrap();
+        assert_eq!(results.total_hits, 1,
+            "Single CJK char should match");
+    }
 }
