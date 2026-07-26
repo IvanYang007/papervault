@@ -94,15 +94,9 @@ pub struct PapervaultApp {
     /// Owns watcher, indexer, renderer threads and channels for folder lifecycle.
     folder_runtime: Option<FolderRuntime>,
     auto_tagger_tx: Option<Sender<AutoTagRequest>>,
-    #[allow(dead_code)]
-    cached_auto_tag_hash: Option<String>,
-    #[allow(dead_code)]
-    cached_auto_tag_value: Option<serde_json::Value>,
     auto_tag_enabled: bool,
     auto_tag_progress: Option<(usize, usize)>,
     auto_tag_error: Option<String>,
-    #[allow(dead_code)]
-    show_auto_tag_opt_in: bool,
     accepted_auto_tags: std::collections::HashMap<String, std::collections::HashSet<String>>,
     pending_retag: bool,
     pending_reindex: bool,
@@ -242,12 +236,9 @@ impl PapervaultApp {
             preview_panel_size: (800, 600),
             watcher_shutdown_flag,
             watcher_shutdown_tx,
-            cached_auto_tag_hash: None,
-            cached_auto_tag_value: None,
             auto_tag_enabled: crate::auto_tagger::config::AutoTagConfig::load().enabled,
             auto_tag_progress: None,
             auto_tag_error: None,
-            show_auto_tag_opt_in: false,
             accepted_auto_tags: std::collections::HashMap::new(),
             pending_retag: false,
             pending_reindex: false,
