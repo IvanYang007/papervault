@@ -716,7 +716,7 @@ impl PapervaultApp {
         match_terms: &[String],
     ) {
         if match_terms.is_empty() {
-            ui.label(RichText::new(snippet).size(14.0).color(Color32::GRAY));
+            ui.label(RichText::new(snippet).size(12.0).color(Color32::GRAY));
             return;
         }
 
@@ -738,7 +738,7 @@ impl PapervaultApp {
         }
 
         if spans.is_empty() {
-            ui.label(RichText::new(snippet).size(14.0).color(Color32::GRAY));
+            ui.label(RichText::new(snippet).size(12.0).color(Color32::GRAY));
             return;
         }
 
@@ -774,13 +774,13 @@ impl PapervaultApp {
                 if cursor < *start {
                     ui.label(
                         RichText::new(&snippet[cursor..*start])
-                            .size(16.0)
+                            .size(12.0)
                             .color(Color32::GRAY),
                     );
                 }
                 ui.label(
                     RichText::new(&snippet[*start..*end])
-                        .size(16.0)
+                        .size(12.0)
                         .color(Color32::BLACK)
                         .background_color(Color32::from_rgb(255, 215, 0)),
                 );
@@ -789,7 +789,7 @@ impl PapervaultApp {
             if cursor < snippet.len() {
                 ui.label(
                     RichText::new(&snippet[cursor..])
-                        .size(16.0)
+                        .size(12.0)
                         .color(Color32::GRAY),
                 );
             }
