@@ -14,6 +14,7 @@ mod preview;
 mod runtime;
 mod search;
 mod tags;
+mod tray;
 mod watcher;
 #[cfg(windows)]
 mod win32;
@@ -153,10 +154,9 @@ fn main() -> eframe::Result {
             }
             _cc.egui_ctx.set_fonts(fonts);
 
-            // ── System tray icon ──
-            let (tray_icon, menu_open_id, menu_exit_id) = {
+            // ── System tray icon (raw Shell_NotifyIconW in background thread) ──
+            let tray_cmd_rx = {
                 let icon_path = std::path::PathBuf::from("assets/tray-icon.png");
-                // Also try relative to the executable for production use
                 let icon_path = if icon_path.exists() {
                     icon_path
                 } else {
@@ -165,46 +165,15 @@ fn main() -> eframe::Result {
                         .and_then(|p| p.parent().map(|d| d.join("assets").join("tray-icon.png")))
                         .unwrap_or(icon_path)
                 };
-                match image::open(&icon_path) {
-                    Ok(img) => {
-                        let rgba = img.into_rgba8();
-                        let (w, h) = rgba.dimensions();
-                        match tray_icon::Icon::from_rgba(rgba.into_raw(), w, h) {
-                            Ok(icon) => {
-                                use tray_icon::menu::{Menu, MenuItem, PredefinedMenuItem};
-                                let menu = Menu::new();
-                                let open_item = MenuItem::new("Open", true, None);
-                                let exit_item = MenuItem::new("Exit", true, None);
-                                let menu_open_id = open_item.id().clone();
-                                let menu_exit_id = exit_item.id().clone();
-                                menu.append(&open_item).ok();
-                                menu.append(&PredefinedMenuItem::separator()).ok();
-                                menu.append(&exit_item).ok();
-                                match tray_icon::TrayIconBuilder::new()
-                                    .with_tooltip("Papervault")
-                                    .with_icon(icon)
-                                    .with_menu(Box::new(menu))
-                                    .build()
-                                {
-                                    Ok(ti) => {
-                                        info!("Tray icon created");
-                                        (Some(ti), Some(menu_open_id), Some(menu_exit_id))
-                                    }
-                                    Err(e) => {
-                                        warn!("Failed to create tray icon: {}", e);
-                                        (None, None, None)
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                warn!("Failed to convert tray icon: {}", e);
-                                (None, None, None)
-                            }
-                        }
+                let icon_str = icon_path.display().to_string();
+                match crate::tray::spawn(&icon_str, "Papervault") {
+                    Ok(rx) => {
+                        info!("Tray icon created");
+                        Some(rx)
                     }
                     Err(e) => {
-                        warn!("Failed to load tray icon: {}", e);
-                        (None, None, None)
+                        warn!("Failed to create tray icon: {}", e);
+                        None
                     }
                 }
             };
@@ -271,10 +240,8 @@ fn main() -> eframe::Result {
                 None, // watcher_shutdown_tx - populated by FolderRuntime::start
                 folder_runtime,
                 auto_tagger_tx,
-                tray_icon,
+                tray_cmd_rx,
                 auto_launch,
-                menu_open_id,
-                menu_exit_id,
             )))
         }),
     )?;
