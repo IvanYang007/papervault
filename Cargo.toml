@@ -50,9 +50,11 @@ strip = true
 panic = "unwind"      # required for catch_unwind in panic isolation
 
 [profile.dev]
-# Faster debug builds: optimize dependencies mildly, skip debug info for deps
+# Fast dev builds — lto/codegen-units overridden for quick iteration
 opt-level = 1
 debug = 1
+lto = false
+codegen-units = 32
 
 ## Benchmarks (requires nightly)
 ## [[bench]]

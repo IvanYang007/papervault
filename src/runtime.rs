@@ -213,6 +213,7 @@ impl FolderRuntime {
     }
 
     /// Checkpoint the tag store WAL (call during shutdown).
+    #[allow(dead_code)]
     pub fn checkpoint_tag_store(&self) {
         // The TagStore is managed externally; caller should run:
         // tag_store.with_conn(|conn| conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)"))

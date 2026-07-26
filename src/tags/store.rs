@@ -372,6 +372,7 @@ impl TagStore {
     }
 
     /// Checkpoint the WAL (call during clean shutdown to truncate).
+    #[allow(dead_code)]
     pub fn wal_checkpoint(&self) {
         if let Err(e) = self.with_conn(|conn| {
             conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
