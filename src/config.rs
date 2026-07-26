@@ -139,10 +139,7 @@ mod tests {
     fn deserialize_old_format_without_new_fields() {
         let old_json = r#"{"watched_folder": "/some/path"}"#;
         let config: Config = serde_json::from_str(old_json).unwrap();
-        assert_eq!(
-            config.watched_folder.unwrap(),
-            PathBuf::from("/some/path")
-        );
+        assert_eq!(config.watched_folder.unwrap(), PathBuf::from("/some/path"));
         // New fields use their serde defaults when missing:
         // start_with_windows → false, minimize_to_tray → true
         assert!(!config.start_with_windows);
