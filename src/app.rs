@@ -1174,203 +1174,215 @@ impl eframe::App for PapervaultApp {
                     }
                 }
             });
+            // Sizing constants for search results; row height relates to font sizes.
+            let result_filename_size = 16.0_f32;
+            let tag_label_size = 14.0_f32;
+            let result_row_height = 44.0_f32;
+
             // Active tag filter chips
             if !self.active_tag_filters.is_empty() {
                 ui.horizontal(|ui| {
                     let filters: Vec<&str> =
                         self.active_tag_filters.iter().map(|s| s.as_str()).collect();
                     for tag in &filters {
-                        ui.label(format!("🔖 {}", tag));
+                        ui.label(
+                            RichText::new(format!("🔖 {}", tag)).size(tag_label_size),
+                        );
                     }
                 });
             }
             ui.separator();
 
-            // ── Search results (shown when typing) ──
-            if !self.search_query.trim().is_empty() {
-                if self.total_hits > self.search_results.len() {
-                    ui.label(format!(
-                        "{} shown of {} matches",
-                        self.search_results.len(),
-                        self.total_hits
-                    ));
-                }
-
-                let mut clicked_idx = self.clicked_index.take();
-                ScrollArea::vertical()
-                    .id_salt("results_scroll")
-                    .show(ui, |ui| {
-                        for (i, result) in self.search_results.iter().enumerate() {
-                            let selected = self.selected_result == Some(i);
-                            let bg = if selected {
-                                Color32::from_rgb(40, 80, 120)
-                            } else if i % 2 == 0 {
-                                Color32::from_rgb(30, 30, 35)
-                            } else {
-                                Color32::TRANSPARENT
-                            };
-
-                            Frame::default().fill(bg).inner_margin(4.0).show(ui, |ui| {
-                                let resp = ui.add_sized(
-                                    [ui.available_width(), 40.0],
-                                    egui::SelectableLabel::new(
-                                        selected,
-                                        RichText::new(format!(
-                                            "{} ({})",
-                                            result.file_name, result.match_count
-                                        ))
-                                        .strong(),
-                                    ),
-                                );
-                                if resp.clicked() {
-                                    clicked_idx = Some(i);
-                                }
-
-                                if !result.tags.is_empty() {
-                                    ui.horizontal(|ui| {
-                                        for t in &result.tags {
-                                            ui.label(RichText::new(format!("🏷{}", t)).small());
-                                        }
-                                    });
-                                }
-
-                                Self::render_highlighted_snippet(
-                                    ui,
-                                    &result.snippet,
-                                    &result.lower_snippet,
-                                    &result.match_terms,
-                                );
-                            });
-                        }
-                    });
-
-                if let Some(idx) = clicked_idx {
-                    self.select_result(idx);
-                }
-
-                ui.separator();
-            }
-
-            // ── Preview / empty states ──
-
-            if self.config.watched_folder.is_some() && self.search_engine.is_none() {
-                ui.vertical_centered(|ui| {
-                    ui.add_space(40.0);
-                    ui.colored_label(
-                        Color32::RED,
-                        format!(
-                            "Search engine failed to initialize for {}",
-                            self.config
-                                .watched_folder
-                                .as_ref()
-                                .map(|p| p.display().to_string())
-                                .unwrap_or_default(),
-                        ),
-                    );
-                    ui.label("The index may be corrupted. Try re-selecting the folder.");
-                });
-            } else if self.config.watched_folder.is_none() {
-                ui.vertical_centered(|ui| {
-                    ui.add_space(100.0);
-                    ui.heading("Papervault");
-                    ui.label("No watched folder configured.");
-                    ui.label("Click 📁 Folder to get started.");
-                });
-            } else if self.selected_result.is_none()
-                && self.search_query.is_empty()
-                && self.browsed_file.is_none()
-            {
-                ui.vertical_centered(|ui| {
-                    ui.add_space(100.0);
-                    ui.label("Type a search query to find documents.");
-                });
-            } else if self.search_results.is_empty() && has_search_query {
-                ui.vertical_centered(|ui| {
-                    ui.add_space(40.0);
-                    ui.label(format!("No results for '{}'", self.search_query.trim()));
-                    ui.label("Try different terms or remove tag filters.");
-                });
-            } else if self.preview_texture.is_some() {
-                let is_pdf = self.preview_file_type.as_deref() == Some(PDF_TYPE);
-                let current_page = self.current_page;
-
-                // PDF page navigation (before preview borrow)
-                if is_pdf {
-                    let at_last_page = self.current_pdf_page_count > 0
-                        && self.current_page >= self.current_pdf_page_count;
-                    let mut zoom_changed = false;
-                    ui.horizontal(|ui| {
-                        if ui.button("◀ Prev").clicked() && current_page > 1 {
-                            self.current_page -= 1;
-                            self.request_page_render();
-                        }
-                        if ui.button("🔍−").clicked() && self.pdf_zoom > 0.25 {
-                            self.pdf_zoom -= 0.25;
-                            zoom_changed = true;
-                        }
-                        ui.label(format!("{}%", (self.pdf_zoom * 100.0) as i32));
-                        if ui.button("🔍+").clicked() && self.pdf_zoom < 4.0 {
-                            self.pdf_zoom += 0.25;
-                            zoom_changed = true;
-                        }
-
-                        if self.current_pdf_page_count > 0 {
-                            ui.label(format!(
-                                "Page {} / {}",
-                                self.current_page, self.current_pdf_page_count
-                            ));
-                        } else {
-                            ui.label(format!("Page {}", self.current_page));
-                        }
-                        if ui
-                            .add_enabled(!at_last_page, egui::Button::new("Next ▶"))
-                            .clicked()
-                        {
-                            self.current_page += 1;
-                            self.request_page_render();
-                        }
-                    });
-                    if zoom_changed {
-                        self.request_page_render();
+            // ── Split remaining space: results (left) + preview (right) ──
+            ui.columns(2, |columns| {
+                // ── Left column: search results ──
+                if has_search_query {
+                    if self.total_hits > self.search_results.len() {
+                        columns[0].label(format!(
+                            "{} shown of {} matches",
+                            self.search_results.len(),
+                            self.total_hits
+                        ));
                     }
-                    ui.separator();
+
+                    let mut clicked_idx = self.clicked_index.take();
+                    let max_h = columns[0].available_size().y;
+                    ScrollArea::vertical()
+                        .id_salt("results_scroll")
+                        .max_height(max_h)
+                        .show(&mut columns[0], |ui| {
+                            for (i, result) in self.search_results.iter().enumerate() {
+                                let selected = self.selected_result == Some(i);
+                                let bg = if selected {
+                                    Color32::from_rgb(40, 80, 120)
+                                } else if i % 2 == 0 {
+                                    Color32::from_rgb(30, 30, 35)
+                                } else {
+                                    Color32::TRANSPARENT
+                                };
+
+                                Frame::default().fill(bg).inner_margin(4.0).show(ui, |ui| {
+                                    let resp = ui.add_sized(
+                                        [ui.available_width(), result_row_height],
+                                        egui::SelectableLabel::new(
+                                            selected,
+                                            RichText::new(format!(
+                                                "{} ({})",
+                                                result.file_name, result.match_count
+                                            ))
+                                            .size(result_filename_size)
+                                            .strong(),
+                                        ),
+                                    );
+                                    if resp.clicked() {
+                                        clicked_idx = Some(i);
+                                    }
+
+                                    if !result.tags.is_empty() {
+                                        ui.horizontal(|ui| {
+                                            for t in &result.tags {
+                                                ui.label(
+                                                    RichText::new(format!("🏷{}", t)).size(tag_label_size),
+                                                );
+                                            }
+                                        });
+                                    }
+
+                                    Self::render_highlighted_snippet(
+                                        ui,
+                                        &result.snippet,
+                                        &result.lower_snippet,
+                                        &result.match_terms,
+                                    );
+                                });
+                            }
+                        });
+
+                    if let Some(idx) = clicked_idx {
+                        self.select_result(idx);
+                    }
                 }
 
-                let tex_id = self
-                    .preview_texture
-                    .as_ref()
-                    .expect("preview has texture")
-                    .id();
-                let tex_size = self
-                    .preview_texture
-                    .as_ref()
-                    .expect("preview has texture")
-                    .size_vec2();
-
-                // Update preview panel size for display-resolution rendering
-                let avail = ui.available_size();
-                self.preview_panel_size = (avail.x as u32, avail.y as u32);
-
-                ui.image(egui::ImageSource::Texture(egui::load::SizedTexture::new(
-                    tex_id, tex_size,
-                )));
-            } else if self
-                .browsed_file
-                .as_ref()
-                .is_some_and(|f| f.to_lowercase().ends_with(".pdf"))
-            {
-                ui.vertical_centered(|ui| {
-                    ui.add_space(40.0);
-                    ui.label("PDF preview not available.");
-                    ui.label("Place pdfium.dll next to papervault.exe for PDF rendering.");
-                });
-            } else if let Some(ref text) = self.preview_text {
-                ScrollArea::vertical()
-                    .id_salt("preview_scroll")
-                    .show(ui, |ui| {
-                        ui.monospace(text);
+                // ── Right column: preview / empty states ──
+                if self.config.watched_folder.is_some() && self.search_engine.is_none() {
+                    columns[1].vertical_centered(|ui| {
+                        ui.add_space(40.0);
+                        ui.colored_label(
+                            Color32::RED,
+                            format!(
+                                "Search engine failed to initialize for {}",
+                                self.config
+                                    .watched_folder
+                                    .as_ref()
+                                    .map(|p| p.display().to_string())
+                                    .unwrap_or_default(),
+                            ),
+                        );
+                        ui.label("The index may be corrupted. Try re-selecting the folder.");
                     });
-            }
+                } else if self.config.watched_folder.is_none() {
+                    columns[1].vertical_centered(|ui| {
+                        ui.add_space(100.0);
+                        ui.heading("Papervault");
+                        ui.label("No watched folder configured.");
+                        ui.label("Click 📁 Folder to get started.");
+                    });
+                } else if self.selected_result.is_none()
+                    && self.search_query.is_empty()
+                    && self.browsed_file.is_none()
+                {
+                    columns[1].vertical_centered(|ui| {
+                        ui.add_space(100.0);
+                        ui.label("Type a search query to find documents.");
+                    });
+                } else if self.search_results.is_empty() && has_search_query {
+                    columns[1].vertical_centered(|ui| {
+                        ui.add_space(40.0);
+                        ui.label(format!("No results for '{}'", self.search_query.trim()));
+                        ui.label("Try different terms or remove tag filters.");
+                    });
+                } else if self.preview_texture.is_some() {
+                    let is_pdf = self.preview_file_type.as_deref() == Some(PDF_TYPE);
+                    let current_page = self.current_page;
+
+                    // PDF page navigation (before preview borrow)
+                    if is_pdf {
+                        let at_last_page = self.current_pdf_page_count > 0
+                            && self.current_page >= self.current_pdf_page_count;
+                        let mut zoom_changed = false;
+                        columns[1].horizontal(|ui| {
+                            if ui.button("◀ Prev").clicked() && current_page > 1 {
+                                self.current_page -= 1;
+                                self.request_page_render();
+                            }
+                            if ui.button("🔍−").clicked() && self.pdf_zoom > 0.25 {
+                                self.pdf_zoom -= 0.25;
+                                zoom_changed = true;
+                            }
+                            ui.label(format!("{}%", (self.pdf_zoom * 100.0) as i32));
+                            if ui.button("🔍+").clicked() && self.pdf_zoom < 4.0 {
+                                self.pdf_zoom += 0.25;
+                                zoom_changed = true;
+                            }
+
+                            if self.current_pdf_page_count > 0 {
+                                ui.label(format!(
+                                    "Page {} / {}",
+                                    self.current_page, self.current_pdf_page_count
+                                ));
+                            } else {
+                                ui.label(format!("Page {}", self.current_page));
+                            }
+                            if ui
+                                .add_enabled(!at_last_page, egui::Button::new("Next ▶"))
+                                .clicked()
+                            {
+                                self.current_page += 1;
+                                self.request_page_render();
+                            }
+                        });
+                        if zoom_changed {
+                            self.request_page_render();
+                        }
+                        columns[1].separator();
+                    }
+
+                    let tex_id = self
+                        .preview_texture
+                        .as_ref()
+                        .expect("preview has texture")
+                        .id();
+                    let tex_size = self
+                        .preview_texture
+                        .as_ref()
+                        .expect("preview has texture")
+                        .size_vec2();
+
+                    // Update preview panel size for display-resolution rendering
+                    let avail = columns[1].available_size();
+                    self.preview_panel_size = (avail.x as u32, avail.y as u32);
+
+                    columns[1].image(egui::ImageSource::Texture(
+                        egui::load::SizedTexture::new(tex_id, tex_size),
+                    ));
+                } else if self
+                    .browsed_file
+                    .as_ref()
+                    .is_some_and(|f| f.to_lowercase().ends_with(".pdf"))
+                {
+                    columns[1].vertical_centered(|ui| {
+                        ui.add_space(40.0);
+                        ui.label("PDF preview not available.");
+                        ui.label("Place pdfium.dll next to papervault.exe for PDF rendering.");
+                    });
+                } else if let Some(ref text) = self.preview_text {
+                    ScrollArea::vertical()
+                        .id_salt("preview_scroll")
+                        .show(&mut columns[1], |ui| {
+                            ui.monospace(text);
+                        });
+                }
+            });
         });
 
         // ── Bottom: status bar ──
