@@ -10,6 +10,7 @@ use crate::tags::model::Tag;
 use crate::tags::store::DocumentInfo;
 use crate::tags::store::TagStore;
 use crate::watcher::watcher::IndexerMessage;
+use tracing::warn;
 use crossbeam::channel::{Receiver, Sender};
 use egui::{
     CentralPanel, Color32, Frame, RichText, ScrollArea, SidePanel, TextEdit, TopBottomPanel,
@@ -169,6 +170,15 @@ pub struct PapervaultApp {
     browsed_file: Option<String>,
     /// Multi-selected file paths for batch tagging (Ctrl+click in file browser).
     selected_files: HashSet<String>,
+    // ── System tray ──
+    tray_icon: Option<tray_icon::TrayIcon>,
+    auto_launch: Option<auto_launch::AutoLaunch>,
+    minimized_to_tray: bool,
+    should_exit: bool,
+    menu_open_id: Option<tray_icon::menu::MenuId>,
+    menu_exit_id: Option<tray_icon::menu::MenuId>,
+    /// Sync auto-start on first frame.
+    first_frame: bool,
 }
 
 impl PapervaultApp {
@@ -187,6 +197,10 @@ impl PapervaultApp {
         watcher_shutdown_tx: Option<Sender<IndexerMessage>>,
         folder_runtime: Option<FolderRuntime>,
         auto_tagger_tx: Option<Sender<AutoTagRequest>>,
+        tray_icon: Option<tray_icon::TrayIcon>,
+        auto_launch: Option<auto_launch::AutoLaunch>,
+        menu_open_id: Option<tray_icon::menu::MenuId>,
+        menu_exit_id: Option<tray_icon::menu::MenuId>,
     ) -> Self {
         let status = if config.watched_folder.is_some() && search_engine.is_some() {
             "Ready".to_string()
@@ -255,6 +269,14 @@ impl PapervaultApp {
             file_browser_periodic_timer: 0,
             browsed_file: None,
             selected_files: HashSet::new(),
+            // ── System tray ──
+            tray_icon,
+            auto_launch,
+            minimized_to_tray: false,
+            should_exit: false,
+            menu_open_id,
+            menu_exit_id,
+            first_frame: true,
         }
     }
 
@@ -932,10 +954,78 @@ impl PapervaultApp {
             }
         });
     }
+
+    /// Process system tray icon events (clicks and menu actions).
+    fn process_tray_events(&mut self, ctx: &egui::Context) {
+        use tray_icon::TrayIconEvent;
+        use tray_icon::menu::MenuEvent;
+
+        while let Ok(event) = TrayIconEvent::receiver().try_recv() {
+            match event {
+                TrayIconEvent::Click {
+                    button: tray_icon::MouseButton::Left,
+                    ..
+                }
+                | TrayIconEvent::DoubleClick { .. } => {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    self.minimized_to_tray = false;
+                }
+                _ => {}
+            }
+        }
+
+        while let Ok(event) = MenuEvent::receiver().try_recv() {
+            if Some(&event.id) == self.menu_open_id.as_ref() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                self.minimized_to_tray = false;
+            } else if Some(&event.id) == self.menu_exit_id.as_ref() {
+                self.should_exit = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+        }
+    }
+
+    /// Sync the auto-start registry state with the config toggle.
+    fn sync_auto_start(&mut self) {
+        if let Some(ref auto) = self.auto_launch {
+            let is_enabled = auto.is_enabled().unwrap_or(false);
+            if self.config.start_with_windows != is_enabled {
+                if self.config.start_with_windows {
+                    if let Err(e) = auto.enable() {
+                        warn!("Failed to enable auto-start: {}", e);
+                    }
+                } else if let Err(e) = auto.disable() {
+                    warn!("Failed to disable auto-start: {}", e);
+                }
+            }
+        }
+    }
 }
 
 impl eframe::App for PapervaultApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // ── System tray event processing ──
+        self.process_tray_events(ctx);
+
+        // ── Close interception (minimize to tray) ──
+        if ctx.input(|i| i.viewport().close_requested()) {
+            if !self.should_exit && self.config.minimize_to_tray && self.tray_icon.is_some() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+                self.minimized_to_tray = true;
+            }
+            // Reset should_exit so next close attempt works normally
+            self.should_exit = false;
+        }
+
+        // ── Sync auto-start on first frame ──
+        if self.first_frame {
+            self.first_frame = false;
+            self.sync_auto_start();
+        }
+
         // Process deferred search result click from previous frame
         if let Some(idx) = self.clicked_index.take() {
             self.select_result(idx);
@@ -1668,7 +1758,44 @@ impl eframe::App for PapervaultApp {
 
         // ── Bottom: status bar ──
         TopBottomPanel::bottom("status_bar").show(ctx, |ui| {
-            ui.label(&self.status_message);
+            ui.horizontal(|ui| {
+                ui.label(&self.status_message);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let mut changed = false;
+                    if ui
+                        .add(egui::Checkbox::new(&mut self.config.minimize_to_tray, "Minimize to tray"))
+                        .changed()
+                    {
+                        changed = true;
+                    }
+                    if self.auto_launch.is_some() {
+                        if ui
+                            .add(egui::Checkbox::new(
+                                &mut self.config.start_with_windows,
+                                "Start with Windows",
+                            ))
+                            .changed()
+                        {
+                            // Sync registry immediately on toggle
+                            if let Some(ref auto) = self.auto_launch {
+                                if self.config.start_with_windows {
+                                    if let Err(e) = auto.enable() {
+                                        warn!("Failed to enable auto-start: {}", e);
+                                    }
+                                } else if let Err(e) = auto.disable() {
+                                    warn!("Failed to disable auto-start: {}", e);
+                                }
+                            }
+                            changed = true;
+                        }
+                    }
+                    if changed {
+                        if let Err(e) = self.config.save() {
+                            warn!("Failed to save config: {}", e);
+                        }
+                    }
+                });
+            });
         });
 
         // ── Folder picker dialog ──

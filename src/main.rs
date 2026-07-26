@@ -2,7 +2,7 @@
 
 use std::panic;
 
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 mod app;
@@ -21,6 +21,9 @@ use runtime::FolderRuntime;
 use tags::store::TagStore;
 
 fn main() -> eframe::Result {
+    // ── CLI args ──
+    let args: Vec<String> = std::env::args().collect();
+    let start_minimized = args.iter().any(|a| a == "--minimized");
     // Initialize tracing — console output
     let log_dir = dirs_next::data_local_dir()
         .unwrap_or_else(|| std::path::PathBuf::from("."))
@@ -113,7 +116,8 @@ fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1200.0, 800.0])
-            .with_min_inner_size([800.0, 600.0]),
+            .with_min_inner_size([800.0, 600.0])
+            .with_visible(!start_minimized),
         ..Default::default()
     };
 
@@ -147,6 +151,93 @@ fn main() -> eframe::Result {
             }
             _cc.egui_ctx.set_fonts(fonts);
 
+            // ── System tray icon ──
+            let (tray_icon, menu_open_id, menu_exit_id) = {
+                let icon_path = std::path::PathBuf::from("assets/tray-icon.png");
+                // Also try relative to the executable for production use
+                let icon_path = if icon_path.exists() {
+                    icon_path
+                } else {
+                    std::env::current_exe()
+                        .ok()
+                        .and_then(|p| p.parent().map(|d| d.join("assets").join("tray-icon.png")))
+                        .unwrap_or(icon_path)
+                };
+                match image::open(&icon_path) {
+                    Ok(img) => {
+                        let rgba = img.into_rgba8();
+                        let (w, h) = rgba.dimensions();
+                        match tray_icon::Icon::from_rgba(rgba.into_raw(), w, h) {
+                            Ok(icon) => {
+                                use tray_icon::menu::{Menu, MenuItem, PredefinedMenuItem};
+                                let menu = Menu::new();
+                                let open_item = MenuItem::new("Open", true, None);
+                                let exit_item = MenuItem::new("Exit", true, None);
+                                let menu_open_id = open_item.id().clone();
+                                let menu_exit_id = exit_item.id().clone();
+                                menu.append(&open_item).ok();
+                                menu.append(&PredefinedMenuItem::separator()).ok();
+                                menu.append(&exit_item).ok();
+                                match tray_icon::TrayIconBuilder::new()
+                                    .with_tooltip("Papervault")
+                                    .with_icon(icon)
+                                    .with_menu(Box::new(menu))
+                                    .build()
+                                {
+                                    Ok(ti) => {
+                                        info!("Tray icon created");
+                                        (Some(ti), Some(menu_open_id), Some(menu_exit_id))
+                                    }
+                                    Err(e) => {
+                                        warn!("Failed to create tray icon: {}", e);
+                                        (None, None, None)
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                warn!("Failed to convert tray icon: {}", e);
+                                (None, None, None)
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!("Failed to load tray icon: {}", e);
+                        (None, None, None)
+                    }
+                }
+            };
+
+            // ── Auto-launch (Windows startup) ──
+            #[allow(unused_mut)]
+            let mut auto_launch: Option<auto_launch::AutoLaunch> = None;
+            #[cfg(target_os = "windows")]
+            {
+                if let Ok(exe_path) = std::env::current_exe() {
+                    match auto_launch::AutoLaunchBuilder::new()
+                        .set_app_name("Papervault")
+                        .set_app_path(&exe_path.display().to_string())
+                        .set_args(&["--minimized"])
+                        .build()
+                    {
+                        Ok(al) => {
+                            // Sync config state with actual registry state
+                            let is_enabled = al.is_enabled().unwrap_or(false);
+                            if app_config.start_with_windows != is_enabled {
+                                if app_config.start_with_windows {
+                                    al.enable().ok();
+                                } else {
+                                    al.disable().ok();
+                                }
+                            }
+                            auto_launch = Some(al);
+                        }
+                        Err(e) => {
+                            warn!("Failed to init auto-launch: {}", e);
+                        }
+                    }
+                }
+            }
+
             // Extract runtime channels (or use dummies)
             let (progress_rx, render_tx, render_result_rx, auto_tagger_tx) =
                 if let Some(ref rt) = folder_runtime {
@@ -178,6 +269,10 @@ fn main() -> eframe::Result {
                 None, // watcher_shutdown_tx - populated by FolderRuntime::start
                 folder_runtime,
                 auto_tagger_tx,
+                tray_icon,
+                auto_launch,
+                menu_open_id,
+                menu_exit_id,
             )))
         }),
     )?;
