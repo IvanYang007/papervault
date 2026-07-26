@@ -959,6 +959,8 @@ impl PapervaultApp {
             while let Ok(cmd) = rx.try_recv() {
                 match cmd {
                     crate::tray::TrayCommand::Open => {
+                        self.set_tool_window(false);
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
                         self.show_window();
                         self.minimized_to_tray = false;
                     }
@@ -971,16 +973,6 @@ impl PapervaultApp {
         }
     }
 
-    /// Hide the window with ShowWindow (tray thread keeps process alive).
-    fn hide_window(&self) {
-        #[cfg(windows)]
-        if let Some(hwnd) = self.hwnd {
-            unsafe {
-                crate::win32::ShowWindow(hwnd, crate::win32::SW_HIDE);
-            }
-        }
-    }
-
     /// Show and focus the window.
     fn show_window(&self) {
         #[cfg(windows)]
@@ -988,6 +980,32 @@ impl PapervaultApp {
             unsafe {
                 crate::win32::ShowWindow(hwnd, crate::win32::SW_SHOW);
                 crate::win32::SetForegroundWindow(hwnd);
+            }
+        }
+    }
+
+    /// Toggle WS_EX_TOOLWINDOW to remove/restore taskbar visibility.
+    fn set_tool_window(&self, tool: bool) {
+        #[cfg(windows)]
+        if let Some(hwnd) = self.hwnd {
+            unsafe {
+                use crate::win32::*;
+                let ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+                let new_style = if tool {
+                    (ex_style | WS_EX_TOOLWINDOW) & !WS_EX_APPWINDOW
+                } else {
+                    (ex_style & !WS_EX_TOOLWINDOW) | WS_EX_APPWINDOW
+                };
+                SetWindowLongPtrW(hwnd, GWL_EXSTYLE, new_style);
+                SetWindowPos(
+                    hwnd,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+                );
             }
         }
     }
@@ -1023,8 +1041,9 @@ impl eframe::App for PapervaultApp {
         if ctx.input(|i| i.viewport().close_requested()) {
             if !self.should_exit && self.config.minimize_to_tray && self.tray_cmd_rx.is_some() {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-                // Hide with ShowWindow — the tray thread's message pump keeps us alive
-                self.hide_window();
+                // Minimized keeps eframe ticking; WS_EX_TOOLWINDOW removes taskbar entry
+                self.set_tool_window(true);
+                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
                 self.minimized_to_tray = true;
             }
             self.should_exit = false;
@@ -1033,6 +1052,11 @@ impl eframe::App for PapervaultApp {
         // ── Sync auto-start on first frame ──
         if self.auto_start_synced.take().is_some() {
             self.sync_auto_start();
+        }
+
+        // ── Keep eframe ticking when minimized to tray ──
+        if self.minimized_to_tray {
+            ctx.request_repaint_after(std::time::Duration::from_millis(200));
         }
 
         // ── Keep eframe ticking when minimized to tray ──
