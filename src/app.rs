@@ -925,7 +925,17 @@ impl eframe::App for PapervaultApp {
                 let completed = rt
                     .auto_tag_progress
                     .load(std::sync::atomic::Ordering::Relaxed);
-                self.auto_tag_progress = Some((completed, total));
+                if completed >= total {
+                    // Tagging batch complete — refresh UI
+                    self.auto_tag_progress = None;
+                    self.file_browser_dirty = true;
+                    if !self.search_query.trim().is_empty() {
+                        self.do_search();
+                    }
+                    self.status_message = format!("Tagging complete — {} files processed", total);
+                } else {
+                    self.auto_tag_progress = Some((completed, total));
+                }
             }
         }
 
