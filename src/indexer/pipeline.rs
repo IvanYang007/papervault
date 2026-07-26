@@ -26,6 +26,9 @@ pub struct Pipeline {
     commit_batch_size: usize,
     /// Shared shutdown flag — checked during initial scan to allow fast close.
     shutdown: Arc<AtomicBool>,
+    /// True when the index was rebuilt (e.g., schema version change).
+    /// When set, the metadata fast-path is bypassed so all files are re-indexed.
+    needs_full_rescan: bool,
 }
 
 impl Pipeline {
@@ -51,6 +54,7 @@ impl Pipeline {
             pending_count: 0,
             commit_batch_size: 10,
             shutdown,
+            needs_full_rescan: false,
         }
     }
 
@@ -80,6 +84,26 @@ impl Pipeline {
                 doc_count
             );
         } else {
+            // Detect index rebuild: Tantivy empty but SQLite has documents.
+            // This happens after schema version changes or index corruption recovery.
+            // When true, the metadata fast-path is bypassed so all files are re-indexed
+            // into the fresh Tantivy index while preserving SQLite tag data.
+            let sqlite_has_docs = self
+                .tag_store
+                .with_conn(|conn| {
+                    conn.query_row("SELECT COUNT(*) FROM documents", [], |r| {
+                        r.get::<_, i64>(0)
+                    })
+                })
+                .unwrap_or(0)
+                > 0;
+            if sqlite_has_docs {
+                info!(
+                    "Index is empty but SQLite has documents — index was rebuilt. Performing full rescan."
+                );
+                self.needs_full_rescan = true;
+            }
+
             info!("Running initial file scan...");
             let (scan_tx, scan_rx) = crossbeam::channel::bounded::<IndexerMessage>(256);
             let folder = self.watcher_folder.clone();
@@ -321,12 +345,31 @@ impl Pipeline {
                 .to_lowercase();
             let content_hash = compute_content_hash(&extracted.text, &file_type);
 
-            // Clean up old entries before inserting new ones
-            let old_hash_to_delete = self
+            // Fetch tags from the OLD hash before potentially deleting it.
+            // If the content hash changed (e.g., extraction library differs),
+            // we migrate the old tags to the new hash.
+            let old_hash = self
                 .tag_store
                 .get_hash_by_path(&path_str)
                 .ok()
-                .flatten()
+                .flatten();
+            let migrated_tags: Vec<String> = if let Some(ref old_h) = old_hash {
+                if old_h.as_str() != content_hash {
+                    self.tag_store
+                        .get_tags_for_document(old_h)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|t| t.name)
+                        .collect()
+                } else {
+                    Vec::new()
+                }
+            } else {
+                Vec::new()
+            };
+
+            // Clean up old entries before inserting new ones
+            let old_hash_to_delete = old_hash
                 .filter(|old| old.as_str() != content_hash);
             if old_hash_to_delete.is_some() {
                 let _ = self.tag_store.delete_document_by_path(&path_str);
@@ -339,13 +382,17 @@ impl Pipeline {
                 .to_string();
             let doc_id = format!("{}{}", content_hash, file_type);
             let modified_ts = *mtime as i64;
-            let tags = self
-                .tag_store
-                .get_tags_for_document(&content_hash)
-                .unwrap_or_default()
-                .into_iter()
-                .map(|t| t.name)
-                .collect::<Vec<String>>();
+            // Use migrated tags when content hash changed, otherwise look up by new hash
+            let tags = if !migrated_tags.is_empty() {
+                migrated_tags.clone()
+            } else {
+                self.tag_store
+                    .get_tags_for_document(&content_hash)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|t| t.name)
+                    .collect::<Vec<String>>()
+            };
 
             if let Err(e) = self.tag_store.upsert_document(
                 &content_hash,
@@ -356,6 +403,20 @@ impl Pipeline {
             ) {
                 error!("Batch upsert error for {}: {}", path_str, e);
                 continue;
+            }
+
+            // Re-assign migrated tags to the new content hash in SQLite
+            if !migrated_tags.is_empty() {
+                for tag_name in &migrated_tags {
+                    // Create tag if it doesn't exist, then assign
+                    if let Ok(tag) = self.tag_store.create_tag(tag_name) {
+                        let _ = self.tag_store.assign_tag(&content_hash, tag.id);
+                    } else if let Ok(tags) = self.tag_store.list_tags() {
+                        if let Some(existing) = tags.iter().find(|t| t.name == *tag_name) {
+                            let _ = self.tag_store.assign_tag(&content_hash, existing.id);
+                        }
+                    }
+                }
             }
 
             // Single lock scope: delete old + index new (avoids double Mutex acquire)
@@ -434,10 +495,12 @@ impl Pipeline {
     ) -> anyhow::Result<()> {
         let path_str = path.display().to_string();
 
-        // Fast-path: check metadata in SQLite
-        if self
-            .tag_store
-            .already_indexed_by_metadata(&path_str, size, mtime)?
+        // Fast-path: check metadata in SQLite.
+        // Skipped when needs_full_rescan is set (index was rebuilt).
+        if !self.needs_full_rescan
+            && self
+                .tag_store
+                .already_indexed_by_metadata(&path_str, size, mtime)?
         {
             debug!("Skipping {} (unchanged metadata)", path_str);
             return Ok(());
@@ -487,11 +550,29 @@ impl Pipeline {
         // If the file's content changed, the old content_hash differs from the
         // new one. Both SQLite (PK=content_hash) and Tantivy (stored by hash)
         // would accumulate duplicate entries without this cleanup.
-        let old_hash_to_delete = self
+        let old_hash = self
             .tag_store
             .get_hash_by_path(&path_str)
             .ok()
-            .flatten()
+            .flatten();
+
+        // Fetch tags from the OLD hash before potentially deleting it
+        let migrated_tags: Vec<String> = if let Some(ref old_h) = old_hash {
+            if old_h.as_str() != content_hash {
+                self.tag_store
+                    .get_tags_for_document(old_h)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|t| t.name)
+                    .collect()
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
+
+        let old_hash_to_delete = old_hash
             .filter(|old| old.as_str() != content_hash);
         if old_hash_to_delete.is_some() {
             if let Err(e) = self.tag_store.delete_document_by_path(&path_str) {
@@ -502,14 +583,17 @@ impl Pipeline {
         let doc_id = format!("{}{}", content_hash, file_type);
         let modified_ts = mtime as i64;
 
-        // Get tags from TagStore (if any — will be empty for new docs)
-        let tags = self
-            .tag_store
-            .get_tags_for_document(&content_hash)
-            .unwrap_or_default()
-            .into_iter()
-            .map(|t| t.name)
-            .collect::<Vec<String>>();
+        // Use migrated tags when content hash changed, otherwise look up by new hash
+        let tags = if !migrated_tags.is_empty() {
+            migrated_tags.clone()
+        } else {
+            self.tag_store
+                .get_tags_for_document(&content_hash)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|t| t.name)
+                .collect::<Vec<String>>()
+        };
 
         // Write SQLite FIRST, then Tantivy.
         // If crash between writes: SQLite has doc, Tantivy doesn't. The
@@ -524,6 +608,19 @@ impl Pipeline {
             size as i64,
             modified_ts,
         )?;
+
+        // Re-assign migrated tags to the new content hash in SQLite
+        if !migrated_tags.is_empty() {
+            for tag_name in &migrated_tags {
+                if let Ok(tag) = self.tag_store.create_tag(tag_name) {
+                    let _ = self.tag_store.assign_tag(&content_hash, tag.id);
+                } else if let Ok(tags) = self.tag_store.list_tags() {
+                    if let Some(existing) = tags.iter().find(|t| t.name == *tag_name) {
+                        let _ = self.tag_store.assign_tag(&content_hash, existing.id);
+                    }
+                }
+            }
+        }
 
         // Single lock scope: delete old + index new (avoids double Mutex acquire)
         {
