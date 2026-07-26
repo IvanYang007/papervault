@@ -21,7 +21,7 @@ pub enum TrayCommand {
 const IDM_OPEN: u32 = 1001;
 const IDM_EXIT: u32 = 1002;
 
-/// Helper: convert a Rust &str to a null-terminated wide string.
+/// Convert a Rust &str to a null-terminated UTF-16 wide string.
 fn to_wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
@@ -254,6 +254,6 @@ unsafe fn show_tray_menu(hwnd: HWND) {
 unsafe fn send_tray_command(hwnd: HWND, cmd: TrayCommand) {
     let ptr = GetWindowLongPtrW(hwnd, GWL_USERDATA) as *mut Sender<TrayCommand>;
     if !ptr.is_null() {
-        let _ = (*ptr).try_send(cmd);
+        let _ = (*ptr).send(cmd);
     }
 }

@@ -105,7 +105,6 @@ pub const WS_EX_TOOLWINDOW: isize = 0x00000080;
 pub const WS_EX_APPWINDOW: isize = 0x00040000;
 
 // ShowWindow
-pub const SW_HIDE: i32 = 0;
 pub const SW_SHOW: i32 = 5;
 
 // SetWindowPos
@@ -118,7 +117,6 @@ pub const SWP_NOACTIVATE: UINT = 0x0010;
 // Messages
 pub const WM_NULL: UINT = 0x0000;
 pub const WM_DESTROY: UINT = 0x0002;
-pub const WM_CLOSE: UINT = 0x0010;
 pub const WM_RBUTTONUP: UINT = 0x0205;
 pub const WM_LBUTTONUP: UINT = 0x0202;
 pub const WM_CONTEXTMENU: UINT = 0x007B;
@@ -151,14 +149,6 @@ pub const CW_USEDEFAULT: i32 = 0x80000000u32 as i32;
 // Struct with a pointer field used for PCWSTR
 #[repr(transparent)]
 pub struct PCWSTR(pub *const u16);
-impl PCWSTR {
-    pub fn from_raw(p: *const u16) -> Self {
-        PCWSTR(p)
-    }
-    pub fn as_ptr(&self) -> *const u16 {
-        self.0
-    }
-}
 
 // WINDOW_EX_STYLE
 #[derive(Default)]

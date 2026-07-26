@@ -1065,12 +1065,7 @@ impl eframe::App for PapervaultApp {
 
         // ── Keep eframe ticking when minimized to tray ──
         if self.minimized_to_tray {
-            ctx.request_repaint_after(std::time::Duration::from_millis(200));
-        }
-
-        // ── Keep eframe ticking when minimized to tray ──
-        if self.minimized_to_tray {
-            ctx.request_repaint_after(std::time::Duration::from_millis(200));
+            ctx.request_repaint_after(std::time::Duration::from_millis(500));
         }
 
         // Process deferred search result click from previous frame
