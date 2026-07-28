@@ -10,6 +10,7 @@ use crate::tags::model::Tag;
 use crate::tags::store::DocumentInfo;
 use crate::tags::store::TagStore;
 use crate::watcher::watcher::IndexerMessage;
+use chrono::DateTime;
 use crossbeam::channel::{Receiver, Sender};
 use egui::{
     CentralPanel, Color32, Frame, RichText, ScrollArea, SidePanel, TextEdit, TopBottomPanel,
@@ -21,6 +22,23 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tracing::warn;
+
+/// Format a file size in bytes into a human-readable string.
+/// Examples: "0 B", "512 B", "23.4 KB", "1.2 MB", "1.4 GB".
+pub fn format_file_size(size: u64) -> String {
+    const UNITS: &[&str] = &["B", "KB", "MB", "GB"];
+    let mut float_size = size as f64;
+    let mut unit_idx = 0;
+    while float_size >= 1024.0 && unit_idx < UNITS.len() - 1 {
+        float_size /= 1024.0;
+        unit_idx += 1;
+    }
+    if unit_idx == 0 {
+        format!("{size} B")
+    } else {
+        format!("{float_size:.1} {}", UNITS[unit_idx])
+    }
+}
 
 /// Messages from the indexer thread to the UI thread.
 #[derive(Debug, Clone)]
@@ -1486,10 +1504,39 @@ impl eframe::App for PapervaultApp {
                                     Color32::TRANSPARENT
                                 };
                                 let label = format!("{} {}{}", icon, sparkle, file_name);
+                                let date_str = DateTime::from_timestamp(doc.modified_ts as i64, 0)
+                                    .map(|dt| dt.format("%Y-%m-%d").to_string())
+                                    .unwrap_or_default();
+                                let size_str = format_file_size(doc.file_size);
                                 let resp = Frame::default()
                                     .fill(sel_bg)
                                     .rounding(egui::Rounding::same(2.0))
-                                    .show(ui, |ui| ui.selectable_label(is_browsed, &label));
+                                    .show(ui, |ui| {
+                                        ui.horizontal(|ui| {
+                                            // Left: clickable filename (selectable_label
+                                            // provides click sense and browsed highlight)
+                                            let label_resp =
+                                                ui.selectable_label(is_browsed, &label);
+                                            // Right: date · size, pushed to the edge
+                                            ui.with_layout(
+                                                egui::Layout::right_to_left(egui::Align::Center),
+                                                |ui| {
+                                                    ui.label(
+                                                        RichText::new(format!(
+                                                            "{} · {}",
+                                                            date_str, size_str
+                                                        ))
+                                                        .size(11.0)
+                                                        .color(Color32::from_rgb(
+                                                            150, 150, 150,
+                                                        )),
+                                                    );
+                                                },
+                                            );
+                                            label_resp
+                                        })
+                                        .inner
+                                    });
                                 if resp.inner.clicked() {
                                     if ctrl_held {
                                         toggled_file = Some(doc.file_path.clone());
@@ -1949,6 +1996,71 @@ impl eframe::App for PapervaultApp {
         if let Some(rt) = self.folder_runtime.take() {
             let _ = rt.stop();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_file_size_zero() {
+        assert_eq!(format_file_size(0), "0 B");
+    }
+
+    #[test]
+    fn format_file_size_bytes() {
+        assert_eq!(format_file_size(1), "1 B");
+        assert_eq!(format_file_size(512), "512 B");
+        assert_eq!(format_file_size(1023), "1023 B");
+    }
+
+    #[test]
+    fn format_file_size_kb_boundary() {
+        // Exactly 1 KB
+        assert_eq!(format_file_size(1024), "1.0 KB");
+        // Just over 1 KB
+        assert_eq!(format_file_size(1025), "1.0 KB");
+        // Typical KB value
+        assert_eq!(format_file_size(23_040), "22.5 KB"); // 22.5 KB
+    }
+
+    #[test]
+    fn format_file_size_mb() {
+        assert_eq!(format_file_size(1_048_576), "1.0 MB"); // 1 MB
+        assert_eq!(format_file_size(1_572_864), "1.5 MB");
+    }
+
+    #[test]
+    fn format_file_size_gb() {
+        assert_eq!(format_file_size(1_073_741_824), "1.0 GB");
+        assert_eq!(format_file_size(1_610_612_736), "1.5 GB");
+    }
+
+    #[test]
+    fn format_file_size_large() {
+        // 1 TB in bytes — should show GB at max unit
+        assert_eq!(format_file_size(1_099_511_627_776), "1024.0 GB");
+    }
+
+    #[test]
+    fn date_format_epoch_zero() {
+        let dt = DateTime::from_timestamp(0, 0).unwrap();
+        assert_eq!(dt.format("%Y-%m-%d").to_string(), "1970-01-01");
+    }
+
+    #[test]
+    fn date_format_known_timestamp() {
+        // 2023-11-15T10:30:00Z
+        let dt = DateTime::from_timestamp(1700044200, 0).unwrap();
+        assert_eq!(dt.format("%Y-%m-%d").to_string(), "2023-11-15");
+    }
+
+    #[test]
+    fn date_format_far_future() {
+        // 2099-12-31T23:59:59Z
+        let dt = DateTime::from_timestamp(4102444799, 0).unwrap();
+        assert_eq!(dt.format("%Y-%m-%d").to_string(), "2099-12-31");
     }
 }
 

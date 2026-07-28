@@ -315,7 +315,7 @@ impl TagStore {
     pub fn list_all_documents(&self) -> SqlResult<Vec<DocumentInfo>> {
         self.with_conn(|conn| {
             let mut stmt = conn.prepare(
-                "SELECT d.file_path, d.file_type, d.content_hash,
+                "SELECT d.file_path, d.file_type, d.content_hash, d.file_size, d.modified_ts,
                         CASE WHEN a.status = 'tagged' THEN 1 ELSE 0 END
                  FROM documents d
                  LEFT JOIN auto_tag_status a ON d.content_hash = a.content_hash
@@ -327,7 +327,9 @@ impl TagStore {
                         file_path: row.get(0)?,
                         file_type: row.get(1)?,
                         content_hash: row.get(2)?,
-                        has_tags: row.get::<_, i64>(3)? != 0,
+                        file_size: row.get::<_, i64>(3)? as u64,
+                        modified_ts: row.get::<_, i64>(4)? as u64,
+                        has_tags: row.get::<_, i64>(5)? != 0,
                     })
                 })?
                 .filter_map(|r| r.ok())
@@ -363,6 +365,10 @@ pub struct DocumentInfo {
     pub file_path: String,
     pub file_type: String,
     pub content_hash: String,
+    /// File size in bytes.
+    pub file_size: u64,
+    /// Last-modified timestamp (seconds since Unix epoch).
+    pub modified_ts: u64,
     /// True when the document has any tags (auto-tag or manually assigned).
     pub has_tags: bool,
 }
@@ -781,6 +787,44 @@ mod tests {
 
         let missing = store.get_tags_for_hashes(&["no_such_hash"]).unwrap();
         assert!(missing.is_empty());
+    }
+
+    #[test]
+    fn list_all_documents_returns_file_size_and_modified_ts() {
+        let (store, _dir) = setup_test_store();
+
+        // Insert documents with various size/timestamp combinations
+        store
+            .upsert_document("hash_a", "/a.pdf", "pdf", 0, 0)
+            .unwrap();
+        store
+            .upsert_document("hash_b", "/b.txt", "txt", 1024, 1700000000)
+            .unwrap();
+        store
+            .upsert_document("hash_c", "/c.md", "md", 1_073_741_824, 1893456000)
+            .unwrap();
+
+        // Verify file_size and modified_ts round-trip correctly
+        let docs = store.list_all_documents().unwrap();
+        assert_eq!(docs.len(), 3);
+
+        for doc in &docs {
+            match doc.content_hash.as_str() {
+                "hash_a" => {
+                    assert_eq!(doc.file_size, 0, "hash_a file_size");
+                    assert_eq!(doc.modified_ts, 0, "hash_a modified_ts");
+                }
+                "hash_b" => {
+                    assert_eq!(doc.file_size, 1024, "hash_b file_size");
+                    assert_eq!(doc.modified_ts, 1700000000, "hash_b modified_ts");
+                }
+                "hash_c" => {
+                    assert_eq!(doc.file_size, 1_073_741_824, "hash_c file_size");
+                    assert_eq!(doc.modified_ts, 1893456000, "hash_c modified_ts");
+                }
+                other => panic!("unexpected document hash: {other}"),
+            }
+        }
     }
 
     // ── Auto-Tag Status Tests ──
