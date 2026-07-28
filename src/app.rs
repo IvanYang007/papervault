@@ -23,6 +23,66 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tracing::warn;
 
+/// Which column the file browser is sorted by.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SortColumn {
+    Name,
+    Date,
+    Size,
+}
+
+/// Sort direction.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SortDirection {
+    Ascending,
+    Descending,
+}
+
+/// Compute new sort state when a column header is clicked.
+/// If the same column is clicked again, toggle direction; otherwise switch to the new column ascending.
+pub fn handle_sort_column_click(
+    current_column: SortColumn,
+    current_direction: SortDirection,
+    clicked_column: SortColumn,
+) -> (SortColumn, SortDirection) {
+    if current_column == clicked_column {
+        let new_direction = match current_direction {
+            SortDirection::Ascending => SortDirection::Descending,
+            SortDirection::Descending => SortDirection::Ascending,
+        };
+        (current_column, new_direction)
+    } else {
+        (clicked_column, SortDirection::Ascending)
+    }
+}
+
+/// Sort file browser documents in-place according to the given column and direction.
+pub fn sort_docs(docs: &mut [DocumentInfo], column: SortColumn, direction: SortDirection) {
+    docs.sort_by(|a, b| {
+        let cmp = match column {
+            SortColumn::Name => {
+                let a_name = std::path::Path::new(&a.file_path)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(&a.file_path)
+                    .to_lowercase();
+                let b_name = std::path::Path::new(&b.file_path)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(&b.file_path)
+                    .to_lowercase();
+                a_name.cmp(&b_name)
+            }
+            SortColumn::Date => a.modified_ts.cmp(&b.modified_ts),
+            SortColumn::Size => a.file_size.cmp(&b.file_size),
+        };
+        match direction {
+            SortDirection::Ascending => cmp,
+            SortDirection::Descending => cmp.reverse(),
+        }
+    });
+}
+
 /// Format a file size in bytes into a human-readable string.
 /// Examples: "0 B", "512 B", "23.4 KB", "1.2 MB", "1.4 GB".
 pub fn format_file_size(size: u64) -> String {
@@ -189,6 +249,10 @@ pub struct PapervaultApp {
     browsed_file: Option<String>,
     /// Multi-selected file paths for batch tagging (Ctrl+click in file browser).
     selected_files: HashSet<String>,
+    /// Current sort column for the file browser.
+    sort_column: SortColumn,
+    /// Current sort direction for the file browser.
+    sort_direction: SortDirection,
     // ── System tray ──
     tray_cmd_rx: Option<Receiver<crate::tray::TrayCommand>>,
     auto_launch: Option<auto_launch::AutoLaunch>,
@@ -286,6 +350,8 @@ impl PapervaultApp {
             file_browser_periodic_timer: 0,
             browsed_file: None,
             selected_files: HashSet::new(),
+            sort_column: SortColumn::Name,
+            sort_direction: SortDirection::Ascending,
             // ── System tray ──
             tray_cmd_rx,
             auto_launch,
@@ -1459,6 +1525,13 @@ impl eframe::App for PapervaultApp {
                 self.file_browser_dirty = false;
             }
 
+            // Apply current sort
+            sort_docs(
+                &mut self.file_browser_docs,
+                self.sort_column,
+                self.sort_direction,
+            );
+
             SidePanel::left("file_browser")
                 .resizable(true)
                 .default_width(280.0)
@@ -1475,6 +1548,79 @@ impl eframe::App for PapervaultApp {
                         }
                     });
                     ui.separator();
+
+                    // Column header row
+                    ui.horizontal(|ui| {
+                        // Name column header
+                        let name_indicator = match self.sort_column {
+                            SortColumn::Name => match self.sort_direction {
+                                SortDirection::Ascending => " ▲",
+                                SortDirection::Descending => " ▼",
+                            },
+                            _ => "",
+                        };
+                        let name_text = RichText::new(format!("Name{}", name_indicator)).strong();
+                        if ui.selectable_label(false, name_text).clicked() {
+                            let (col, dir) = handle_sort_column_click(
+                                self.sort_column,
+                                self.sort_direction,
+                                SortColumn::Name,
+                            );
+                            self.sort_column = col;
+                            self.sort_direction = dir;
+                            self.file_browser_dirty = true;
+                        }
+
+                        // Spacer to push date and size right
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                // Size column header
+                                let size_indicator = match self.sort_column {
+                                    SortColumn::Size => match self.sort_direction {
+                                        SortDirection::Ascending => " ▲",
+                                        SortDirection::Descending => " ▼",
+                                    },
+                                    _ => "",
+                                };
+                                let size_text =
+                                    RichText::new(format!("Size{}", size_indicator)).strong();
+                                if ui.selectable_label(false, size_text).clicked() {
+                                    let (col, dir) = handle_sort_column_click(
+                                        self.sort_column,
+                                        self.sort_direction,
+                                        SortColumn::Size,
+                                    );
+                                    self.sort_column = col;
+                                    self.sort_direction = dir;
+                                    self.file_browser_dirty = true;
+                                }
+
+                                ui.label("  ");
+
+                                // Date column header
+                                let date_indicator = match self.sort_column {
+                                    SortColumn::Date => match self.sort_direction {
+                                        SortDirection::Ascending => " ▲",
+                                        SortDirection::Descending => " ▼",
+                                    },
+                                    _ => "",
+                                };
+                                let date_text =
+                                    RichText::new(format!("Modified{}", date_indicator)).strong();
+                                if ui.selectable_label(false, date_text).clicked() {
+                                    let (col, dir) = handle_sort_column_click(
+                                        self.sort_column,
+                                        self.sort_direction,
+                                        SortColumn::Date,
+                                    );
+                                    self.sort_column = col;
+                                    self.sort_direction = dir;
+                                    self.file_browser_dirty = true;
+                                }
+                            },
+                        );
+                    });
 
                     let ctrl_held = ui.input(|i| i.modifiers.ctrl);
                     let mut clicked_file: Option<String> = None;
@@ -1505,7 +1651,7 @@ impl eframe::App for PapervaultApp {
                                 };
                                 let label = format!("{} {}{}", icon, sparkle, file_name);
                                 let date_str = DateTime::from_timestamp(doc.modified_ts as i64, 0)
-                                    .map(|dt| dt.format("%Y-%m-%d").to_string())
+                                    .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
                                     .unwrap_or_default();
                                 let size_str = format_file_size(doc.file_size);
                                 let resp = Frame::default()
@@ -2003,6 +2149,197 @@ impl eframe::App for PapervaultApp {
 mod tests {
     use super::*;
 
+    fn make_doc(path: &str, file_type: &str, size: u64, ts: u64) -> DocumentInfo {
+        DocumentInfo {
+            file_path: path.to_string(),
+            file_type: file_type.to_string(),
+            content_hash: String::new(),
+            file_size: size,
+            modified_ts: ts,
+            has_tags: false,
+        }
+    }
+
+    // ── sort_docs tests ──
+
+    #[test]
+    fn sort_by_name_ascending() {
+        let mut docs = vec![
+            make_doc("/z.pdf", "pdf", 100, 300),
+            make_doc("/a.txt", "txt", 200, 100),
+            make_doc("/m.md", "md", 300, 200),
+        ];
+        sort_docs(&mut docs, SortColumn::Name, SortDirection::Ascending);
+        let names: Vec<&str> = docs.iter().map(|d| d.file_path.as_str()).collect();
+        assert_eq!(names, vec!["/a.txt", "/m.md", "/z.pdf"]);
+    }
+
+    #[test]
+    fn sort_by_name_descending() {
+        let mut docs = vec![
+            make_doc("/a.txt", "txt", 200, 100),
+            make_doc("/z.pdf", "pdf", 100, 300),
+            make_doc("/m.md", "md", 300, 200),
+        ];
+        sort_docs(&mut docs, SortColumn::Name, SortDirection::Descending);
+        let names: Vec<&str> = docs.iter().map(|d| d.file_path.as_str()).collect();
+        assert_eq!(names, vec!["/z.pdf", "/m.md", "/a.txt"]);
+    }
+
+    #[test]
+    fn sort_by_name_case_insensitive() {
+        let mut docs = vec![
+            make_doc("/Z.pdf", "pdf", 100, 300),
+            make_doc("/a.txt", "txt", 200, 100),
+        ];
+        sort_docs(&mut docs, SortColumn::Name, SortDirection::Ascending);
+        let names: Vec<&str> = docs.iter().map(|d| d.file_path.as_str()).collect();
+        assert_eq!(names, vec!["/a.txt", "/Z.pdf"]);
+    }
+
+    #[test]
+    fn sort_by_date_ascending() {
+        let mut docs = vec![
+            make_doc("/z.pdf", "pdf", 100, 300),
+            make_doc("/a.txt", "txt", 200, 100),
+            make_doc("/m.md", "md", 300, 200),
+        ];
+        sort_docs(&mut docs, SortColumn::Date, SortDirection::Ascending);
+        let ts: Vec<u64> = docs.iter().map(|d| d.modified_ts).collect();
+        assert_eq!(ts, vec![100, 200, 300]);
+    }
+
+    #[test]
+    fn sort_by_date_descending() {
+        let mut docs = vec![
+            make_doc("/a.txt", "txt", 200, 100),
+            make_doc("/z.pdf", "pdf", 100, 300),
+            make_doc("/m.md", "md", 300, 200),
+        ];
+        sort_docs(&mut docs, SortColumn::Date, SortDirection::Descending);
+        let ts: Vec<u64> = docs.iter().map(|d| d.modified_ts).collect();
+        assert_eq!(ts, vec![300, 200, 100]);
+    }
+
+    #[test]
+    fn sort_by_date_equal_timestamps() {
+        // Equal timestamps: original relative order preserved (stable sort)
+        let mut docs = vec![
+            make_doc("/a.txt", "txt", 200, 100),
+            make_doc("/b.pdf", "pdf", 100, 100),
+        ];
+        sort_docs(&mut docs, SortColumn::Date, SortDirection::Ascending);
+        let names: Vec<&str> = docs.iter().map(|d| d.file_path.as_str()).collect();
+        assert_eq!(names, vec!["/a.txt", "/b.pdf"]);
+    }
+
+    #[test]
+    fn sort_by_size_ascending() {
+        let mut docs = vec![
+            make_doc("/z.pdf", "pdf", 300, 100),
+            make_doc("/a.txt", "txt", 100, 200),
+            make_doc("/m.md", "md", 200, 300),
+        ];
+        sort_docs(&mut docs, SortColumn::Size, SortDirection::Ascending);
+        let sizes: Vec<u64> = docs.iter().map(|d| d.file_size).collect();
+        assert_eq!(sizes, vec![100, 200, 300]);
+    }
+
+    #[test]
+    fn sort_by_size_descending() {
+        let mut docs = vec![
+            make_doc("/a.txt", "txt", 100, 200),
+            make_doc("/z.pdf", "pdf", 300, 100),
+            make_doc("/m.md", "md", 200, 300),
+        ];
+        sort_docs(&mut docs, SortColumn::Size, SortDirection::Descending);
+        let sizes: Vec<u64> = docs.iter().map(|d| d.file_size).collect();
+        assert_eq!(sizes, vec![300, 200, 100]);
+    }
+
+    #[test]
+    fn sort_toggle_same_column_toggles_direction() {
+        // Name asc → click Name → Name desc
+        let (col, dir) = handle_sort_column_click(
+            SortColumn::Name,
+            SortDirection::Ascending,
+            SortColumn::Name,
+        );
+        assert_eq!(col, SortColumn::Name);
+        assert_eq!(dir, SortDirection::Descending);
+
+        // Name desc → click Name → Name asc
+        let (col, dir) = handle_sort_column_click(
+            SortColumn::Name,
+            SortDirection::Descending,
+            SortColumn::Name,
+        );
+        assert_eq!(col, SortColumn::Name);
+        assert_eq!(dir, SortDirection::Ascending);
+    }
+
+    #[test]
+    fn sort_toggle_switches_to_new_column_ascending() {
+        // Name asc → click Date → Date asc
+        let (col, dir) = handle_sort_column_click(
+            SortColumn::Name,
+            SortDirection::Ascending,
+            SortColumn::Date,
+        );
+        assert_eq!(col, SortColumn::Date);
+        assert_eq!(dir, SortDirection::Ascending);
+
+        // Name desc → click Size → Size asc
+        let (col, dir) = handle_sort_column_click(
+            SortColumn::Name,
+            SortDirection::Descending,
+            SortColumn::Size,
+        );
+        assert_eq!(col, SortColumn::Size);
+        assert_eq!(dir, SortDirection::Ascending);
+    }
+
+    #[test]
+    fn sort_state_persists_across_refresh() {
+        // Simulate a refresh cycle: sort, re-create docs, sort again with same state.
+        // The sort state (column, direction) must survive.
+        let column = SortColumn::Date;
+        let direction = SortDirection::Descending;
+
+        let mut docs = vec![
+            make_doc("/a.txt", "txt", 200, 100),
+            make_doc("/z.pdf", "pdf", 100, 300),
+            make_doc("/m.md", "md", 300, 200),
+        ];
+        sort_docs(&mut docs, column, direction);
+        let ts: Vec<u64> = docs.iter().map(|d| d.modified_ts).collect();
+        assert_eq!(ts, vec![300, 200, 100]);
+
+        // Simulate a re-fetch from DB (same data, new Vec)
+        let mut docs2 = vec![
+            make_doc("/a.txt", "txt", 200, 100),
+            make_doc("/z.pdf", "pdf", 100, 300),
+            make_doc("/m.md", "md", 300, 200),
+        ];
+        // Sort again with the SAME state (state persisted across refresh)
+        sort_docs(&mut docs2, column, direction);
+        let ts2: Vec<u64> = docs2.iter().map(|d| d.modified_ts).collect();
+        assert_eq!(ts2, vec![300, 200, 100]);
+    }
+
+    #[test]
+    fn sort_by_size_equal_sizes() {
+        let mut docs = vec![
+            make_doc("/b.pdf", "pdf", 100, 200),
+            make_doc("/a.txt", "txt", 100, 100),
+        ];
+        sort_docs(&mut docs, SortColumn::Size, SortDirection::Ascending);
+        let names: Vec<&str> = docs.iter().map(|d| d.file_path.as_str()).collect();
+        assert_eq!(names, vec!["/b.pdf", "/a.txt"]);
+    }
+
+    // ── format_file_size tests ──
+
     #[test]
     fn format_file_size_zero() {
         assert_eq!(format_file_size(0), "0 B");
@@ -2046,21 +2383,27 @@ mod tests {
     #[test]
     fn date_format_epoch_zero() {
         let dt = DateTime::from_timestamp(0, 0).unwrap();
-        assert_eq!(dt.format("%Y-%m-%d").to_string(), "1970-01-01");
+        assert_eq!(dt.format("%Y-%m-%d %H:%M").to_string(), "1970-01-01 00:00");
     }
 
     #[test]
     fn date_format_known_timestamp() {
         // 2023-11-15T10:30:00Z
         let dt = DateTime::from_timestamp(1700044200, 0).unwrap();
-        assert_eq!(dt.format("%Y-%m-%d").to_string(), "2023-11-15");
+        assert_eq!(
+            dt.format("%Y-%m-%d %H:%M").to_string(),
+            "2023-11-15 10:30"
+        );
     }
 
     #[test]
     fn date_format_far_future() {
         // 2099-12-31T23:59:59Z
         let dt = DateTime::from_timestamp(4102444799, 0).unwrap();
-        assert_eq!(dt.format("%Y-%m-%d").to_string(), "2099-12-31");
+        assert_eq!(
+            dt.format("%Y-%m-%d %H:%M").to_string(),
+            "2099-12-31 23:59"
+        );
     }
 }
 
