@@ -25,7 +25,7 @@ use tracing::warn;
 
 /// Which column the file browser is sorted by.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub enum SortColumn {
+enum SortColumn {
     Name,
     Date,
     Size,
@@ -33,14 +33,14 @@ pub enum SortColumn {
 
 /// Sort direction.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub enum SortDirection {
+enum SortDirection {
     Ascending,
     Descending,
 }
 
 /// Compute new sort state when a column header is clicked.
 /// If the same column is clicked again, toggle direction; otherwise switch to the new column ascending.
-pub fn handle_sort_column_click(
+fn handle_sort_column_click(
     current_column: SortColumn,
     current_direction: SortDirection,
     clicked_column: SortColumn,
@@ -57,7 +57,7 @@ pub fn handle_sort_column_click(
 }
 
 /// Sort file browser documents in-place according to the given column and direction.
-pub fn sort_docs(docs: &mut [DocumentInfo], column: SortColumn, direction: SortDirection) {
+fn sort_docs(docs: &mut [DocumentInfo], column: SortColumn, direction: SortDirection) {
     docs.sort_by(|a, b| {
         let cmp = match column {
             SortColumn::Name => {
@@ -85,7 +85,7 @@ pub fn sort_docs(docs: &mut [DocumentInfo], column: SortColumn, direction: SortD
 
 /// Format a file size in bytes into a human-readable string.
 /// Examples: "0 B", "512 B", "23.4 KB", "1.2 MB", "1.4 GB".
-pub fn format_file_size(size: u64) -> String {
+fn format_file_size(size: u64) -> String {
     const UNITS: &[&str] = &["B", "KB", "MB", "GB"];
     let mut float_size = size as f64;
     let mut unit_idx = 0;
@@ -178,6 +178,9 @@ pub struct PapervaultApp {
     auto_tag_progress: Option<(usize, usize)>,
     auto_tag_error: Option<String>,
     accepted_auto_tags: std::collections::HashMap<String, std::collections::HashSet<String>>,
+    /// Cache the most-recently queried auto-tags to avoid per-frame SQL.
+    cached_auto_tag_hash: Option<String>,
+    cached_auto_tags: Vec<String>,
     pending_retag: bool,
     pending_reindex: bool,
     search_query: String,
@@ -335,6 +338,8 @@ impl PapervaultApp {
             auto_tag_progress: None,
             auto_tag_error: None,
             accepted_auto_tags: std::collections::HashMap::new(),
+            cached_auto_tag_hash: None,
+            cached_auto_tags: Vec::new(),
             pending_retag: false,
             pending_reindex: false,
             last_search_instant: None,
@@ -1531,22 +1536,20 @@ impl eframe::App for PapervaultApp {
 
         // ── Left panel: file browser ──
         if self.config.watched_folder.is_some() {
-            // Refresh file list if dirty
+            // Refresh file list if dirty and apply current sort
             if self.file_browser_dirty {
                 if let Some(ref store) = self.tag_store {
                     if let Ok(docs) = store.list_all_documents() {
                         self.file_browser_docs = docs;
                     }
                 }
+                sort_docs(
+                    &mut self.file_browser_docs,
+                    self.sort_column,
+                    self.sort_direction,
+                );
                 self.file_browser_dirty = false;
             }
-
-            // Apply current sort
-            sort_docs(
-                &mut self.file_browser_docs,
-                self.sort_column,
-                self.sort_direction,
-            );
 
             SidePanel::left("file_browser")
                 .resizable(true)
@@ -1567,7 +1570,7 @@ impl eframe::App for PapervaultApp {
 
                     // Column header row
                     ui.horizontal(|ui| {
-                        // Name column header
+                        // Name
                         let name_indicator = match self.sort_column {
                             SortColumn::Name => match self.sort_direction {
                                 SortDirection::Ascending => " ▲",
@@ -1587,11 +1590,10 @@ impl eframe::App for PapervaultApp {
                             self.file_browser_dirty = true;
                         }
 
-                        // Spacer to push date and size right
                         ui.with_layout(
                             egui::Layout::right_to_left(egui::Align::Center),
                             |ui| {
-                                // Size column header
+                                // Size
                                 let size_indicator = match self.sort_column {
                                     SortColumn::Size => match self.sort_direction {
                                         SortDirection::Ascending => " ▲",
@@ -1613,8 +1615,7 @@ impl eframe::App for PapervaultApp {
                                 }
 
                                 ui.label("  ");
-
-                                // Date column header
+                                // Date
                                 let date_indicator = match self.sort_column {
                                     SortColumn::Date => match self.sort_direction {
                                         SortDirection::Ascending => " ▲",
@@ -1834,7 +1835,6 @@ impl eframe::App for PapervaultApp {
                                     clicked_idx = Some(i);
                                 }
 
-                                // Show manually assigned tags from Tantivy index
                                 if !result.tags.is_empty() {
                                     ui.horizontal(|ui| {
                                         for t in &result.tags {
@@ -1845,7 +1845,6 @@ impl eframe::App for PapervaultApp {
                                         }
                                     });
                                 }
-                                // Show auto-tags from tag store (DeepSeek-generated)
                                 if !result.content_hash.is_empty() {
                                     let auto_tags = Self::query_auto_tags(
                                         &self.tag_store,
@@ -1891,11 +1890,17 @@ impl eframe::App for PapervaultApp {
                 .show(ctx, |ui| {
                     // ── Show tags at top of preview when a file is selected ──
                     if let Some(ref hash) = self.selected_hash {
-                        let tags = Self::query_auto_tags(&self.tag_store, hash);
+                        // Cache the auto-tag query to avoid per-frame SQLite round trips
+                        if self.cached_auto_tag_hash.as_deref() != Some(hash.as_str()) {
+                            self.cached_auto_tag_hash = Some(hash.clone());
+                            self.cached_auto_tags =
+                                Self::query_auto_tags(&self.tag_store, hash);
+                        }
+                        let tags = &self.cached_auto_tags;
                         if !tags.is_empty() {
                             ui.horizontal_wrapped(|ui| {
                                 ui.label("🏷");
-                                for tag in &tags {
+                                for tag in tags {
                                     ui.label(
                                         RichText::new(tag)
                                             .size(13.0)
@@ -2399,7 +2404,7 @@ mod tests {
         )
     }
 
-    fn make_search_result(path: &str, hash: &str) -> SearchResult {
+    fn make_search_result(path: &str, hash: &str, file_type: &str) -> SearchResult {
         SearchResult {
             file_name: std::path::Path::new(path)
                 .file_name()
@@ -2407,7 +2412,7 @@ mod tests {
                 .unwrap_or(path)
                 .to_string(),
             file_path: path.to_string(),
-            file_type: "txt".to_string(),
+            file_type: file_type.to_string(),
             snippet: String::new(),
             match_count: 1,
             match_terms: std::sync::Arc::new([]),
@@ -2464,7 +2469,7 @@ mod tests {
         // Simulate: user browsed a PDF in file browser
         app.browsed_file = Some("/docs/report.pdf".to_string());
         // Add a search result so select_result has something to select
-        app.search_results = vec![make_search_result("/docs/notes.txt", "hash1")];
+        app.search_results = vec![make_search_result("/docs/notes.txt", "hash1", "txt")];
         app.total_hits = 1;
 
         app.select_result(0);
@@ -2480,7 +2485,7 @@ mod tests {
     fn select_result_pdf_uses_extension_fallback() {
         let mut app = make_transition_test_app();
         // Simulate: index has wrong file_type ("") but path ends with .pdf
-        let mut result = make_search_result("/docs/report.pdf", "hash1");
+        let mut result = make_search_result("/docs/report.pdf", "hash1", "txt");
         result.file_type = String::new(); // broken index
         app.search_results = vec![result];
         app.total_hits = 1;
@@ -2498,7 +2503,7 @@ mod tests {
         let mut app = make_transition_test_app();
         // Simulate: user browsed a PDF, then clicked a search result
         app.browsed_file = Some("/docs/report.pdf".to_string());
-        app.search_results = vec![make_search_result("/docs/notes.txt", "hash1")];
+        app.search_results = vec![make_search_result("/docs/notes.txt", "hash1", "txt")];
         app.total_hits = 1;
 
         app.select_result(0);
@@ -2513,7 +2518,7 @@ mod tests {
     fn select_result_out_of_bounds_does_not_panic() {
         let mut app = make_transition_test_app();
         app.browsed_file = Some("/docs/doc.pdf".to_string());
-        app.search_results = vec![make_search_result("/a.txt", "h1")];
+        app.search_results = vec![make_search_result("/a.txt", "h1", "txt")];
         app.total_hits = 1;
 
         // Should return early without clearing browsed_file
@@ -2550,7 +2555,7 @@ mod tests {
     fn transition_from_search_to_browse() {
         let mut app = make_transition_test_app();
         // Start: user clicks a search result
-        app.search_results = vec![make_search_result("/docs/notes.txt", "hash1")];
+        app.search_results = vec![make_search_result("/docs/notes.txt", "hash1", "txt")];
         app.total_hits = 1;
         app.select_result(0);
         assert!(app.browsed_file.is_none());
@@ -2578,7 +2583,7 @@ mod tests {
         // If that PDF was actually rendered, selected_hash would also be set
 
         // Then: user clicks a search result
-        app.search_results = vec![make_search_result("/docs/notes.txt", "hash1")];
+        app.search_results = vec![make_search_result("/docs/notes.txt", "hash1", "txt")];
         app.total_hits = 1;
         app.select_result(0);
 
