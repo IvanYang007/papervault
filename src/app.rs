@@ -512,7 +512,11 @@ impl PapervaultApp {
             self.preview_texture = None;
             self.load_text_preview(&PathBuf::from(&file_path));
         }
-        self.preview_file_type = Some(file_type);
+        self.preview_file_type = Some(if is_pdf {
+            PDF_TYPE.into()
+        } else {
+            file_type
+        });
     }
 
     /// Preview a file from the file browser (not a search result).
@@ -2426,6 +2430,11 @@ mod tests {
         );
         assert_eq!(app.selected_result, Some(0));
         assert!(app.browsed_file.is_none());
+        assert_eq!(
+            app.preview_file_type.as_deref(),
+            Some("pdf"),
+            "preview_file_type must be 'pdf' for PDF search results"
+        );
     }
 
     #[test]
