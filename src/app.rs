@@ -500,8 +500,9 @@ impl PapervaultApp {
         // Clear stale preview when switching documents
         self.preview_texture = None;
         self.current_pdf_page_count = 0;
-        let is_pdf = self.search_results[index].file_type == PDF_TYPE;
         let file_path = self.search_results[index].file_path.clone();
+        let is_pdf = self.search_results[index].file_type == PDF_TYPE
+            || file_path.to_lowercase().ends_with(".pdf");
         let file_type = self.search_results[index].file_type.clone();
 
         if is_pdf {
@@ -2391,6 +2392,42 @@ mod tests {
         }
     }
 
+    fn make_pdf_search_result(path: &str, hash: &str) -> SearchResult {
+        SearchResult {
+            file_name: std::path::Path::new(path)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(path)
+                .to_string(),
+            file_path: path.to_string(),
+            file_type: "pdf".to_string(),
+            snippet: String::new(),
+            match_count: 1,
+            match_terms: std::sync::Arc::new([]),
+            content_hash: hash.to_string(),
+            tags: vec![],
+            lower_snippet: String::new(),
+        }
+    }
+
+    #[test]
+    fn select_result_pdf_goes_to_render_not_text_preview() {
+        let mut app = make_transition_test_app();
+        app.search_results = vec![make_pdf_search_result("/docs/report.pdf", "hash1")];
+        app.total_hits = 1;
+
+        app.select_result(0);
+
+        // PDF search results must route to request_page_render,
+        // not load_text_preview — preview_text must remain None
+        assert!(
+            app.preview_text.is_none(),
+            "PDF search result must NOT set preview_text (would show garbled text)"
+        );
+        assert_eq!(app.selected_result, Some(0));
+        assert!(app.browsed_file.is_none());
+    }
+
     #[test]
     fn select_result_clears_browsed_file() {
         let mut app = make_transition_test_app();
@@ -2407,6 +2444,23 @@ mod tests {
             "select_result must clear stale browsed_file"
         );
         assert_eq!(app.selected_result, Some(0));
+    }
+
+    #[test]
+    fn select_result_pdf_uses_extension_fallback() {
+        let mut app = make_transition_test_app();
+        // Simulate: index has wrong file_type ("") but path ends with .pdf
+        let mut result = make_search_result("/docs/report.pdf", "hash1");
+        result.file_type = String::new(); // broken index
+        app.search_results = vec![result];
+        app.total_hits = 1;
+
+        app.select_result(0);
+
+        assert!(
+            app.preview_text.is_none(),
+            "Even with empty file_type, .pdf extension must route to render"
+        );
     }
 
     #[test]
