@@ -493,6 +493,7 @@ impl PapervaultApp {
         if index >= self.search_results.len() {
             return;
         }
+        self.browsed_file = None;
         self.selected_result = Some(index);
         self.selected_hash = Some(self.search_results[index].content_hash.clone());
         self.current_page = 1;
@@ -2336,6 +2337,166 @@ mod tests {
         sort_docs(&mut docs, SortColumn::Size, SortDirection::Ascending);
         let names: Vec<&str> = docs.iter().map(|d| d.file_path.as_str()).collect();
         assert_eq!(names, vec!["/b.pdf", "/a.txt"]);
+    }
+
+    // ── select_result / browse_file state transition tests ──
+
+    /// Minimal PapervaultApp for testing state transitions.
+    fn make_transition_test_app() -> PapervaultApp {
+        let (_progress_tx, progress_rx) = crossbeam::channel::unbounded();
+        PapervaultApp::new(
+            Config::default(),
+            None, // search_engine
+            None, // search_reader
+            None, // search_fields
+            progress_rx,
+            None, // tag_tx
+            None, // render_tx
+            None, // render_rx
+            None, // tag_store
+            None, // watcher_shutdown_flag
+            None, // watcher_shutdown_tx
+            None, // folder_runtime
+            None, // auto_tagger_tx
+            None, // tray_cmd_rx
+            None, // auto_launch
+        )
+    }
+
+    fn make_search_result(path: &str, hash: &str) -> SearchResult {
+        SearchResult {
+            file_name: std::path::Path::new(path)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(path)
+                .to_string(),
+            file_path: path.to_string(),
+            file_type: "txt".to_string(),
+            snippet: String::new(),
+            match_count: 1,
+            match_terms: std::sync::Arc::new([]),
+            content_hash: hash.to_string(),
+            tags: vec![],
+            lower_snippet: String::new(),
+        }
+    }
+
+    #[test]
+    fn select_result_clears_browsed_file() {
+        let mut app = make_transition_test_app();
+        // Simulate: user browsed a PDF in file browser
+        app.browsed_file = Some("/docs/report.pdf".to_string());
+        // Add a search result so select_result has something to select
+        app.search_results = vec![make_search_result("/docs/notes.txt", "hash1")];
+        app.total_hits = 1;
+
+        app.select_result(0);
+
+        assert!(
+            app.browsed_file.is_none(),
+            "select_result must clear stale browsed_file"
+        );
+        assert_eq!(app.selected_result, Some(0));
+    }
+
+    #[test]
+    fn select_result_clears_browsed_file_with_pdf_path() {
+        let mut app = make_transition_test_app();
+        // Simulate: user browsed a PDF, then clicked a search result
+        app.browsed_file = Some("/docs/report.pdf".to_string());
+        app.search_results = vec![make_search_result("/docs/notes.txt", "hash1")];
+        app.total_hits = 1;
+
+        app.select_result(0);
+
+        assert!(
+            app.browsed_file.is_none(),
+            "browsed_file must be cleared even when it ends with .pdf"
+        );
+    }
+
+    #[test]
+    fn select_result_out_of_bounds_does_not_panic() {
+        let mut app = make_transition_test_app();
+        app.browsed_file = Some("/docs/doc.pdf".to_string());
+        app.search_results = vec![make_search_result("/a.txt", "h1")];
+        app.total_hits = 1;
+
+        // Should return early without clearing browsed_file
+        app.select_result(5);
+        assert!(
+            app.browsed_file.is_some(),
+            "out-of-bounds select_result must not touch browsed_file"
+        );
+    }
+
+    #[test]
+    fn browse_file_sets_browsed_and_clears_selected_result() {
+        let mut app = make_transition_test_app();
+        // Simulate: user had a search result selected
+        app.selected_result = Some(0);
+        app.browsed_file = None;
+
+        // browse_file with a non-existent path — the function will error on
+        // file read but the state transitions happen before that.
+        app.browse_file("/nonexistent/doc.txt");
+
+        assert_eq!(
+            app.browsed_file.as_deref(),
+            Some("/nonexistent/doc.txt"),
+            "browse_file must set browsed_file"
+        );
+        assert!(
+            app.selected_result.is_none(),
+            "browse_file must clear selected_result"
+        );
+    }
+
+    #[test]
+    fn transition_from_search_to_browse() {
+        let mut app = make_transition_test_app();
+        // Start: user clicks a search result
+        app.search_results = vec![make_search_result("/docs/notes.txt", "hash1")];
+        app.total_hits = 1;
+        app.select_result(0);
+        assert!(app.browsed_file.is_none());
+        assert_eq!(app.selected_result, Some(0));
+
+        // Then: user clicks a file in the file browser
+        app.browse_file("/docs/report.pdf");
+
+        assert_eq!(
+            app.browsed_file.as_deref(),
+            Some("/docs/report.pdf"),
+            "After browse, browsed_file must be set"
+        );
+        assert!(
+            app.selected_result.is_none(),
+            "After browse, selected_result must be cleared"
+        );
+    }
+
+    #[test]
+    fn transition_from_browse_to_search() {
+        let mut app = make_transition_test_app();
+        // Start: user browsed a PDF in the file browser
+        app.browsed_file = Some("/docs/report.pdf".to_string());
+        // If that PDF was actually rendered, selected_hash would also be set
+
+        // Then: user clicks a search result
+        app.search_results = vec![make_search_result("/docs/notes.txt", "hash1")];
+        app.total_hits = 1;
+        app.select_result(0);
+
+        assert!(
+            app.browsed_file.is_none(),
+            "After select_result, stale browsed_file must be cleared"
+        );
+        assert_eq!(
+            app.selected_result,
+            Some(0),
+            "After select_result, selected_result must be set"
+        );
     }
 
     // ── format_file_size tests ──
