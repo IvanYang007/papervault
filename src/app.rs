@@ -552,27 +552,37 @@ impl PapervaultApp {
     }
 
     /// Load a text file preview with 2MB cap.
+    /// Handles non-UTF-8 files by falling back to lossy decode (same approach
+    /// as `TextExtractor` in the indexer).
     fn load_text_preview(&mut self, file_path: &Path) {
         const PREVIEW_MAX_BYTES: u64 = 2 * 1024 * 1024;
         match std::fs::metadata(file_path) {
-            Ok(meta) if meta.len() > PREVIEW_MAX_BYTES => match std::fs::File::open(file_path) {
-                Ok(file) => {
-                    use std::io::Read;
-                    let mut reader = std::io::BufReader::new(file.take(PREVIEW_MAX_BYTES));
-                    let mut content = String::new();
-                    if reader.read_to_string(&mut content).is_ok() {
-                        content.push_str("\n\n─── Preview truncated at 2 MB ───");
-                        self.preview_text = Some(content);
-                    } else {
-                        self.preview_text = Some("Error reading file.".to_string());
+            Ok(meta) if meta.len() > PREVIEW_MAX_BYTES => {
+                use std::io::Read;
+                match std::fs::File::open(file_path) {
+                    Ok(file) => {
+                        let mut reader = file.take(PREVIEW_MAX_BYTES);
+                        let mut bytes = Vec::new();
+                        match reader.read_to_end(&mut bytes) {
+                            Ok(_) => {
+                                let content = String::from_utf8_lossy(&bytes).to_string();
+                                self.preview_text =
+                                    Some(content + "\n\n─── Preview truncated at 2 MB ───");
+                            }
+                            Err(e) => {
+                                self.preview_text =
+                                    Some(format!("Error reading file: {}", e));
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        self.preview_text = Some(format!("Error reading file: {}", e));
                     }
                 }
-                Err(e) => {
-                    self.preview_text = Some(format!("Error reading file: {}", e));
-                }
-            },
-            _ => match std::fs::read_to_string(file_path) {
-                Ok(content) => {
+            }
+            _ => match std::fs::read(file_path) {
+                Ok(bytes) => {
+                    let content = String::from_utf8_lossy(&bytes).to_string();
                     self.preview_text = Some(content);
                 }
                 Err(e) => {
@@ -2496,6 +2506,32 @@ mod tests {
             app.selected_result,
             Some(0),
             "After select_result, selected_result must be set"
+        );
+    }
+
+    #[test]
+    fn load_text_preview_non_utf8_shows_content_not_error() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("latin1.txt");
+        // Latin-1 bytes that are NOT valid UTF-8 (0xE9 = é in Latin-1)
+        let bytes: Vec<u8> = vec![
+            0x48, 0x65, 0x6C, 0x6C, 0x6F, 0x20, // "Hello "
+            0xE9, // lone byte, invalid UTF-8
+            0x20, 0x77, 0x6F, 0x72, 0x6C, 0x64, // " world"
+        ];
+        std::fs::write(&path, &bytes).unwrap();
+
+        let mut app = make_transition_test_app();
+        app.browse_file(path.to_str().unwrap());
+
+        let preview = app.preview_text.as_deref().unwrap_or_default();
+        assert!(
+            !preview.contains("Error reading file"),
+            "non-UTF-8 file should not produce an error: {preview}"
+        );
+        assert!(
+            preview.contains("Hello"),
+            "non-UTF-8 file should contain readable content"
         );
     }
 
