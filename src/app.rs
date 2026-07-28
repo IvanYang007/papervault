@@ -1834,6 +1834,7 @@ impl eframe::App for PapervaultApp {
                                     clicked_idx = Some(i);
                                 }
 
+                                // Show manually assigned tags from Tantivy index
                                 if !result.tags.is_empty() {
                                     ui.horizontal(|ui| {
                                         for t in &result.tags {
@@ -1843,6 +1844,26 @@ impl eframe::App for PapervaultApp {
                                             );
                                         }
                                     });
+                                }
+                                // Show auto-tags from tag store (DeepSeek-generated)
+                                if !result.content_hash.is_empty() {
+                                    let auto_tags = Self::query_auto_tags(
+                                        &self.tag_store,
+                                        &result.content_hash,
+                                    );
+                                    if !auto_tags.is_empty() {
+                                        ui.horizontal(|ui| {
+                                            for t in &auto_tags {
+                                                ui.label(
+                                                    RichText::new(format!("✨{}", t))
+                                                        .size(tag_label_size)
+                                                        .color(Color32::from_rgb(
+                                                            160, 190, 140,
+                                                        )),
+                                                );
+                                            }
+                                        });
+                                    }
                                 }
 
                                 Self::render_highlighted_snippet(
