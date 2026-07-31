@@ -109,10 +109,11 @@ impl DeepSeekProvider {
             })?;
 
         let tag_response: TagResponse = serde_json::from_str(content).map_err(|e| {
+            // char-safe preview — byte slicing panics inside CJK characters
+            let preview: String = content.chars().take(200).collect();
             TagError::Parse(format!(
                 "failed to parse tag JSON from model output: {}. Raw content: {}",
-                e,
-                &content[..content.len().min(200)]
+                e, preview
             ))
         })?;
 

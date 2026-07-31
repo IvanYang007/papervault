@@ -1699,11 +1699,30 @@ impl eframe::App for PapervaultApp {
             // Refresh request: with a live runtime the indexer thread computes
             // the snapshot (list_all_documents is a full scan under the DB
             // mutex — it must not run on the UI thread). The result arrives
-            // as IndexerProgress::DocsSnapshot. Without a runtime, fall back
-            // to an inline refresh.
+            // as IndexerProgress::DocsSnapshot. First paint is the exception:
+            // the indexer thread may still be in startup reconciliation and
+            // would leave the panel empty for seconds — load synchronously
+            // once so the panel is never visibly split.
             if self.file_browser_dirty {
+                let needs_first_paint = self.file_browser_docs.is_empty();
                 if let Some(ref rt) = self.folder_runtime {
-                    rt.browser_refresh_flag.store(true, Ordering::Relaxed);
+                    if needs_first_paint {
+                        if let Some(ref store) = self.tag_store {
+                            if let Ok(docs) = store.list_all_documents() {
+                                self.file_browser_docs = docs;
+                            }
+                        }
+                        sort_docs(
+                            &mut self.file_browser_docs,
+                            self.sort_column,
+                            self.sort_direction,
+                        );
+                        self.file_browser_rows = build_file_browser_rows(&self.file_browser_docs);
+                        self.refresh_browsed_row();
+                        self.file_browser_dirty = false;
+                    } else {
+                        rt.browser_refresh_flag.store(true, Ordering::Relaxed);
+                    }
                 } else {
                     if let Some(ref store) = self.tag_store {
                         if let Ok(docs) = store.list_all_documents() {
@@ -1824,9 +1843,11 @@ impl eframe::App for PapervaultApp {
                     let mut clicked_file: Option<String> = None;
                     let mut toggled_file: Option<String> = None;
                     // Fixed row height — required by show_rows virtualization.
+                    // Matches the real row content (~20px label + padding) so
+                    // the visible density matches the pre-virtualization list.
                     // (The browsed file's auto-tags moved to a footer below the
                     // list so rows stay uniform.)
-                    let row_height = 30.0;
+                    let row_height = 22.0;
                     ScrollArea::vertical()
                         .id_salt("file_browser_scroll")
                         .show_rows(ui, row_height, self.file_browser_rows.len(), |ui, range| {

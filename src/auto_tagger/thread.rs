@@ -383,8 +383,10 @@ fn tag_document(
         return;
     }
 
-    let text_preview = if text.len() > 120 {
-        format!("{}...", &text[..120])
+    let text_preview = if text.chars().count() > 120 {
+        // char-safe truncation — byte slicing panics inside CJK characters
+        let truncated: String = text.chars().take(120).collect();
+        format!("{}...", truncated)
     } else {
         text.to_string()
     };
@@ -1014,6 +1016,34 @@ mod tests {
             breaker.allow_request(),
             "permanent errors (auth) must not trip the breaker — retries are pointless anyway"
         );
+    }
+
+    #[test]
+    fn tag_document_cjk_text_preview_does_not_panic() {
+        use crate::auto_tagger::config::AutoTagConfig;
+        let (store, _dir) = auto_tagger_test_store();
+        store.upsert_document("h1", "/a.pdf", "pdf", 0, 0).unwrap();
+
+        // 121 CJK chars (363 bytes) — the old byte-slice `&text[..120]`
+        // panicked inside a multibyte character.
+        let cjk_text = "中文内容".repeat(30) + "结尾";
+        assert!(cjk_text.len() > 120);
+
+        let config = AutoTagConfig::default(); // disabled — returns after preview
+        let breaker = ApiCircuitBreaker::new(6, 60_000);
+        tag_document(
+            "h1",
+            "a.pdf",
+            &cjk_text,
+            "x",
+            &store,
+            &DummyProvider,
+            &config,
+            None,
+            &breaker,
+            None,
+        );
+        // Reaching this line means the preview truncation did not panic.
     }
 
     #[test]
