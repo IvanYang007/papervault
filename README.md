@@ -4,16 +4,18 @@ Fast, lightweight PDF & text file search and viewer for Windows 11. Full-text se
 
 ## Features
 
-- **Instant full-text search** across 1,000–10,000+ PDFs and text files
-- **Search-as-you-type** with highlighted snippets (pre-lowercased for zero per-frame allocs)
+- **Instant full-text search** across 1,000–10,000+ PDFs and text files (Tantivy, typically <10ms)
+- **Search-as-you-type** with highlighted snippets (match spans pre-computed per search — zero per-frame work)
 - **Side-by-side layout** — resizable preview panel via drag handle, search results and preview both visible
-- **Parallel indexing** — initial folder scan extracts 32 files at once via rayon; subsequent launches skip the scan if index is up-to-date
-- **File browser** — browse all indexed documents by folder with auto-refresh and tag indicators
-- **PDF preview** — two-pass rendering (low-res→full-res), LRU page cache, display-resolution rendering, encrypted PDF support
+- **Explorer-style file browser** — virtualized Name / Modified / Size columns with drag-to-resize headers, sortable by click, tag indicators (✨)
+- **Parallel indexing** — initial folder scan extracts 32 files at once via rayon; subsequent launches skip the scan if the index is up-to-date; SQLite writes batched into one transaction per 32-file batch
+- **PDF preview** — cached parsed document (parsed once per file, ~6× faster page flips), two-pass rendering (low-res→full-res), LRU page cache, display-resolution rendering, encrypted PDF support
 - **Page prefetch** — next page renders during idle, forward nav feels instant
 - **AI auto-tagging** — DeepSeek API generates document tags from content with 3-tier caching (exact hash, filename token overlap, AI fallback)
+- **No wasted API calls** — already-tagged files are never re-sent to the API; re-indexing preserves both AI and manual tags (no wipe via FK cascade)
+- **One-click re-index for tags** — re-tags the whole library through a durable DB queue (survives queue backpressure, picks up automatically)
+- **API circuit breaker** — a dead DeepSeek endpoint fails fast instead of churning for hours; recovers with a probe call after the cooldown
 - **Manual batch tagging** — Ctrl+click multiple files, click "Tag Selected" to trigger tagging on specific documents
-- **Tags on preview** — auto-tags display at the top of the preview panel when a file is selected
 - **Tag system** — organize, filter, and search by tags with post-filtering; tags refresh live without restart
 - **Chinese (CJK) font support** — Chinese, Japanese characters render correctly
 - **Recursive subfolder indexing** — watches all subdirectories
@@ -47,32 +49,34 @@ cargo build --release
 
 | Component | Technology |
 |-----------|-----------|
-| UI | egui 0.30 (immediate-mode, Rust-native) |
+| UI | egui 0.30 + egui_extras 0.30 (immediate-mode, Rust-native) |
 | Search | Tantivy 0.22 (full-text search engine) |
 | PDF extraction | pdf_oxide 0.3 (pure Rust, ~5x faster than pdf-extract) |
 | Parallel indexing | rayon (32-file batch extraction) |
 | PDF rendering | pdfium-render 0.8.37 (Chromium pdfium) |
 | File watching | notify 7 + walkdir (recursive) |
-| Tags | SQLite (rusqlite, WAL mode, single persistent connection) |
-| Auto-tagging | DeepSeek API (ureq, 3-worker thread pool) |
+| Tags | SQLite (rusqlite, WAL + synchronous=NORMAL, prepared-statement cache, batched transactions) |
+| Auto-tagging | DeepSeek API (ureq, 3-worker thread pool, circuit breaker, atomic row claiming) |
 | Fonts | Microsoft YaHei / SimSun CJK via egui FontDefinitions |
 
 ## Architecture
 
 ```
 4 threads + rayon pool + 3 auto-tagger workers: UI | Indexer | Renderer | Watcher | AutoTagger×3
-5 channels: watcher, tag, render, result, progress + auto_tagger (unbounded)
+6 channels: watcher (bounded 256), tag, render, result, progress + auto_tagger (bounded 256)
+File-browser snapshots are computed on the indexer thread; the UI never scans the DB
 ```
 
 ## Performance
 
-| 700-file collection | Time |
-|---------------------|------|
-| Small PDFs (1-page) | ~1.5s initial scan |
-| Large PDFs (100-page) | ~20s initial scan |
-| Search | <10ms |
-| Page flip (cache hit) | 0ms |
-| Page flip (cache miss) | ~10ms preview, ~80ms full-res |
+| Workload | Before | After |
+|----------|--------|-------|
+| SQLite writes, 5000-file scan | 402 ms (per-file autocommit) | 36 ms (batched transactions) — **11×** |
+| PDF page flip (warm) | 2.2 ms (document re-parsed) | 0.37 ms (cached document) — **6×** |
+| Auto-tag status fetch, 50 results | 435 µs (50 per-row queries) | 152 µs (1 batch query) — **3×** |
+| Search | <10 ms | <10 ms |
+
+Additional gains that don't show in micro-benchmarks: zero per-frame SQLite queries (results list, tag panel, preview all read an in-memory cache), virtualized file browser (only visible rows laid out), and no duplicate AI calls (atomic row claiming).
 
 ## License
 

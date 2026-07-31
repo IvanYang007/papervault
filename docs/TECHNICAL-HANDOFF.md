@@ -1,8 +1,8 @@
 # Technical Handoff — Papervault v2.0
 
-**Date:** 2026-07-22  
-**Branch:** `feat/pdf-oxide-extraction`  
-**Status:** ✅ v2.0 complete — 52 tests, clippy clean, debug + release builds
+**Date:** 2026-07-31  
+**Branch:** `master`  
+**Status:** ✅ v3.0 complete — 176 tests, clippy clean, release build
 
 ---
 
@@ -44,15 +44,16 @@ Windows 11 desktop PDF/text search & viewer. Rust + egui 0.30 + Tantivy 0.22 + p
   Renderer   — pdfium page → RGBA bitmap → channel → UI TextureHandle
   Watcher    — notify-debouncer-full → recursive folder watching
 
-5 Channels:
-  watcher_tx ──bounded(256)──▶ watcher_rx → Pipeline
-  tag_tx     ──unbounded────▶ tag_rx    → Pipeline (no-op handler, kept for future)
-  render_tx  ──unbounded────▶ render_rx → PdfRenderer (coalescing: latest-wins)
-  result_tx  ──unbounded────▶ UI        → TextureHandle
-  progress_tx──unbounded────▶ UI        → status bar
+6 Channels:
+  watcher_tx     ──bounded(256)──▶ watcher_rx → Pipeline
+  tag_tx         ──unbounded────▶ tag_rx    → Pipeline (no-op handler, kept for future)
+  render_tx      ──unbounded────▶ render_rx → PdfRenderer (coalescing: latest-wins)
+  result_tx      ──unbounded────▶ UI        → TextureHandle
+  progress_tx    ──unbounded────▶ UI        → status bar (+ DocsSnapshot for file browser)
+  auto_tagger_tx ──bounded(256)──▶ 3 workers → DeepSeek (DB is the durable queue)
 
 Layout:
-  Left panel:    📂 File browser (all indexed docs from SQLite)
+  Left panel:    📂 File browser (virtualized table — resizable Name/Modified/Size columns)
                  🏷 Tag panel (pre-computed cache, updated on tag change)
   Center top:    🔍 Search bar
   Center below:  Search results (when typing) OR file preview
@@ -78,6 +79,16 @@ Layout:
 | HashSet-based reconcile preload | Single SQL query loads all hashes → O(1) in-memory lookups |
 | File browser refresh cooldown (30 frames) | Rate-limits `list_all_documents()` during active indexing |
 | Pre-lowercased match terms in do_search | Eliminates per-frame String allocations in snippet highlighting |
+| (v3.0) Cached parsed PdfDocument per file | PDF parsed once per file instead of per render — ~6x faster page flips/zooms |
+| (v3.0) Atomic claim_pending_auto_tags (UPDATE…RETURNING) | Concurrent workers each claim disjoint rows — zero duplicate AI calls |
+| (v3.0) Batched SQLite writes (one tx per 32-file batch) | ~11x faster scan writes; per-item fallback on batch failure |
+| (v3.0) Circuit breaker on the DeepSeek endpoint | A dead API fails fast (no hours of churn); half-open probe after cooldown |
+| (v3.0) File-browser snapshots on the indexer thread | list_all_documents never runs on the UI thread (async snapshot channel) |
+| (v3.0) INSERT…ON CONFLICT instead of INSERT OR REPLACE | Re-indexing no longer fires the FK cascade — AI and manual tags survive |
+| (v3.0) already_tagged guard in the indexer | Never wipes tags or re-calls the API for unchanged tagged content |
+| (v3.0) DB-driven re-index for tags | Rows marked pending first — one click re-tags the whole library, drops self-heal |
+| (v3.0) prepare_cached + 64-slot statement cache | Hot SQL compiled once per connection |
+| (v3.0) egui_extras TableBuilder (resizable columns) | Explorer-style Name/Modified/Size resize; rows() keeps virtualization |
 
 ---
 
@@ -93,6 +104,10 @@ Layout:
 | Release build time | ~110s |
 | Release binary size | ~19 MB |
 | Memory (10K doc vault) | ~300-500MB |
+| (v3.0) SQLite writes, 5000-file scan | 402 ms → 36 ms (batched transactions, 11x) |
+| (v3.0) PDF page flip (warm) | 2.2 ms → 0.37 ms (cached document, 6x) |
+| (v3.0) Auto-tag status fetch (50 results) | 435 µs → 152 µs (one batch query, 3x) |
+| (v3.0) Per-frame SQLite queries | 50/frame → 0 (in-memory display cache) |
 
 ---
 
@@ -160,7 +175,7 @@ ef68dc8 fix: address rust-code-review P2 findings
 
 | Priority | Item |
 |----------|------|
-| P1 | File browser virtualization (egui limitation, 10K+ docs) |
+| ✅ | File browser virtualization + resizable columns (egui_extras table, v3.0) |
 | P2 | OCR for scanned PDFs |
 | P2 | Keyboard shortcuts |
 | P2 | Release packaging / installer |
