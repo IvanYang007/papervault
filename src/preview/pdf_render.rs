@@ -17,12 +17,24 @@ const MAX_CACHED_PAGES: usize = 8;
 /// Cache key for rendered page bitmaps: (path, page, zoom_percent).
 type PageCacheKey = (PathBuf, usize, u32);
 
+/// Process-wide pdfium handle, initialized exactly once (a second
+/// FPDF_InitLibrary would block forever on pdfium's global marshall lock).
+/// Stored as an atomic usize because Pdfium is !Sync; every access happens on
+/// the renderer thread. Once provides the happens-before for the store.
+static PDFIUM_INIT: std::sync::Once = std::sync::Once::new();
+static PDFIUM_PTR: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 /// Background PDF renderer with page cache, two-pass rendering, and prefetch support.
 pub struct PdfRenderer {
     request_rx: Receiver<RenderRequest>,
     result_tx: Sender<RenderResult>,
-    pdfium: Option<pdfium_render::prelude::Pdfium>,
-    cached_bytes: Option<(PathBuf, Vec<u8>)>,
+    /// Leaked once — PdfDocument borrows the bindings, so the Pdfium must
+    /// outlive every cached document. Intentional leak: the OS cleans up at
+    /// process exit (same pattern as the single-instance mutex handle).
+    pdfium: Option<&'static pdfium_render::prelude::Pdfium>,
+    /// Currently loaded PDF document, keyed by path. Reused across page/zoom
+    /// renders so the PDF is parsed once per file instead of once per render.
+    cached_doc: Option<(PathBuf, pdfium_render::prelude::PdfDocument<'static>)>,
     /// LRU page cache: most-recently-used entry is at the front.
     page_cache: VecDeque<(PageCacheKey, Arc<Vec<u8>>, u32, u32)>,
 }
@@ -38,23 +50,55 @@ impl PdfRenderer {
             request_rx,
             result_tx,
             pdfium,
-            cached_bytes: None,
+            cached_doc: None,
             page_cache: VecDeque::new(),
         }
     }
 
     /// Try to bind pdfium from the exe directory or system path.
+    /// `PAPERVAULT_PDFIUM_DLL` overrides the DLL location (used by tests).
+    /// The library is initialized exactly once per process and leaked —
+    /// PdfDocument borrows the bindings, so the Pdfium must outlive every
+    /// document (same pattern as the single-instance mutex handle).
     /// Public so FolderRuntime can pre-warm pdfium during startup.
-    pub fn init_pdfium() -> Option<pdfium_render::prelude::Pdfium> {
-        let dll_dir = std::env::current_exe()
-            .ok()
-            .and_then(|p| p.parent().map(|d| d.to_path_buf()))
-            .unwrap_or_else(|| std::path::PathBuf::from("."));
-        let dll_path = dll_dir.join("pdfium.dll");
-        let bindings = pdfium_render::prelude::Pdfium::bind_to_library(&dll_path)
-            .or_else(|_| pdfium_render::prelude::Pdfium::bind_to_system_library())
-            .ok()?;
-        Some(pdfium_render::prelude::Pdfium::new(bindings))
+    pub fn init_pdfium() -> Option<&'static pdfium_render::prelude::Pdfium> {
+        PDFIUM_INIT.call_once(|| {
+            let dll_path = std::env::var_os("PAPERVAULT_PDFIUM_DLL")
+                .map(PathBuf::from)
+                .filter(|p| p.exists())
+                .or_else(|| {
+                    std::env::current_exe()
+                        .ok()
+                        .and_then(|p| p.parent().map(|d| d.join("pdfium.dll")))
+                        .filter(|p| p.exists())
+                });
+            let bindings = match dll_path {
+                Some(path) => pdfium_render::prelude::Pdfium::bind_to_library(&path)
+                    .or_else(|_| pdfium_render::prelude::Pdfium::bind_to_system_library()),
+                None => pdfium_render::prelude::Pdfium::bind_to_system_library(),
+            }
+            .ok();
+            if let Some(bindings) = bindings {
+                let pdfium = pdfium_render::prelude::Pdfium::new(bindings);
+                // SAFETY: Box::into_raw leaks the Pdfium deliberately (it must
+                // outlive all PdfDocuments). The pointer is created once, never
+                // freed, aligned and non-null; the Once store/release pair plus
+                // the Acquire load make it visible to later threads. All
+                // dereferences happen on the single renderer thread while the
+                // pointer stays valid.
+                PDFIUM_PTR.store(
+                    Box::into_raw(Box::new(pdfium)) as usize,
+                    std::sync::atomic::Ordering::Release,
+                );
+            }
+        });
+        let ptr = PDFIUM_PTR.load(std::sync::atomic::Ordering::Acquire);
+        if ptr == 0 {
+            None
+        } else {
+            // SAFETY: see the safety comment at the store site above.
+            Some(unsafe { &*(ptr as *const pdfium_render::prelude::Pdfium) })
+        }
     }
 
     /// Run the render loop (blocks until channel closes).
@@ -149,10 +193,12 @@ impl PdfRenderer {
         Ok(())
     }
 
-    /// Ensure file bytes are cached for the given path.
-    fn ensure_bytes(&mut self, path: &PathBuf) -> anyhow::Result<()> {
+    /// Ensure the PDF document for the given path is loaded and cached.
+    /// The parsed document is reused across page/zoom renders — the PDF is
+    /// parsed once per file instead of once per render request.
+    fn ensure_document(&mut self, path: &PathBuf) -> anyhow::Result<()> {
         let cache_hit = self
-            .cached_bytes
+            .cached_doc
             .as_ref()
             .is_some_and(|(cached_path, _)| cached_path == path);
 
@@ -163,8 +209,9 @@ impl PdfRenderer {
         let metadata = std::fs::metadata(path)
             .with_context(|| format!("Failed to stat: {}", path.display()))?;
         let file_size = metadata.len();
+        let oversized = file_size > BYTE_CACHE_MAX_BYTES;
 
-        if file_size > BYTE_CACHE_MAX_BYTES {
+        if oversized {
             warn!(
                 "PDF {} is {:.1} MB — exceeds cache limit",
                 path.display(),
@@ -175,9 +222,23 @@ impl PdfRenderer {
         let bytes =
             std::fs::read(path).with_context(|| format!("Failed to read: {}", path.display()))?;
 
+        let pdfium = self.pdfium.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "Pdfium library not available — place pdfium.dll next to papervault.exe"
+            )
+        })?;
+        let doc = pdfium
+            .load_pdf_from_byte_vec(bytes, None)
+            .context("Failed to load PDF")?;
+
         // Path changed — clear page cache since old pages are for a different file
         self.page_cache.clear();
-        self.cached_bytes = Some((path.clone(), bytes));
+        // Oversized files load per render to bound memory — do not cache them.
+        self.cached_doc = if oversized {
+            None
+        } else {
+            Some((path.clone(), doc))
+        };
         Ok(())
     }
 
@@ -239,13 +300,23 @@ impl PdfRenderer {
     /// Immutable render phase.
     fn do_render(&self, request: &RenderRequest, is_preview: bool) -> anyhow::Result<RenderResult> {
         let pdfium = self.pdfium.as_ref().expect("pdfium initialized");
-        let (_, bytes) = self.cached_bytes.as_ref().expect("bytes cached");
 
-        let doc = pdfium
-            .load_pdf_from_byte_slice(bytes, None)
-            .context("Failed to load PDF")?;
+        // Use the cached document (parsed once per file). Oversized files fall
+        // back to a per-render load to bound memory.
+        let doc;
+        let doc_ref = match self.cached_doc.as_ref() {
+            Some((_, cached)) => cached,
+            None => {
+                let bytes = std::fs::read(&request.path)
+                    .with_context(|| format!("Failed to read: {}", request.path.display()))?;
+                doc = pdfium
+                    .load_pdf_from_byte_vec(bytes, None)
+                    .context("Failed to load PDF")?;
+                &doc
+            }
+        };
 
-        let pages = doc.pages();
+        let pages = doc_ref.pages();
         if pages.is_empty() {
             return Ok(RenderResult {
                 request_id: request.request_id,
@@ -330,15 +401,8 @@ impl PdfRenderer {
 
         // Render
         self.ensure_pdfium()?;
-        self.ensure_bytes(&request.path)?;
+        self.ensure_document(&request.path)?;
         let result = self.do_render(request, is_preview);
-
-        // Evict oversized byte cache
-        if let Some((_, ref cached)) = self.cached_bytes {
-            if cached.len() as u64 > BYTE_CACHE_MAX_BYTES {
-                self.cached_bytes = None;
-            }
-        }
 
         // Cache the result if it's a full-res render
         if let Ok(ref r) = result {
@@ -353,5 +417,187 @@ impl PdfRenderer {
         }
 
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossbeam::channel;
+
+    /// pdfium is a process-global resource (init holds its marshall lock for
+    /// the process lifetime). Tests touching pdfium must run one at a time.
+    static PDFIUM_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn lock_pdfium() -> std::sync::MutexGuard<'static, ()> {
+        PDFIUM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Generate a 3-page searchable PDF via printpdf (dev-dependency).
+    fn generate_pdf(path: &std::path::Path) {
+        use printpdf::*;
+        use std::io::BufWriter;
+        let (doc, page1_idx, layer1_idx) =
+            PdfDocument::new("Test", Mm(210.0), Mm(297.0), "Layer 1");
+        let font = doc.add_builtin_font(BuiltinFont::Helvetica).unwrap();
+        let layer = doc.get_page(page1_idx).get_layer(layer1_idx);
+        layer.use_text("page one", 12.0, Mm(10.0), Mm(280.0), &font);
+        for i in 2..=3 {
+            let (page_idx, layer_idx) = doc.add_page(Mm(210.0), Mm(297.0), format!("Page {}", i));
+            let layer = doc.get_page(page_idx).get_layer(layer_idx);
+            layer.use_text(format!("page {}", i), 12.0, Mm(10.0), Mm(280.0), &font);
+        }
+        doc.save(&mut BufWriter::new(std::fs::File::create(path).unwrap()))
+            .unwrap();
+    }
+
+    /// Point the renderer at the repo's release DLL; false when it is missing.
+    /// NOTE: must not create/drop a Pdfium here — init/destroy cycles would
+    /// destroy the library under the renderer's leaked instance.
+    fn require_pdfium() -> bool {
+        std::env::set_var("PAPERVAULT_PDFIUM_DLL", "target/release/pdfium.dll");
+        std::path::Path::new("target/release/pdfium.dll").exists()
+    }
+
+    fn make_renderer() -> PdfRenderer {
+        let (_tx, rx) = channel::unbounded::<RenderRequest>();
+        let (_result_tx, _result_rx) = channel::unbounded::<RenderResult>();
+        PdfRenderer::new(rx, _result_tx)
+    }
+
+    fn render_request(path: PathBuf, page: usize) -> RenderRequest {
+        RenderRequest {
+            request_id: 1,
+            path,
+            page,
+            zoom: 1.0,
+            target_width: 400,
+            target_height: 600,
+            priority: 1,
+        }
+    }
+
+    #[test]
+    fn cached_document_reused_across_page_renders() {
+        if !require_pdfium() {
+            eprintln!("SKIP: pdfium.dll not available");
+            return;
+        }
+        let _guard = lock_pdfium();
+        let dir = tempfile::TempDir::new().unwrap();
+        let pdf_path = dir.path().join("doc.pdf");
+        generate_pdf(&pdf_path);
+
+        let mut renderer = make_renderer();
+
+        // First render parses the PDF once and caches the parsed document.
+        let r1 = renderer
+            .render_page(&render_request(pdf_path.clone(), 1), false)
+            .unwrap();
+        assert_eq!(r1.page_count, 3, "3-page fixture must report 3 pages");
+        assert!(r1.width > 0 && r1.height > 0);
+        assert!(
+            renderer.cached_doc.is_some(),
+            "parsed document must be cached after the first render"
+        );
+        assert_eq!(renderer.cached_doc.as_ref().unwrap().0, pdf_path);
+
+        // Second render (different page) must reuse the cached document —
+        // a stale or re-parsed doc would still render, but the cache must
+        // still point at this path with the same cached entry.
+        let r2 = renderer
+            .render_page(&render_request(pdf_path.clone(), 2), false)
+            .unwrap();
+        assert_eq!(r2.page_count, 3);
+        assert!(r2.width > 0 && r2.height > 0);
+        assert_eq!(renderer.cached_doc.as_ref().unwrap().0, pdf_path);
+    }
+
+    #[test]
+    fn document_swap_reloads_doc_and_clears_page_cache() {
+        if !require_pdfium() {
+            eprintln!("SKIP: pdfium.dll not available");
+            return;
+        }
+        let _guard = lock_pdfium();
+        let dir = tempfile::TempDir::new().unwrap();
+        let pdf_a = dir.path().join("a.pdf");
+        let pdf_b = dir.path().join("b.pdf");
+        generate_pdf(&pdf_a);
+        generate_pdf(&pdf_b);
+
+        let mut renderer = make_renderer();
+        renderer
+            .render_page(&render_request(pdf_a.clone(), 1), false)
+            .unwrap();
+        assert_eq!(renderer.cached_doc.as_ref().unwrap().0, pdf_a);
+
+        // Rendering a different file must swap the cached document.
+        renderer
+            .render_page(&render_request(pdf_b.clone(), 1), false)
+            .unwrap();
+        assert_eq!(renderer.cached_doc.as_ref().unwrap().0, pdf_b);
+        // The stale page entry for the old document must be evicted; the cache
+        // now holds only the new document's rendered page.
+        assert_eq!(
+            renderer.page_cache.len(),
+            1,
+            "old pages must be evicted when the document changes"
+        );
+        let (key, ..) = renderer.page_cache.front().unwrap();
+        assert_eq!(
+            key.0, pdf_b,
+            "remaining page must belong to the new document"
+        );
+    }
+
+    /// Measurement: page render with (warm) and without (cold) document re-parse.
+    /// Run with `cargo test --release pdf_document_cache_timing -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn pdf_document_cache_timing() {
+        if !require_pdfium() {
+            eprintln!("SKIP: pdfium.dll not available");
+            return;
+        }
+        let _guard = lock_pdfium();
+        use std::time::Instant;
+        let dir = tempfile::TempDir::new().unwrap();
+        let pdf_a = dir.path().join("a.pdf");
+        let pdf_b = dir.path().join("b.pdf");
+        generate_pdf(&pdf_a);
+        generate_pdf(&pdf_b);
+
+        let mut renderer = make_renderer();
+
+        // Cold: page 1 — includes PDF parse.
+        let start = Instant::now();
+        renderer
+            .render_page(&render_request(pdf_a.clone(), 1), false)
+            .unwrap();
+        let cold = start.elapsed();
+
+        // Warm: page 2 — cached document, render only.
+        let start = Instant::now();
+        renderer
+            .render_page(&render_request(pdf_a.clone(), 2), false)
+            .unwrap();
+        let warm = start.elapsed();
+
+        // Cold again on a second file (forces re-parse).
+        let start = Instant::now();
+        renderer
+            .render_page(&render_request(pdf_b.clone(), 1), false)
+            .unwrap();
+        let cold2 = start.elapsed();
+
+        eprintln!(
+            "cold page render (with parse): {:?}, warm page render (cached doc): {:?}, \
+             cold-2nd-file: {:?}, speedup {:.1}x",
+            cold,
+            warm,
+            cold2,
+            cold.as_secs_f64() / warm.as_secs_f64().max(1e-9)
+        );
     }
 }
