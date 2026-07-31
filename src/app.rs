@@ -57,30 +57,47 @@ fn handle_sort_column_click(
 }
 
 /// Sort file browser documents in-place according to the given column and direction.
-fn sort_docs(docs: &mut [DocumentInfo], column: SortColumn, direction: SortDirection) {
-    docs.sort_by(|a, b| {
-        let cmp = match column {
-            SortColumn::Name => {
-                let a_name = std::path::Path::new(&a.file_path)
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or(&a.file_path)
-                    .to_lowercase();
-                let b_name = std::path::Path::new(&b.file_path)
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or(&b.file_path)
-                    .to_lowercase();
-                a_name.cmp(&b_name)
-            }
-            SortColumn::Date => a.modified_ts.cmp(&b.modified_ts),
-            SortColumn::Size => a.file_size.cmp(&b.file_size),
-        };
-        match direction {
-            SortDirection::Ascending => cmp,
-            SortDirection::Descending => cmp.reverse(),
+fn sort_docs(docs: &mut Vec<DocumentInfo>, column: SortColumn, direction: SortDirection) {
+    match column {
+        // Precompute lowercase keys once — comparing with fresh to_lowercase()
+        // per comparison was O(n log n) allocations per refresh.
+        SortColumn::Name => {
+            let keys: Vec<String> = docs
+                .iter()
+                .map(|d| {
+                    std::path::Path::new(&d.file_path)
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or(&d.file_path)
+                        .to_lowercase()
+                })
+                .collect();
+            let mut order: Vec<usize> = (0..docs.len()).collect();
+            order.sort_by(|&ia, &ib| {
+                let cmp = keys[ia].cmp(&keys[ib]);
+                match direction {
+                    SortDirection::Ascending => cmp,
+                    SortDirection::Descending => cmp.reverse(),
+                }
+            });
+            let sorted: Vec<DocumentInfo> = order.iter().map(|&i| docs[i].clone()).collect();
+            *docs = sorted;
         }
-    });
+        SortColumn::Date => docs.sort_by(|a, b| {
+            let cmp = a.modified_ts.cmp(&b.modified_ts);
+            match direction {
+                SortDirection::Ascending => cmp,
+                SortDirection::Descending => cmp.reverse(),
+            }
+        }),
+        SortColumn::Size => docs.sort_by(|a, b| {
+            let cmp = a.file_size.cmp(&b.file_size);
+            match direction {
+                SortDirection::Ascending => cmp,
+                SortDirection::Descending => cmp.reverse(),
+            }
+        }),
+    }
 }
 
 /// Format a file size in bytes into a human-readable string.
@@ -1100,69 +1117,17 @@ impl PapervaultApp {
         }
     }
 
-    /// Render a snippet with matched terms highlighted in gold.
-    fn render_highlighted_snippet(
-        ui: &mut egui::Ui,
-        snippet: &str,
-        lower_snippet: &str,
-        match_terms: &[String],
-    ) {
-        if match_terms.is_empty() {
-            ui.label(RichText::new(snippet).size(12.0).color(Color32::GRAY));
-            return;
-        }
-
-        let mut spans: Vec<(usize, usize)> = Vec::new();
-
-        // Find all match positions (case-insensitive).
-        // match_terms are pre-lowercased in do_search(), so no per-frame alloc here.
-        for term in match_terms {
-            if term.is_empty() {
-                continue;
-            }
-            let mut search_start = 0;
-            while let Some(pos) = lower_snippet[search_start..].find(term) {
-                let abs_start = search_start + pos;
-                let abs_end = abs_start + term.len();
-                spans.push((abs_start, abs_end));
-                search_start = abs_end;
-            }
-        }
-
+    /// Render a snippet with pre-computed highlight spans highlighted in gold.
+    fn render_highlighted_snippet(ui: &mut egui::Ui, snippet: &str, spans: &[(usize, usize)]) {
         if spans.is_empty() {
             ui.label(RichText::new(snippet).size(12.0).color(Color32::GRAY));
             return;
         }
 
-        // Sort and merge overlapping spans, validating against original byte boundaries.
-        // Byte offsets from the lowercased string may not align with UTF-8 boundaries
-        // in the original snippet (e.g., Turkish İ → i̇ changes byte length).
-        spans.sort_by_key(|s| s.0);
-        let mut merged: Vec<(usize, usize)> = Vec::new();
-        for span in spans {
-            // Validate span boundaries against the original snippet
-            if !snippet.is_char_boundary(span.0) || !snippet.is_char_boundary(span.1) {
-                tracing::debug!(
-                    "Skipping highlight span at byte offsets ({}, {}) — not char-aligned in original",
-                    span.0, span.1
-                );
-                continue;
-            }
-            if let Some(last) = merged.last_mut() {
-                if span.0 <= last.1 {
-                    last.1 = last.1.max(span.1);
-                } else {
-                    merged.push(span);
-                }
-            } else {
-                merged.push(span);
-            }
-        }
-
         // Render segments with alternating colors
         ui.horizontal(|ui| {
             let mut cursor = 0;
-            for (start, end) in &merged {
+            for (start, end) in spans {
                 if cursor < *start {
                     ui.label(
                         RichText::new(&snippet[cursor..*start])
@@ -2030,8 +1995,7 @@ impl eframe::App for PapervaultApp {
                                 Self::render_highlighted_snippet(
                                     ui,
                                     &result.snippet,
-                                    &result.lower_snippet,
-                                    &result.match_terms,
+                                    &result.highlight_spans,
                                 );
                             });
                         }
@@ -2619,6 +2583,7 @@ mod tests {
             snippet: String::new(),
             match_count: 1,
             match_terms: std::sync::Arc::new([]),
+            highlight_spans: Vec::new(),
             content_hash: hash.to_string(),
             tags: vec![],
             lower_snippet: String::new(),
@@ -2637,6 +2602,7 @@ mod tests {
             snippet: String::new(),
             match_count: 1,
             match_terms: std::sync::Arc::new([]),
+            highlight_spans: Vec::new(),
             content_hash: hash.to_string(),
             tags: vec![],
             lower_snippet: String::new(),

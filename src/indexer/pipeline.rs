@@ -274,11 +274,12 @@ impl Pipeline {
     fn process_batch(&mut self, batch: &[(PathBuf, u64, u64)], offset: usize) -> usize {
         use rayon::prelude::*;
 
-        // Phase 1: Extract text in parallel (each thread creates its own extractors)
+        // Phase 1: Extract text in parallel. The extractor chain is built
+        // once and shared (Send + Sync) — previously it was rebuilt per file.
+        let stages = crate::indexer::stages::create_extractor_chain();
         let results: Vec<_> = batch
             .par_iter()
             .map(|(path, mtime, size)| {
-                let stages = crate::indexer::stages::create_extractor_chain();
                 let extracted = match crate::indexer::stages::run_chain(path, &stages) {
                     Ok(Some(content)) => Some(content),
                     Ok(None) => None,

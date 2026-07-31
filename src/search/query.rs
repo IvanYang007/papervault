@@ -53,9 +53,59 @@ pub struct SearchResult {
     pub match_count: usize,
     #[serde(skip)]
     pub match_terms: Arc<[String]>,
+    /// Pre-computed highlight spans into `snippet` (byte offsets, merged,
+    /// char-boundary validated) — the render loop must not re-scan per frame.
+    #[serde(skip)]
+    pub highlight_spans: Vec<(usize, usize)>,
     pub content_hash: String,
     pub tags: Vec<String>,
     pub lower_snippet: String,
+}
+
+/// Find all match positions of the (lowercased) terms in a snippet, merge
+/// overlapping spans, and validate UTF-8 boundaries against the original.
+/// Byte offsets come from the lowercased string, which can misalign with the
+/// original (e.g. Turkish İ → i̇) — misaligned spans are dropped.
+pub fn compute_highlight_spans(
+    snippet: &str,
+    lower_snippet: &str,
+    match_terms: &[String],
+) -> Vec<(usize, usize)> {
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    for term in match_terms {
+        if term.is_empty() {
+            continue;
+        }
+        let mut search_start = 0;
+        while let Some(pos) = lower_snippet[search_start..].find(term) {
+            let abs_start = search_start + pos;
+            let abs_end = abs_start + term.len();
+            spans.push((abs_start, abs_end));
+            search_start = abs_end;
+        }
+    }
+    if spans.is_empty() {
+        return spans;
+    }
+    // Sort and merge overlapping spans, validating against the original
+    // snippet's char boundaries.
+    spans.sort_by_key(|s| s.0);
+    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(spans.len());
+    for span in spans {
+        if !snippet.is_char_boundary(span.0) || !snippet.is_char_boundary(span.1) {
+            continue;
+        }
+        if let Some(last) = merged.last_mut() {
+            if span.0 <= last.1 {
+                last.1 = last.1.max(span.1);
+            } else {
+                merged.push(span);
+            }
+        } else {
+            merged.push(span);
+        }
+    }
+    merged
 }
 
 /// Collection of search results with metadata.
@@ -187,5 +237,45 @@ mod tests {
             search_with_reader(&fields, &reader, &SearchRequest::new("   ".into())).unwrap();
         assert!(results.items.is_empty());
         assert_eq!(results.total_hits, 0);
+    }
+
+    // ── compute_highlight_spans tests ──
+
+    #[test]
+    fn highlight_spans_find_case_insensitive_matches() {
+        let snippet = "The quick brown fox";
+        let spans = compute_highlight_spans(snippet, &snippet.to_lowercase(), &["quick".into()]);
+        assert_eq!(spans, vec![(4, 9)], "must find the term in lowercase text");
+        assert_eq!(&snippet[4..9], "quick");
+    }
+
+    #[test]
+    fn highlight_spans_merge_overlapping_terms() {
+        let snippet = "tax return 2023";
+        let lower = snippet.to_lowercase();
+        let spans = compute_highlight_spans(snippet, &lower, &["tax".into(), "tax return".into()]);
+        // (0,3) and (0,10) overlap -> merged to (0,10)
+        assert_eq!(spans, vec![(0, 10)]);
+    }
+
+    #[test]
+    fn highlight_spans_skip_non_char_boundaries() {
+        // The lowercased offset misaligns with the original for İ (2-byte
+        // uppercase, 3-byte lowercase) — the span must be dropped, not panic.
+        let snippet = "İstanbul";
+        let lower = snippet.to_lowercase();
+        let spans = compute_highlight_spans(snippet, &lower, &["istanbul".into()]);
+        assert!(
+            spans.is_empty(),
+            "misaligned spans must be dropped: {:?}",
+            spans
+        );
+    }
+
+    #[test]
+    fn highlight_spans_no_terms_returns_empty() {
+        let snippet = "plain text";
+        let spans = compute_highlight_spans(snippet, &snippet.to_lowercase(), &[]);
+        assert!(spans.is_empty());
     }
 }

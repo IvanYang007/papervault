@@ -254,6 +254,8 @@ unsafe fn show_tray_menu(hwnd: HWND) {
 unsafe fn send_tray_command(hwnd: HWND, cmd: TrayCommand) {
     let ptr = GetWindowLongPtrW(hwnd, GWL_USERDATA) as *mut Sender<TrayCommand>;
     if !ptr.is_null() {
-        let _ = (*ptr).send(cmd);
+        // try_send: a full queue (main thread busy) must not block the tray
+        // message pump — a lost Open/Exit click is better than a frozen icon.
+        let _ = (*ptr).try_send(cmd);
     }
 }

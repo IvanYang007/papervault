@@ -373,14 +373,19 @@ pub fn search_with_reader(
             fragment.to_string()
         };
 
+        let lower_snippet = snippet.to_lowercase();
+        // Pre-computed once per search — the UI must not re-scan per frame.
+        let highlight_spans =
+            crate::search::query::compute_highlight_spans(&snippet, &lower_snippet, &match_terms);
         items.push(SearchResult {
             file_name,
             file_path,
             file_type,
-            lower_snippet: snippet.to_lowercase(),
+            lower_snippet,
             snippet,
             match_count,
             match_terms: Arc::clone(&match_terms),
+            highlight_spans,
             content_hash,
             tags,
         });
