@@ -35,12 +35,24 @@ pub struct PdfRenderer {
     /// Currently loaded PDF document, keyed by path. Reused across page/zoom
     /// renders so the PDF is parsed once per file instead of once per render.
     cached_doc: Option<(PathBuf, pdfium_render::prelude::PdfDocument<'static>)>,
+    /// Files larger than this are rendered per-request without caching.
+    byte_cache_max_bytes: u64,
     /// LRU page cache: most-recently-used entry is at the front.
     page_cache: VecDeque<(PageCacheKey, Arc<Vec<u8>>, u32, u32)>,
 }
 
 impl PdfRenderer {
     pub fn new(request_rx: Receiver<RenderRequest>, result_tx: Sender<RenderResult>) -> Self {
+        Self::new_with_cache_limit(request_rx, result_tx, BYTE_CACHE_MAX_BYTES)
+    }
+
+    /// Renderer with an overridable per-file cache limit (tests force the
+    /// oversized-fallback path with a normal-size fixture).
+    pub fn new_with_cache_limit(
+        request_rx: Receiver<RenderRequest>,
+        result_tx: Sender<RenderResult>,
+        byte_cache_max_bytes: u64,
+    ) -> Self {
         // Eagerly initialize pdfium so the first render is instant.
         let pdfium = Self::init_pdfium();
         if pdfium.is_some() {
@@ -51,6 +63,7 @@ impl PdfRenderer {
             result_tx,
             pdfium,
             cached_doc: None,
+            byte_cache_max_bytes,
             page_cache: VecDeque::new(),
         }
     }
@@ -209,7 +222,7 @@ impl PdfRenderer {
         let metadata = std::fs::metadata(path)
             .with_context(|| format!("Failed to stat: {}", path.display()))?;
         let file_size = metadata.len();
-        let oversized = file_size > BYTE_CACHE_MAX_BYTES;
+        let oversized = file_size > self.byte_cache_max_bytes;
 
         if oversized {
             warn!(
@@ -555,6 +568,45 @@ mod tests {
             key.0, pdf_b,
             "remaining page must belong to the new document"
         );
+    }
+
+    #[test]
+    fn oversized_files_use_per_render_load_without_caching() {
+        if !require_pdfium() {
+            eprintln!("SKIP: pdfium.dll not available");
+            return;
+        }
+        let _guard = lock_pdfium();
+        let dir = tempfile::TempDir::new().unwrap();
+        let pdf_path = dir.path().join("big.pdf");
+        generate_pdf(&pdf_path);
+
+        // Limit of 1 byte forces every file onto the oversized path.
+        let (_tx, rx) = channel::unbounded::<RenderRequest>();
+        let (_result_tx, _result_rx) = channel::unbounded::<RenderResult>();
+        let mut renderer = PdfRenderer::new_with_cache_limit(rx, _result_tx, 1);
+
+        // Render must succeed through the per-render fallback load.
+        let r1 = renderer
+            .render_page(&render_request(pdf_path.clone(), 1), false)
+            .unwrap();
+        assert_eq!(r1.page_count, 3);
+        assert!(r1.width > 0 && r1.height > 0);
+        assert!(
+            renderer.cached_doc.is_none(),
+            "oversized files must not be cached"
+        );
+        assert_eq!(
+            renderer.page_cache.len(),
+            1,
+            "rendered pages still populate the LRU page cache"
+        );
+
+        // A second render on the same path keeps working (no stale state).
+        let r2 = renderer
+            .render_page(&render_request(pdf_path, 2), false)
+            .unwrap();
+        assert!(r2.width > 0 && r2.height > 0);
     }
 
     /// Measurement: page render with (warm) and without (cold) document re-parse.

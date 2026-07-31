@@ -1232,6 +1232,39 @@ mod tests {
     }
 
     #[test]
+    fn claim_pending_auto_tags_marks_rows_processing() {
+        let (store, _dir) = setup_test_store();
+        store.upsert_document("h1", "/a.pdf", "pdf", 0, 0).unwrap();
+        store
+            .upsert_auto_tag_status("h1", "a.pdf", "x", "pending", None, None)
+            .unwrap();
+
+        let claimed = store.claim_pending_auto_tags(10).unwrap();
+        assert_eq!(claimed.len(), 1);
+        // The claim must flip the row so no other worker picks it up.
+        let status = store.auto_tag_status("h1").unwrap().unwrap();
+        assert_eq!(
+            status.status, "processing",
+            "claimed rows must be marked 'processing'"
+        );
+        // And the worker finishing the job flips it to 'tagged'.
+        store
+            .upsert_auto_tag_status(
+                "h1",
+                "a.pdf",
+                "x",
+                "tagged",
+                Some(r#"{"tags":["tax"]}"#),
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            store.auto_tag_status("h1").unwrap().unwrap().status,
+            "tagged"
+        );
+    }
+
+    #[test]
     fn reset_stale_processing_makes_rows_claimable() {
         let (store, _dir) = setup_test_store();
         store.upsert_document("h1", "/a.pdf", "pdf", 0, 0).unwrap();

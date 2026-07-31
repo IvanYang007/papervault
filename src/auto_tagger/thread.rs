@@ -960,6 +960,61 @@ mod tests {
     }
 
     #[test]
+    fn tag_document_breaker_wiring_unavailable_trips_non_transient_does_not() {
+        use crate::auto_tagger::config::AutoTagConfig;
+        use crate::auto_tagger::provider::{TagError, TagProvider, TagResponse};
+
+        struct FailProvider(TagError);
+        impl TagProvider for FailProvider {
+            fn generate_tags(
+                &self,
+                _: &str,
+                _: &str,
+                _: &[String],
+            ) -> Result<TagResponse, TagError> {
+                Err(self.0.clone())
+            }
+        }
+
+        // Transient (Unavailable) failures must trip the breaker.
+        let (store, _dir) = auto_tagger_test_store();
+        store.upsert_document("h1", "/a.pdf", "pdf", 0, 0).unwrap();
+        store
+            .upsert_auto_tag_status("h1", "a.pdf", "x", "pending", None, None)
+            .unwrap();
+        let config = AutoTagConfig {
+            enabled: true,
+            max_retries: 1, // no backoff sleeps
+            ..AutoTagConfig::default()
+        };
+        let breaker = ApiCircuitBreaker::new(1, 60_000);
+        let provider = FailProvider(TagError::Unavailable("down".into()));
+        tag_document(
+            "h1", "a.pdf", "text", "x", &store, &provider, &config, None, &breaker, None,
+        );
+        assert!(
+            !breaker.allow_request(),
+            "Unavailable failures must trip the circuit breaker"
+        );
+
+        // Non-transient (auth) failures must NOT trip it.
+        let (store, _dir) = auto_tagger_test_store();
+        store.upsert_document("h2", "/b.pdf", "pdf", 0, 0).unwrap();
+        store
+            .upsert_auto_tag_status("h2", "b.pdf", "x", "pending", None, None)
+            .unwrap();
+        let breaker = ApiCircuitBreaker::new(1, 60_000);
+        let provider = FailProvider(TagError::Auth("bad key".into()));
+        tag_document(
+            "h2", "b.pdf", "text", "x", &store, &provider, &config, None, &breaker, None,
+        );
+        assert!(
+            breaker.allow_request(),
+            "permanent errors (auth) must not trip the breaker — retries are pointless anyway"
+        );
+    }
+
+    #[test]
     fn shutdown_request_returns_true() {
         use crate::auto_tagger::config::AutoTagConfig;
         use crate::auto_tagger::provider::{Entities, TagError, TagProvider, TagResponse};

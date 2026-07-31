@@ -797,6 +797,16 @@ impl PapervaultApp {
         // No per-frame tag query.
     }
 
+    /// Drop the stale display-cache entry for one hash (tag data changed).
+    fn invalidate_auto_tag(&mut self, content_hash: &str) {
+        self.auto_tag_cache.remove(content_hash);
+    }
+
+    /// Drop every stale display-cache entry (bulk re-queue events).
+    fn clear_auto_tag_cache(&mut self) {
+        self.auto_tag_cache.clear();
+    }
+
     /// Take the last-completed hash from the auto-tagger signal and drop its
     /// stale display-cache entry (if any).
     fn consume_auto_tag_completed(
@@ -896,7 +906,7 @@ impl PapervaultApp {
             None,
         );
         // The pending reset wipes tags_json — drop the stale display cache entry.
-        self.auto_tag_cache.remove(&hash);
+        self.invalidate_auto_tag(&hash);
 
         let _ = tx.send(AutoTagRequest::TagDocument {
             content_hash: hash.clone(),
@@ -992,7 +1002,7 @@ impl PapervaultApp {
                 None,
             );
             // Reset wipes tags_json — drop the stale display cache entry.
-            self.auto_tag_cache.remove(&doc.content_hash);
+            self.invalidate_auto_tag(&doc.content_hash);
 
             let request = AutoTagRequest::TagDocument {
                 content_hash: doc.content_hash.clone(),
@@ -1318,8 +1328,8 @@ impl eframe::App for PapervaultApp {
                     // Progress moved — refresh file browser
                     self.file_browser_dirty = true;
                     // The completed doc's tags changed — drop its cached display data
-                    if let Some(ref hash) = self.selected_hash {
-                        self.auto_tag_cache.remove(hash);
+                    if let Some(hash) = self.selected_hash.clone() {
+                        self.invalidate_auto_tag(&hash);
                     }
                     if completed >= total {
                         self.auto_tag_progress = None;
@@ -1395,7 +1405,7 @@ impl eframe::App for PapervaultApp {
                         }
                         self.auto_tag_progress = Some((queued, total));
                         // All docs re-queued — any cached auto-tag display is now stale
-                        self.auto_tag_cache.clear();
+                        self.clear_auto_tag_cache();
                     }
                 }
             }
@@ -1620,7 +1630,7 @@ impl eframe::App for PapervaultApp {
                                                 let _ = store.dismiss_auto_tag(&hash, &tag);
                                             }
                                             // The stored JSON changed — drop the stale entry
-                                            self.auto_tag_cache.remove(&hash);
+                                            self.invalidate_auto_tag(&hash);
                                         }
                                     }
                                 }
@@ -2958,6 +2968,40 @@ mod tests {
         let status = app.cached_auto_tag("h1").expect("h1 cached");
         assert_eq!(status.filename, "a.pdf");
         assert_eq!(status.value["tags"][0], "tax");
+    }
+
+    #[test]
+    fn invalidate_and_clear_auto_tag_cache_methods() {
+        let (mut app, _dir) = make_store_app();
+        let store = app.tag_store.clone().unwrap();
+        store.upsert_document("h1", "/a.pdf", "pdf", 0, 0).unwrap();
+        store.upsert_document("h2", "/b.pdf", "pdf", 0, 0).unwrap();
+        for h in ["h1", "h2"] {
+            store
+                .upsert_auto_tag_status(
+                    h,
+                    "a.pdf",
+                    "x",
+                    "tagged",
+                    Some(r#"{"tags":["tax"]}"#),
+                    None,
+                )
+                .unwrap();
+        }
+        app.ensure_auto_tag_cache(&["h1", "h2"]);
+        assert_eq!(app.auto_tag_cache.len(), 2);
+
+        // Single-hash invalidation (what dismiss/retag/progress do).
+        app.invalidate_auto_tag("h1");
+        assert!(!app.auto_tag_cache.contains_key("h1"));
+        assert!(app.auto_tag_cache.contains_key("h2"));
+
+        // Bulk invalidation (what reindex does).
+        app.clear_auto_tag_cache();
+        assert!(app.auto_tag_cache.is_empty());
+        // A read after invalidation re-fetches (miss path) instead of
+        // serving the stale snapshot.
+        assert_eq!(app.cached_auto_tags("h1"), vec!["tax"]);
     }
 
     #[test]
