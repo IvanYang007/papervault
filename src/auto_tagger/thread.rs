@@ -1047,6 +1047,75 @@ mod tests {
     }
 
     #[test]
+    fn tag_document_retags_content_when_hash_before_differs() {
+        // "Re-index for tags" semantics: the worker must STILL call the API
+        // for an already-tagged row when the hash-before differs (the reindex
+        // flow sends a synthetic hash so tier-1 cannot short-circuit).
+        use crate::auto_tagger::config::AutoTagConfig;
+        use crate::auto_tagger::provider::{Entities, TagError, TagProvider, TagResponse};
+
+        struct CountingProvider(std::sync::atomic::AtomicUsize);
+        impl TagProvider for CountingProvider {
+            fn generate_tags(
+                &self,
+                _: &str,
+                _: &str,
+                _: &[String],
+            ) -> Result<TagResponse, TagError> {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                Ok(TagResponse {
+                    tags: vec!["fresh".into()],
+                    entities: Entities::default(),
+                })
+            }
+        }
+
+        let (store, _dir) = auto_tagger_test_store();
+        store.upsert_document("h1", "/a.pdf", "pdf", 0, 0).unwrap();
+        store
+            .upsert_auto_tag_status(
+                "h1",
+                "a.pdf",
+                "stale-hash-before",
+                "tagged",
+                Some(r#"{"tags":["old"]}"#),
+                None,
+            )
+            .unwrap();
+
+        let provider = CountingProvider(std::sync::atomic::AtomicUsize::new(0));
+        let config = AutoTagConfig {
+            enabled: true,
+            ..AutoTagConfig::default()
+        };
+        let breaker = ApiCircuitBreaker::new(6, 60_000);
+        tag_document(
+            "h1",
+            "a.pdf",
+            "text",
+            "reindex-hash", // differs from the stored hash-before
+            &store,
+            &provider,
+            &config,
+            None,
+            &breaker,
+            None,
+        );
+
+        assert_eq!(
+            provider.0.load(Ordering::Relaxed),
+            1,
+            "reindex must still reach the API for changed content"
+        );
+        let status = store.auto_tag_status("h1").unwrap().unwrap();
+        assert_eq!(status.status, "tagged");
+        assert!(
+            status.tags_json.as_deref().unwrap_or("").contains("fresh"),
+            "the fresh re-tag result must be stored"
+        );
+    }
+
+    #[test]
     fn shutdown_request_returns_true() {
         use crate::auto_tagger::config::AutoTagConfig;
         use crate::auto_tagger::provider::{Entities, TagError, TagProvider, TagResponse};

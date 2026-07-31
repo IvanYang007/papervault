@@ -1385,7 +1385,11 @@ impl eframe::App for PapervaultApp {
                             rt.auto_tag_progress
                                 .store(0, std::sync::atomic::Ordering::Relaxed);
                         }
-                        self.auto_tag_progress = Some((0, total));
+                        // DB-first re-queue: every row is marked 'pending' (the
+                        // durable queue) BEFORE the channel send. If the
+                        // bounded channel is full, dropped requests are
+                        // recovered by the workers' idle re-claim — one click
+                        // re-indexes the whole library.
                         let mut queued = 0usize;
                         for doc in docs {
                             let file_name = std::path::Path::new(&doc.file_path)
@@ -1399,6 +1403,15 @@ impl eframe::App for PapervaultApp {
                                 hasher.update(b"reindex");
                                 hasher.finalize().to_hex().to_string()
                             };
+                            // Durable queue first: claimable even if the send drops.
+                            let _ = store.upsert_auto_tag_status(
+                                &doc.content_hash,
+                                &file_name,
+                                &content_hash_before_tag,
+                                "pending",
+                                None,
+                                None,
+                            );
                             // Never block the UI thread on the bounded queue.
                             if !Self::try_queue_auto_tag(
                                 tx,
@@ -1409,18 +1422,14 @@ impl eframe::App for PapervaultApp {
                                     content_hash_before_tag,
                                 },
                             ) {
+                                // Queue full — the remaining rows are already
+                                // 'pending' in the DB, so the workers pick them
+                                // up via the idle re-claim. Nothing is lost.
                                 tracing::warn!(
-                                    "Auto-tagger queue full during reindex — queued {}/{}",
-                                    queued,
-                                    total
+                                    "Auto-tagger queue full during reindex — {} queued via DB, {} via channel",
+                                    total - queued,
+                                    queued
                                 );
-                                self.status_message = format!(
-                                    "Re-index queued {}/{} files — queue full (run again to continue)",
-                                    queued, total
-                                );
-                                // No more sends will complete — clear the
-                                // progress state so the panel is not stuck.
-                                self.auto_tag_progress = None;
                                 break;
                             }
                             queued += 1;
@@ -1428,6 +1437,8 @@ impl eframe::App for PapervaultApp {
                         self.auto_tag_progress = Some((queued, total));
                         // All docs re-queued — any cached auto-tag display is now stale
                         self.clear_auto_tag_cache();
+                        self.status_message =
+                            format!("Re-index queued {} files for tagging", total);
                     }
                 }
             }
