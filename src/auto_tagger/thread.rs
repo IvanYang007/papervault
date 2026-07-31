@@ -49,15 +49,17 @@ impl ApiCircuitBreaker {
             return true;
         }
         if Self::now_ms().saturating_sub(tripped) >= self.cooldown_ms as usize {
-            // Half-open: allow one probe and clear the stamp — a failure must
-            // re-trip through the threshold, a success closes the breaker.
-            let _ = self.tripped_at_ms.compare_exchange(
-                tripped,
-                0,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            );
-            return true;
+            // Half-open: allow ONE probe — the CAS winner only, so concurrent
+            // workers cannot all hit the API at once. A failed probe re-trips
+            // via record_failure (the counter is still >= threshold).
+            if self
+                .tripped_at_ms
+                .compare_exchange(tripped, 0, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                return true;
+            }
+            return false;
         }
         false
     }

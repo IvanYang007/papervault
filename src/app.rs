@@ -238,6 +238,9 @@ pub struct RenderResult {
 struct CachedAutoTag {
     filename: String,
     value: serde_json::Value,
+    /// Pre-extracted tag strings — the results loop clones the Arc instead
+    /// of rebuilding a Vec<String> per row per frame.
+    tags: Arc<Vec<String>>,
 }
 
 /// Top-level application state.
@@ -1066,7 +1069,7 @@ impl PapervaultApp {
     }
 
     /// Auto-tags for a hash from the cache. Empty when absent or not fetched.
-    fn cached_auto_tags(&mut self, content_hash: &str) -> Vec<String> {
+    fn cached_auto_tags(&mut self, content_hash: &str) -> Arc<Vec<String>> {
         if let Some(tags) = Self::tags_from_cache(&self.auto_tag_cache, content_hash) {
             return tags;
         }
@@ -1080,20 +1083,13 @@ impl PapervaultApp {
     fn tags_from_cache(
         cache: &std::collections::HashMap<String, Option<std::sync::Arc<CachedAutoTag>>>,
         content_hash: &str,
-    ) -> Option<Vec<String>> {
+    ) -> Option<Arc<Vec<String>>> {
         let entry = cache.get(content_hash)?;
         entry.as_ref().map(|c| Self::tags_of(c))
     }
 
-    fn tags_of(cached: &CachedAutoTag) -> Vec<String> {
-        cached.value["tags"]
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|t| t.as_str().map(|s| s.to_string()))
-                    .collect()
-            })
-            .unwrap_or_default()
+    fn tags_of(cached: &CachedAutoTag) -> Arc<Vec<String>> {
+        Arc::clone(&cached.tags)
     }
 
     /// Batch-fetch auto-tag status for the given hashes (single SQL query) and
@@ -1123,8 +1119,17 @@ impl PapervaultApp {
                             serde_json::from_str::<serde_json::Value>(json)
                                 .ok()
                                 .map(|value| {
+                                    let tags = value["tags"]
+                                        .as_array()
+                                        .map(|arr| {
+                                            arr.iter()
+                                                .filter_map(|t| t.as_str().map(|s| s.to_string()))
+                                                .collect()
+                                        })
+                                        .unwrap_or_default();
                                     std::sync::Arc::new(CachedAutoTag {
                                         filename: status.filename.clone(),
+                                        tags: Arc::new(tags),
                                         value,
                                     })
                                 })
@@ -2037,7 +2042,7 @@ impl eframe::App for PapervaultApp {
                                     .unwrap_or_default();
                                     if !auto_tags.is_empty() {
                                         ui.horizontal(|ui| {
-                                            for t in &auto_tags {
+                                            for t in auto_tags.iter() {
                                                 ui.label(
                                                     RichText::new(format!("✨{}", t))
                                                         .size(tag_label_size)
@@ -2077,7 +2082,7 @@ impl eframe::App for PapervaultApp {
                         if !tags.is_empty() {
                             ui.horizontal_wrapped(|ui| {
                                 ui.label("🏷");
-                                for tag in &tags {
+                                for tag in tags.iter() {
                                     ui.label(
                                         RichText::new(tag)
                                             .size(13.0)
@@ -2966,7 +2971,10 @@ mod tests {
 
         // Batch fill: 3 hashes in one query (h1 tagged, h2 no json, missing absent)
         app.ensure_auto_tag_cache(&["h1", "h2", "missing"]);
-        assert_eq!(app.cached_auto_tags("h1"), vec!["tax", "irs"]);
+        assert_eq!(
+            app.cached_auto_tags("h1").as_ref(),
+            &vec!["tax".to_string(), "irs".to_string()]
+        );
         assert!(
             app.cached_auto_tags("h2").is_empty(),
             "fetched-but-empty must not re-query"
@@ -3013,7 +3021,10 @@ mod tests {
         assert!(app.auto_tag_cache.is_empty());
         // A read after invalidation re-fetches (miss path) instead of
         // serving the stale snapshot.
-        assert_eq!(app.cached_auto_tags("h1"), vec!["tax"]);
+        assert_eq!(
+            app.cached_auto_tags("h1").as_ref(),
+            &vec!["tax".to_string()]
+        );
     }
 
     #[test]
@@ -3033,7 +3044,10 @@ mod tests {
             .unwrap();
 
         app.ensure_auto_tag_cache(&["h1"]);
-        assert_eq!(app.cached_auto_tags("h1"), vec!["tax"]);
+        assert_eq!(
+            app.cached_auto_tags("h1").as_ref(),
+            &vec!["tax".to_string()]
+        );
 
         // Change the DB behind the cache — a filled entry must NOT re-query.
         store
@@ -3047,14 +3061,17 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            app.cached_auto_tags("h1"),
-            vec!["tax"],
+            app.cached_auto_tags("h1").as_ref(),
+            &vec!["tax".to_string()],
             "cache must serve the snapshot until invalidated"
         );
 
         // Invalidation (what dismiss/retag/progress do) forces a re-fetch.
         app.auto_tag_cache.remove("h1");
-        assert_eq!(app.cached_auto_tags("h1"), vec!["changed"]);
+        assert_eq!(
+            app.cached_auto_tags("h1").as_ref(),
+            &vec!["changed".to_string()]
+        );
     }
 
     #[test]
@@ -3074,7 +3091,10 @@ mod tests {
             .unwrap();
 
         // Direct read without prefetch — the miss path queries once and fills.
-        assert_eq!(app.cached_auto_tags("h1"), vec!["tax"]);
+        assert_eq!(
+            app.cached_auto_tags("h1").as_ref(),
+            &vec!["tax".to_string()]
+        );
         assert!(app.auto_tag_cache.contains_key("h1"));
     }
 
