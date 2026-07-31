@@ -163,6 +163,12 @@ pub struct RenderResult {
     pub is_preview: bool,
 }
 
+/// Cached auto-tag display data for one document (parsed once, read many frames).
+struct CachedAutoTag {
+    filename: String,
+    value: serde_json::Value,
+}
+
 /// Top-level application state.
 pub struct PapervaultApp {
     config: Config,
@@ -178,9 +184,9 @@ pub struct PapervaultApp {
     auto_tag_progress: Option<(usize, usize)>,
     auto_tag_error: Option<String>,
     accepted_auto_tags: std::collections::HashMap<String, std::collections::HashSet<String>>,
-    /// Cache the most-recently queried auto-tags to avoid per-frame SQL.
-    cached_auto_tag_hash: Option<String>,
-    cached_auto_tags: Vec<String>,
+    /// Parsed auto-tag data per content hash — avoids per-frame SQLite queries.
+    /// Entry value: None = fetched but has no status/tags; Some = display data.
+    auto_tag_cache: std::collections::HashMap<String, Option<std::sync::Arc<CachedAutoTag>>>,
     pending_retag: bool,
     pending_reindex: bool,
     search_query: String,
@@ -338,8 +344,7 @@ impl PapervaultApp {
             auto_tag_progress: None,
             auto_tag_error: None,
             accepted_auto_tags: std::collections::HashMap::new(),
-            cached_auto_tag_hash: None,
-            cached_auto_tags: Vec::new(),
+            auto_tag_cache: std::collections::HashMap::new(),
             pending_retag: false,
             pending_reindex: false,
             last_search_instant: None,
@@ -517,11 +522,7 @@ impl PapervaultApp {
             self.preview_texture = None;
             self.load_text_preview(&PathBuf::from(&file_path));
         }
-        self.preview_file_type = Some(if is_pdf {
-            PDF_TYPE.into()
-        } else {
-            file_type
-        });
+        self.preview_file_type = Some(if is_pdf { PDF_TYPE.into() } else { file_type });
     }
 
     /// Preview a file from the file browser (not a search result).
@@ -580,8 +581,7 @@ impl PapervaultApp {
                                     Some(content + "\n\n─── Preview truncated at 2 MB ───");
                             }
                             Err(e) => {
-                                self.preview_text =
-                                    Some(format!("Error reading file: {}", e));
+                                self.preview_text = Some(format!("Error reading file: {}", e));
                             }
                         }
                     }
@@ -793,6 +793,8 @@ impl PapervaultApp {
             None,
             None,
         );
+        // The pending reset wipes tags_json — drop the stale display cache entry.
+        self.auto_tag_cache.remove(&hash);
 
         let _ = tx.send(AutoTagRequest::TagDocument {
             content_hash: hash.clone(),
@@ -880,6 +882,8 @@ impl PapervaultApp {
                 None,
                 None,
             );
+            // Reset wipes tags_json — drop the stale display cache entry.
+            self.auto_tag_cache.remove(&doc.content_hash);
 
             match tx.try_send(AutoTagRequest::TagDocument {
                 content_hash: doc.content_hash.clone(),
@@ -918,21 +922,40 @@ impl PapervaultApp {
         self.status_message = format!("Queued {} files for tagging", total);
     }
 
-    /// Get auto-tags for a document from the store. Returns empty vec if no tags.
-    fn query_auto_tags(store: &Option<TagStore>, content_hash: &str) -> Vec<String> {
-        let Some(ref store) = store else {
-            return Vec::new();
-        };
-        let Ok(Some(status)) = store.auto_tag_status(content_hash) else {
-            return Vec::new();
-        };
-        let Some(ref json) = status.tags_json else {
-            return Vec::new();
-        };
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(json) else {
-            return Vec::new();
-        };
-        value["tags"]
+    /// Read the cached auto-tag display data for a hash.
+    /// On cache miss, fetch the status once (single query) and fill the cache.
+    fn cached_auto_tag(&mut self, content_hash: &str) -> Option<std::sync::Arc<CachedAutoTag>> {
+        if let Some(entry) = self.auto_tag_cache.get(content_hash) {
+            return entry.clone();
+        }
+        self.ensure_auto_tag_cache(&[content_hash]);
+        self.auto_tag_cache
+            .get(content_hash)
+            .and_then(|e| e.clone())
+    }
+
+    /// Auto-tags for a hash from the cache. Empty when absent or not fetched.
+    fn cached_auto_tags(&mut self, content_hash: &str) -> Vec<String> {
+        if let Some(tags) = Self::tags_from_cache(&self.auto_tag_cache, content_hash) {
+            return tags;
+        }
+        // Miss — fetch once, then read from the cache.
+        self.cached_auto_tag(content_hash);
+        Self::tags_from_cache(&self.auto_tag_cache, content_hash).unwrap_or_default()
+    }
+
+    /// Extract the "tags" array from cached auto-tag data.
+    /// Returns None when the hash has no cache entry (not yet fetched).
+    fn tags_from_cache(
+        cache: &std::collections::HashMap<String, Option<std::sync::Arc<CachedAutoTag>>>,
+        content_hash: &str,
+    ) -> Option<Vec<String>> {
+        let entry = cache.get(content_hash)?;
+        entry.as_ref().map(|c| Self::tags_of(c))
+    }
+
+    fn tags_of(cached: &CachedAutoTag) -> Vec<String> {
+        cached.value["tags"]
             .as_array()
             .map(|arr| {
                 arr.iter()
@@ -940,6 +963,49 @@ impl PapervaultApp {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// Batch-fetch auto-tag status for the given hashes (single SQL query) and
+    /// fill the cache. Existing entries are kept. Hashes without a status row
+    /// are marked as fetched (None) so they are not re-queried every frame.
+    fn ensure_auto_tag_cache(&mut self, hashes: &[&str]) {
+        let missing: Vec<&str> = hashes
+            .iter()
+            .copied()
+            .filter(|h| !self.auto_tag_cache.contains_key(*h))
+            .collect();
+        if missing.is_empty() {
+            return;
+        }
+        let Some(ref store) = self.tag_store else {
+            // No store — mark as fetched so the UI never retries per frame.
+            for hash in &missing {
+                self.auto_tag_cache.insert((*hash).to_string(), None);
+            }
+            return;
+        };
+        match store.get_auto_tag_statuses_for_hashes(&missing) {
+            Ok(map) => {
+                for hash in &missing {
+                    let entry = map.get(*hash).and_then(|status| {
+                        status.tags_json.as_deref().and_then(|json| {
+                            serde_json::from_str::<serde_json::Value>(json)
+                                .ok()
+                                .map(|value| {
+                                    std::sync::Arc::new(CachedAutoTag {
+                                        filename: status.filename.clone(),
+                                        value,
+                                    })
+                                })
+                        })
+                    });
+                    self.auto_tag_cache.insert((*hash).to_string(), entry);
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Failed to batch-fetch auto-tag status: {}", e);
+            }
+        }
     }
 
     fn assign_tag_to_selected(&mut self, tag_id: i64) {
@@ -1191,6 +1257,10 @@ impl eframe::App for PapervaultApp {
                 if completed > prev_completed {
                     // Progress moved — refresh file browser
                     self.file_browser_dirty = true;
+                    // The completed doc's tags changed — drop its cached display data
+                    if let Some(ref hash) = self.selected_hash {
+                        self.auto_tag_cache.remove(hash);
+                    }
                     if completed >= total {
                         self.auto_tag_progress = None;
                         self.status_message =
@@ -1237,12 +1307,14 @@ impl eframe::App for PapervaultApp {
                                 hasher.finalize().to_hex().to_string()
                             };
                             let _ = tx.send(AutoTagRequest::TagDocument {
-                                content_hash: doc.content_hash.clone(),
-                                filename: file_name,
-                                text: "[Document text could not be extracted. Use filename to determine topic.]".to_string(),
-                                content_hash_before_tag,
-                            });
+                                    content_hash: doc.content_hash.clone(),
+                                    filename: file_name,
+                                    text: "[Document text could not be extracted. Use filename to determine topic.]".to_string(),
+                                    content_hash_before_tag,
+                                });
                         }
+                        // All docs re-queued — any cached auto-tag display is now stale
+                        self.auto_tag_cache.clear();
                     }
                 }
             }
@@ -1395,125 +1467,100 @@ impl eframe::App for PapervaultApp {
                         }
 
                         // ── Auto-tag suggestions ──
-                        if let Some(hash) = &self.selected_hash {
-                            if let Some(ref store) = self.tag_store {
-                                if let Ok(Some(auto_status)) = store.auto_tag_status(hash) {
-                                    if let Some(ref json) = auto_status.tags_json {
-                                        if let Ok(value) =
-                                            serde_json::from_str::<serde_json::Value>(json)
-                                        {
-                                            // Render topic tags
-                                            if let Some(tags) = value["tags"].as_array() {
-                                                if !tags.is_empty() {
-                                                    ui.separator();
+                        let selected_hash = self.selected_hash.clone();
+                        if let Some(hash) = selected_hash {
+                            if let Some(status) = self.cached_auto_tag(&hash) {
+                                let value = &status.value;
+                                // Render topic tags
+                                if let Some(tags) = value["tags"].as_array() {
+                                    if !tags.is_empty() {
+                                        ui.separator();
+                                        ui.horizontal(|ui| {
+                                            ui.label(
+                                                RichText::new("✨ Auto-tags")
+                                                    .size(11.0)
+                                                    .color(Color32::GRAY),
+                                            );
+                                            if ui.small_button("🔄 Re-tag").clicked() {
+                                                self.pending_retag = true;
+                                            }
+                                        });
+                                        let mut to_dismiss: Option<String> = None;
+                                        let mut to_toggle: Option<String> = None;
+                                        let accepted = self
+                                            .accepted_auto_tags
+                                            .entry(hash.clone())
+                                            .or_default();
+                                        for tag_value in tags {
+                                            if let Some(tag_name) = tag_value.as_str() {
+                                                let is_accepted = accepted.contains(tag_name);
+                                                let frame = if is_accepted {
+                                                    egui::Frame::default()
+                                                        .fill(Color32::from_rgb(40, 80, 40))
+                                                        .rounding(egui::Rounding::same(4.0))
+                                                } else {
+                                                    egui::Frame::default()
+                                                        .stroke(egui::Stroke::new(
+                                                            1.0_f32,
+                                                            Color32::from_rgb(100, 100, 100),
+                                                        ))
+                                                        .rounding(egui::Rounding::same(4.0))
+                                                };
+                                                frame.show(ui, |ui| {
                                                     ui.horizontal(|ui| {
-                                                        ui.label(
-                                                            RichText::new("✨ Auto-tags")
-                                                                .size(11.0)
-                                                                .color(Color32::GRAY),
-                                                        );
-                                                        if ui.small_button("🔄 Re-tag").clicked()
+                                                        ui.label("✨");
+                                                        if ui
+                                                            .selectable_label(is_accepted, tag_name)
+                                                            .on_hover_text(format!(
+                                                                "AI tag for \"{}\"",
+                                                                status.filename
+                                                            ))
+                                                            .clicked()
                                                         {
-                                                            self.pending_retag = true;
+                                                            to_toggle = Some(tag_name.to_string());
+                                                        }
+                                                        if ui.small_button("✕").clicked() {
+                                                            to_dismiss = Some(tag_name.to_string());
                                                         }
                                                     });
-                                                    let mut to_dismiss: Option<String> = None;
-                                                    let mut to_toggle: Option<String> = None;
-                                                    let accepted = self
-                                                        .accepted_auto_tags
-                                                        .entry(hash.clone())
-                                                        .or_default();
-                                                    for tag_value in tags {
-                                                        if let Some(tag_name) = tag_value.as_str() {
-                                                            let is_accepted =
-                                                                accepted.contains(tag_name);
-                                                            let frame = if is_accepted {
-                                                                egui::Frame::default()
-                                                                    .fill(Color32::from_rgb(
-                                                                        40, 80, 40,
-                                                                    ))
-                                                                    .rounding(egui::Rounding::same(
-                                                                        4.0,
-                                                                    ))
-                                                            } else {
-                                                                egui::Frame::default()
-                                                                    .stroke(egui::Stroke::new(
-                                                                        1.0_f32,
-                                                                        Color32::from_rgb(
-                                                                            100, 100, 100,
-                                                                        ),
-                                                                    ))
-                                                                    .rounding(egui::Rounding::same(
-                                                                        4.0,
-                                                                    ))
-                                                            };
-                                                            frame.show(ui, |ui| {
-                                                                ui.horizontal(|ui| {
-                                                                    ui.label("✨");
-                                                                    if ui
-                                                                        .selectable_label(
-                                                                            is_accepted,
-                                                                            tag_name,
-                                                                        )
-                                                                        .on_hover_text(format!(
-                                                                            "AI tag for \"{}\"",
-                                                                            auto_status.filename
-                                                                        ))
-                                                                        .clicked()
-                                                                    {
-                                                                        to_toggle = Some(
-                                                                            tag_name.to_string(),
-                                                                        );
-                                                                    }
-                                                                    if ui
-                                                                        .small_button("✕")
-                                                                        .clicked()
-                                                                    {
-                                                                        to_dismiss = Some(
-                                                                            tag_name.to_string(),
-                                                                        );
-                                                                    }
-                                                                });
-                                                            });
-                                                        }
-                                                    }
-                                                    if let Some(tag) = to_toggle {
-                                                        if accepted.contains(&tag) {
-                                                            accepted.remove(&tag);
-                                                        } else {
-                                                            accepted.insert(tag);
-                                                        }
-                                                    }
-                                                    if let Some(tag) = to_dismiss {
-                                                        accepted.remove(&tag);
-                                                        if let Some(ref store) = self.tag_store {
-                                                            let _ =
-                                                                store.dismiss_auto_tag(hash, &tag);
-                                                        }
-                                                    }
-                                                }
+                                                });
                                             }
-                                            // Render entity tags with type icons
-                                            if let Some(entities) = value["entities"].as_object() {
-                                                for (entity_type, entity_values) in entities {
-                                                    let icon = match entity_type.as_str() {
-                                                        "persons" => "👤",
-                                                        "organizations" => "🏢",
-                                                        "years" => "📅",
-                                                        "doc_id" => "📄",
-                                                        "amounts" => "💰",
-                                                        _ => "🏷",
-                                                    };
-                                                    if let Some(arr) = entity_values.as_array() {
-                                                        for ev in arr {
-                                                            if let Some(ev_name) = ev.as_str() {
-                                                                ui.horizontal(|ui| {
-                                                                    ui.label(icon);
-                                                                    ui.label(ev_name);
-                                                                });
-                                                            }
-                                                        }
-                                                    }
+                                        }
+                                        if let Some(tag) = to_toggle {
+                                            if accepted.contains(&tag) {
+                                                accepted.remove(&tag);
+                                            } else {
+                                                accepted.insert(tag);
+                                            }
+                                        }
+                                        if let Some(tag) = to_dismiss {
+                                            accepted.remove(&tag);
+                                            if let Some(ref store) = self.tag_store {
+                                                let _ = store.dismiss_auto_tag(&hash, &tag);
+                                            }
+                                            // The stored JSON changed — drop the stale entry
+                                            self.auto_tag_cache.remove(&hash);
+                                        }
+                                    }
+                                }
+                                // Render entity tags with type icons
+                                if let Some(entities) = value["entities"].as_object() {
+                                    for (entity_type, entity_values) in entities {
+                                        let icon = match entity_type.as_str() {
+                                            "persons" => "👤",
+                                            "organizations" => "🏢",
+                                            "years" => "📅",
+                                            "doc_id" => "📄",
+                                            "amounts" => "💰",
+                                            _ => "🏷",
+                                        };
+                                        if let Some(arr) = entity_values.as_array() {
+                                            for ev in arr {
+                                                if let Some(ev_name) = ev.as_str() {
+                                                    ui.horizontal(|ui| {
+                                                        ui.label(icon);
+                                                        ui.label(ev_name);
+                                                    });
                                                 }
                                             }
                                         }
@@ -1549,6 +1596,18 @@ impl eframe::App for PapervaultApp {
                     self.sort_direction,
                 );
                 self.file_browser_dirty = false;
+            }
+
+            // Ensure the browsed file's auto-tags are cached before the row loop
+            if let Some(ref browsed) = self.browsed_file {
+                let hash = self
+                    .file_browser_docs
+                    .iter()
+                    .find(|d| d.file_path == *browsed)
+                    .map(|d| d.content_hash.clone());
+                if let Some(hash) = hash {
+                    self.ensure_auto_tag_cache(&[hash.as_str()]);
+                }
             }
 
             SidePanel::left("file_browser")
@@ -1590,53 +1649,50 @@ impl eframe::App for PapervaultApp {
                             self.file_browser_dirty = true;
                         }
 
-                        ui.with_layout(
-                            egui::Layout::right_to_left(egui::Align::Center),
-                            |ui| {
-                                // Size
-                                let size_indicator = match self.sort_column {
-                                    SortColumn::Size => match self.sort_direction {
-                                        SortDirection::Ascending => " ▲",
-                                        SortDirection::Descending => " ▼",
-                                    },
-                                    _ => "",
-                                };
-                                let size_text =
-                                    RichText::new(format!("Size{}", size_indicator)).strong();
-                                if ui.selectable_label(false, size_text).clicked() {
-                                    let (col, dir) = handle_sort_column_click(
-                                        self.sort_column,
-                                        self.sort_direction,
-                                        SortColumn::Size,
-                                    );
-                                    self.sort_column = col;
-                                    self.sort_direction = dir;
-                                    self.file_browser_dirty = true;
-                                }
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            // Size
+                            let size_indicator = match self.sort_column {
+                                SortColumn::Size => match self.sort_direction {
+                                    SortDirection::Ascending => " ▲",
+                                    SortDirection::Descending => " ▼",
+                                },
+                                _ => "",
+                            };
+                            let size_text =
+                                RichText::new(format!("Size{}", size_indicator)).strong();
+                            if ui.selectable_label(false, size_text).clicked() {
+                                let (col, dir) = handle_sort_column_click(
+                                    self.sort_column,
+                                    self.sort_direction,
+                                    SortColumn::Size,
+                                );
+                                self.sort_column = col;
+                                self.sort_direction = dir;
+                                self.file_browser_dirty = true;
+                            }
 
-                                ui.label("  ");
-                                // Date
-                                let date_indicator = match self.sort_column {
-                                    SortColumn::Date => match self.sort_direction {
-                                        SortDirection::Ascending => " ▲",
-                                        SortDirection::Descending => " ▼",
-                                    },
-                                    _ => "",
-                                };
-                                let date_text =
-                                    RichText::new(format!("Modified{}", date_indicator)).strong();
-                                if ui.selectable_label(false, date_text).clicked() {
-                                    let (col, dir) = handle_sort_column_click(
-                                        self.sort_column,
-                                        self.sort_direction,
-                                        SortColumn::Date,
-                                    );
-                                    self.sort_column = col;
-                                    self.sort_direction = dir;
-                                    self.file_browser_dirty = true;
-                                }
-                            },
-                        );
+                            ui.label("  ");
+                            // Date
+                            let date_indicator = match self.sort_column {
+                                SortColumn::Date => match self.sort_direction {
+                                    SortDirection::Ascending => " ▲",
+                                    SortDirection::Descending => " ▼",
+                                },
+                                _ => "",
+                            };
+                            let date_text =
+                                RichText::new(format!("Modified{}", date_indicator)).strong();
+                            if ui.selectable_label(false, date_text).clicked() {
+                                let (col, dir) = handle_sort_column_click(
+                                    self.sort_column,
+                                    self.sort_direction,
+                                    SortColumn::Date,
+                                );
+                                self.sort_column = col;
+                                self.sort_direction = dir;
+                                self.file_browser_dirty = true;
+                            }
+                        });
                     });
 
                     let ctrl_held = ui.input(|i| i.modifiers.ctrl);
@@ -1690,9 +1746,7 @@ impl eframe::App for PapervaultApp {
                                                             date_str, size_str
                                                         ))
                                                         .size(11.0)
-                                                        .color(Color32::from_rgb(
-                                                            150, 150, 150,
-                                                        )),
+                                                        .color(Color32::from_rgb(150, 150, 150)),
                                                     );
                                                 },
                                             );
@@ -1710,8 +1764,11 @@ impl eframe::App for PapervaultApp {
                                 }
                                 // Show auto-tags inline for browsed file
                                 if is_browsed && doc.has_tags {
-                                    let tags =
-                                        Self::query_auto_tags(&self.tag_store, &doc.content_hash);
+                                    let tags = Self::tags_from_cache(
+                                        &self.auto_tag_cache,
+                                        &doc.content_hash,
+                                    )
+                                    .unwrap_or_default();
                                     if !tags.is_empty() {
                                         let preview: Vec<&str> =
                                             tags.iter().map(|s| s.as_str()).take(5).collect();
@@ -1805,6 +1862,21 @@ impl eframe::App for PapervaultApp {
                     ));
                 }
 
+                // Batch-fill the auto-tag cache for all displayed results —
+                // the row loop below must only read the cache (no per-row SQL).
+                {
+                    let missing: Vec<String> = self
+                        .search_results
+                        .iter()
+                        .filter(|r| !self.auto_tag_cache.contains_key(&r.content_hash))
+                        .map(|r| r.content_hash.clone())
+                        .collect();
+                    if !missing.is_empty() {
+                        let refs: Vec<&str> = missing.iter().map(|s| s.as_str()).collect();
+                        self.ensure_auto_tag_cache(&refs);
+                    }
+                }
+
                 let mut clicked_idx: Option<usize> = None;
                 let max_h = ui.available_size().y;
                 ScrollArea::vertical()
@@ -1846,19 +1918,18 @@ impl eframe::App for PapervaultApp {
                                     });
                                 }
                                 if !result.content_hash.is_empty() {
-                                    let auto_tags = Self::query_auto_tags(
-                                        &self.tag_store,
+                                    let auto_tags = Self::tags_from_cache(
+                                        &self.auto_tag_cache,
                                         &result.content_hash,
-                                    );
+                                    )
+                                    .unwrap_or_default();
                                     if !auto_tags.is_empty() {
                                         ui.horizontal(|ui| {
                                             for t in &auto_tags {
                                                 ui.label(
                                                     RichText::new(format!("✨{}", t))
                                                         .size(tag_label_size)
-                                                        .color(Color32::from_rgb(
-                                                            160, 190, 140,
-                                                        )),
+                                                        .color(Color32::from_rgb(160, 190, 140)),
                                                 );
                                             }
                                         });
@@ -1889,18 +1960,13 @@ impl eframe::App for PapervaultApp {
                 .min_width(250.0)
                 .show(ctx, |ui| {
                     // ── Show tags at top of preview when a file is selected ──
-                    if let Some(ref hash) = self.selected_hash {
-                        // Cache the auto-tag query to avoid per-frame SQLite round trips
-                        if self.cached_auto_tag_hash.as_deref() != Some(hash.as_str()) {
-                            self.cached_auto_tag_hash = Some(hash.clone());
-                            self.cached_auto_tags =
-                                Self::query_auto_tags(&self.tag_store, hash);
-                        }
-                        let tags = &self.cached_auto_tags;
+                    let selected_hash = self.selected_hash.clone();
+                    if let Some(hash) = selected_hash {
+                        let tags = self.cached_auto_tags(&hash);
                         if !tags.is_empty() {
                             ui.horizontal_wrapped(|ui| {
                                 ui.label("🏷");
-                                for tag in tags {
+                                for tag in &tags {
                                     ui.label(
                                         RichText::new(tag)
                                             .size(13.0)
@@ -2302,11 +2368,8 @@ mod tests {
     #[test]
     fn sort_toggle_same_column_toggles_direction() {
         // Name asc → click Name → Name desc
-        let (col, dir) = handle_sort_column_click(
-            SortColumn::Name,
-            SortDirection::Ascending,
-            SortColumn::Name,
-        );
+        let (col, dir) =
+            handle_sort_column_click(SortColumn::Name, SortDirection::Ascending, SortColumn::Name);
         assert_eq!(col, SortColumn::Name);
         assert_eq!(dir, SortDirection::Descending);
 
@@ -2323,11 +2386,8 @@ mod tests {
     #[test]
     fn sort_toggle_switches_to_new_column_ascending() {
         // Name asc → click Date → Date asc
-        let (col, dir) = handle_sort_column_click(
-            SortColumn::Name,
-            SortDirection::Ascending,
-            SortColumn::Date,
-        );
+        let (col, dir) =
+            handle_sort_column_click(SortColumn::Name, SortDirection::Ascending, SortColumn::Date);
         assert_eq!(col, SortColumn::Date);
         assert_eq!(dir, SortDirection::Ascending);
 
@@ -2626,6 +2686,185 @@ mod tests {
 
     // ── format_file_size tests ──
 
+    /// Create an app backed by a temp-file TagStore with the full schema.
+    fn make_store_app() -> (PapervaultApp, tempfile::TempDir) {
+        use rusqlite::Connection;
+        let dir = tempfile::TempDir::new().unwrap();
+        let conn = Connection::open(dir.path().join("test.db")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE documents (
+                content_hash TEXT PRIMARY KEY,
+                file_path   TEXT NOT NULL,
+                file_type   TEXT NOT NULL,
+                file_size   INTEGER NOT NULL DEFAULT 0,
+                modified_ts INTEGER NOT NULL DEFAULT 0,
+                indexed_at  TEXT NOT NULL DEFAULT '',
+                last_error  TEXT
+            );
+            CREATE TABLE tags (
+                id   INTEGER PRIMARY KEY,
+                name TEXT UNIQUE NOT NULL
+            );
+            CREATE TABLE document_tags (
+                content_hash TEXT NOT NULL REFERENCES documents(content_hash) ON DELETE CASCADE,
+                tag_id      INTEGER NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
+                PRIMARY KEY (content_hash, tag_id)
+            );
+            CREATE TABLE auto_tag_status (
+                content_hash TEXT PRIMARY KEY REFERENCES documents(content_hash) ON DELETE CASCADE,
+                filename     TEXT NOT NULL,
+                content_hash_before_tag TEXT NOT NULL,
+                status       TEXT NOT NULL DEFAULT 'pending',
+                tags_json    TEXT,
+                attempts     INTEGER NOT NULL DEFAULT 0,
+                last_error   TEXT,
+                created_at   TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at   TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE TABLE auto_tag_cache (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                filename_tokens TEXT NOT NULL,
+                tags_json       TEXT NOT NULL,
+                source_hash     TEXT NOT NULL,
+                hit_count       INTEGER NOT NULL DEFAULT 1,
+                created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
+            );",
+        )
+        .unwrap();
+        let store = TagStore::new_for_test(conn);
+        let (_progress_tx, progress_rx) = crossbeam::channel::unbounded();
+        let app = PapervaultApp::new(
+            Config::default(),
+            None,
+            None,
+            None,
+            progress_rx,
+            None,
+            None,
+            None,
+            Some(store),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        (app, dir)
+    }
+
+    // ── auto-tag cache tests ──
+
+    #[test]
+    fn cached_auto_tags_batch_fill_returns_parsed_tags() {
+        let (mut app, _dir) = make_store_app();
+        let store = app.tag_store.clone().unwrap();
+        store.upsert_document("h1", "/a.pdf", "pdf", 0, 0).unwrap();
+        store.upsert_document("h2", "/b.pdf", "pdf", 0, 0).unwrap();
+        store
+            .upsert_auto_tag_status(
+                "h1",
+                "a.pdf",
+                "x",
+                "tagged",
+                Some(r#"{"tags":["tax","irs"]}"#),
+                None,
+            )
+            .unwrap();
+        store
+            .upsert_auto_tag_status("h2", "b.pdf", "y", "tagged", None, None)
+            .unwrap();
+
+        // Batch fill: 3 hashes in one query (h1 tagged, h2 no json, missing absent)
+        app.ensure_auto_tag_cache(&["h1", "h2", "missing"]);
+        assert_eq!(app.cached_auto_tags("h1"), vec!["tax", "irs"]);
+        assert!(
+            app.cached_auto_tags("h2").is_empty(),
+            "fetched-but-empty must not re-query"
+        );
+        assert!(
+            app.cached_auto_tags("missing").is_empty(),
+            "absent row must be marked fetched, not re-queried"
+        );
+
+        // The tag panel path: full display data (filename + parsed JSON)
+        let status = app.cached_auto_tag("h1").expect("h1 cached");
+        assert_eq!(status.filename, "a.pdf");
+        assert_eq!(status.value["tags"][0], "tax");
+    }
+
+    #[test]
+    fn cached_auto_tags_serves_snapshot_until_invalidated() {
+        let (mut app, _dir) = make_store_app();
+        let store = app.tag_store.clone().unwrap();
+        store.upsert_document("h1", "/a.pdf", "pdf", 0, 0).unwrap();
+        store
+            .upsert_auto_tag_status(
+                "h1",
+                "a.pdf",
+                "x",
+                "tagged",
+                Some(r#"{"tags":["tax"]}"#),
+                None,
+            )
+            .unwrap();
+
+        app.ensure_auto_tag_cache(&["h1"]);
+        assert_eq!(app.cached_auto_tags("h1"), vec!["tax"]);
+
+        // Change the DB behind the cache — a filled entry must NOT re-query.
+        store
+            .upsert_auto_tag_status(
+                "h1",
+                "a.pdf",
+                "x",
+                "tagged",
+                Some(r#"{"tags":["changed"]}"#),
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            app.cached_auto_tags("h1"),
+            vec!["tax"],
+            "cache must serve the snapshot until invalidated"
+        );
+
+        // Invalidation (what dismiss/retag/progress do) forces a re-fetch.
+        app.auto_tag_cache.remove("h1");
+        assert_eq!(app.cached_auto_tags("h1"), vec!["changed"]);
+    }
+
+    #[test]
+    fn cached_auto_tags_miss_queries_once_and_fills() {
+        let (mut app, _dir) = make_store_app();
+        let store = app.tag_store.clone().unwrap();
+        store.upsert_document("h1", "/a.pdf", "pdf", 0, 0).unwrap();
+        store
+            .upsert_auto_tag_status(
+                "h1",
+                "a.pdf",
+                "x",
+                "tagged",
+                Some(r#"{"tags":["tax"]}"#),
+                None,
+            )
+            .unwrap();
+
+        // Direct read without prefetch — the miss path queries once and fills.
+        assert_eq!(app.cached_auto_tags("h1"), vec!["tax"]);
+        assert!(app.auto_tag_cache.contains_key("h1"));
+    }
+
+    #[test]
+    fn cached_auto_tags_without_store_returns_empty_without_retry() {
+        let mut app = make_transition_test_app(); // no tag store
+        app.ensure_auto_tag_cache(&["h1"]);
+        assert!(app.cached_auto_tags("h1").is_empty());
+        // A second read must not attempt a query (would be per-frame churn).
+        assert!(app.cached_auto_tags("h1").is_empty());
+    }
+
     #[test]
     fn format_file_size_zero() {
         assert_eq!(format_file_size(0), "0 B");
@@ -2676,20 +2915,14 @@ mod tests {
     fn date_format_known_timestamp() {
         // 2023-11-15T10:30:00Z
         let dt = DateTime::from_timestamp(1700044200, 0).unwrap();
-        assert_eq!(
-            dt.format("%Y-%m-%d %H:%M").to_string(),
-            "2023-11-15 10:30"
-        );
+        assert_eq!(dt.format("%Y-%m-%d %H:%M").to_string(), "2023-11-15 10:30");
     }
 
     #[test]
     fn date_format_far_future() {
         // 2099-12-31T23:59:59Z
         let dt = DateTime::from_timestamp(4102444799, 0).unwrap();
-        assert_eq!(
-            dt.format("%Y-%m-%d %H:%M").to_string(),
-            "2099-12-31 23:59"
-        );
+        assert_eq!(dt.format("%Y-%m-%d %H:%M").to_string(), "2099-12-31 23:59");
     }
 }
 

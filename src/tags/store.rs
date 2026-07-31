@@ -433,6 +433,52 @@ impl TagStore {
         })
     }
 
+    /// Batch-fetch auto-tag statuses for multiple hashes in a single query.
+    /// Hashes without a row are absent from the map.
+    pub fn get_auto_tag_statuses_for_hashes(
+        &self,
+        hashes: &[&str],
+    ) -> SqlResult<std::collections::HashMap<String, AutoTagStatus>> {
+        use std::collections::HashMap;
+        if hashes.is_empty() {
+            return Ok(HashMap::new());
+        }
+        self.with_conn(|conn| {
+            let mut result: HashMap<String, AutoTagStatus> = HashMap::new();
+            for chunk in hashes.chunks(500) {
+                let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+                let sql = format!(
+                    "SELECT content_hash, filename, content_hash_before_tag, status,
+                            tags_json, attempts, last_error, created_at, updated_at
+                     FROM auto_tag_status WHERE content_hash IN ({})",
+                    placeholders
+                );
+                let mut stmt = conn.prepare(&sql)?;
+                let params: Vec<&dyn rusqlite::types::ToSql> = chunk
+                    .iter()
+                    .map(|s| s as &dyn rusqlite::types::ToSql)
+                    .collect();
+                let rows = stmt.query_map(params.as_slice(), |row| {
+                    Ok(AutoTagStatus {
+                        content_hash: row.get(0)?,
+                        filename: row.get(1)?,
+                        content_hash_before_tag: row.get(2)?,
+                        status: row.get(3)?,
+                        tags_json: row.get(4)?,
+                        attempts: row.get(5)?,
+                        last_error: row.get(6)?,
+                        created_at: row.get(7)?,
+                        updated_at: row.get(8)?,
+                    })
+                })?;
+                for status in rows.flatten() {
+                    result.insert(status.content_hash.clone(), status);
+                }
+            }
+            Ok(result)
+        })
+    }
+
     /// Get documents that need auto-tagging (status = 'pending'), ordered by creation time.
     pub fn pending_auto_tags(&self, limit: usize) -> SqlResult<Vec<AutoTagStatus>> {
         self.with_conn(|conn| {
@@ -860,6 +906,99 @@ mod tests {
         let (store, _dir) = setup_test_store();
         let result = store.auto_tag_status("no-such-hash").unwrap();
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn get_auto_tag_statuses_for_hashes_returns_only_existing_rows() {
+        let (store, _dir) = setup_test_store();
+        store.upsert_document("h1", "/a.pdf", "pdf", 0, 0).unwrap();
+        store.upsert_document("h2", "/b.pdf", "pdf", 0, 0).unwrap();
+        store
+            .upsert_auto_tag_status(
+                "h1",
+                "a.pdf",
+                "x",
+                "tagged",
+                Some(r#"{"tags":["tax"]}"#),
+                None,
+            )
+            .unwrap();
+        store
+            .upsert_auto_tag_status("h2", "b.pdf", "y", "pending", None, None)
+            .unwrap();
+
+        let map = store
+            .get_auto_tag_statuses_for_hashes(&["h1", "h2", "missing"])
+            .unwrap();
+        assert_eq!(map.len(), 2, "hashes without a row must be absent");
+        assert_eq!(map["h1"].tags_json.as_deref(), Some(r#"{"tags":["tax"]}"#));
+        assert_eq!(map["h1"].filename, "a.pdf");
+        assert_eq!(map["h2"].status, "pending");
+        assert!(!map.contains_key("missing"));
+    }
+
+    #[test]
+    fn get_auto_tag_statuses_for_hashes_empty_input_returns_empty() {
+        let (store, _dir) = setup_test_store();
+        let map = store.get_auto_tag_statuses_for_hashes(&[]).unwrap();
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn get_auto_tag_statuses_for_hashes_chunks_over_500() {
+        let (store, _dir) = setup_test_store();
+        // 501 hashes exercises the 500-row chunk boundary. No rows exist;
+        // the point is the chunked query builds and runs without error.
+        let hashes: Vec<String> = (0..501).map(|i| format!("h{}", i)).collect();
+        let refs: Vec<&str> = hashes.iter().map(|s| s.as_str()).collect();
+        let map = store.get_auto_tag_statuses_for_hashes(&refs).unwrap();
+        assert!(map.is_empty());
+    }
+
+    /// Measurement: batch fetch (new per-search pattern) vs per-row fetch
+    /// (old per-frame pattern) on a 5000-row status table. Run with
+    /// `cargo test --release batch_vs_per_row_fetch -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn batch_vs_per_row_fetch_timing() {
+        use std::time::Instant;
+        let (store, _dir) = setup_test_store();
+        for i in 0..5000 {
+            store
+                .upsert_document(&format!("h{}", i), "/a.pdf", "pdf", 0, 0)
+                .unwrap();
+            store
+                .upsert_auto_tag_status(
+                    &format!("h{}", i),
+                    "a.pdf",
+                    "x",
+                    "tagged",
+                    Some(r#"{"tags":["tax"]}"#),
+                    None,
+                )
+                .unwrap();
+        }
+        let hashes: Vec<String> = (0..50).map(|i| format!("h{}", i)).collect();
+        let refs: Vec<&str> = hashes.iter().map(|s| s.as_str()).collect();
+
+        // Old pattern: one query per result row, per frame (50 queries).
+        let start = Instant::now();
+        for h in &refs {
+            let _ = store.auto_tag_status(h).unwrap();
+        }
+        let per_row = start.elapsed();
+
+        // New pattern: one batch query per search.
+        let start = Instant::now();
+        let _ = store.get_auto_tag_statuses_for_hashes(&refs).unwrap();
+        let batch = start.elapsed();
+
+        eprintln!(
+            "per-row x50: {:?}, batch x1: {:?}, speedup {:.1}x",
+            per_row,
+            batch,
+            per_row.as_secs_f64() / batch.as_secs_f64().max(1e-9)
+        );
     }
 
     #[test]
