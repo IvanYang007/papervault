@@ -383,11 +383,11 @@ impl Pipeline {
         }
 
         // Phase 2b: ONE transaction for all SQLite writes in this batch.
-        // (Previously each file cost 2-3 autocommit WAL fsyncs.) All-or-nothing:
-        // a failed batch skips Tantivy indexing so no Tantivy row is ever
-        // orphaned without its SQLite row.
-        let batch_ok = if docs.is_empty() {
-            true
+        // (Previously each file cost 2-3 autocommit WAL fsyncs.) All-or-nothing;
+        // on failure fall back to per-item writes so one bad file does not
+        // strand the healthy files of this batch.
+        let sqlite_ok: Vec<bool> = if docs.is_empty() {
+            Vec::new()
         } else {
             let items: Vec<BatchDocumentUpsert> = docs
                 .iter()
@@ -403,62 +403,99 @@ impl Pipeline {
                 })
                 .collect();
             match self.tag_store.upsert_documents_batch(&items) {
-                Ok(()) => true,
+                Ok(()) => vec![true; docs.len()],
                 Err(e) => {
-                    error!("Batch upsert error ({} files skipped): {}", docs.len(), e);
-                    false
+                    error!(
+                        "Batch upsert failed ({} files), falling back to per-item writes: {}",
+                        docs.len(),
+                        e
+                    );
+                    docs.iter()
+                        .map(|d| {
+                            let ok = {
+                                if d.old_hash_to_delete.is_some() {
+                                    let _ = self.tag_store.delete_document_by_path(&d.path_str);
+                                }
+                                self.tag_store
+                                    .upsert_document(
+                                        &d.content_hash,
+                                        &d.path_str,
+                                        &d.file_type,
+                                        d.size as i64,
+                                        d.modified_ts,
+                                    )
+                                    .is_ok()
+                                    && self
+                                        .tag_store
+                                        .upsert_auto_tag_status(
+                                            &d.content_hash,
+                                            &d.file_name,
+                                            &d.content_hash_before_tag,
+                                            "pending",
+                                            None,
+                                            None,
+                                        )
+                                        .is_ok()
+                            };
+                            if !ok {
+                                error!("Per-item upsert failed for {}", d.path_str);
+                            }
+                            ok
+                        })
+                        .collect()
                 }
             }
         };
 
         // Phase 2c: Tantivy writes (single lock scope) + auto-tag requests
         let mut processed = 0usize;
-        if batch_ok {
-            for doc in &docs {
-                {
-                    let mut engine = self.search_engine.lock().unwrap_or_else(|e| e.into_inner());
-                    if let Some(ref old_hash) = doc.old_hash_to_delete {
-                        let _ = engine.delete_by_hash(old_hash);
-                    }
-                    if let Err(e) = engine.index_document(
-                        &doc.doc_id,
-                        doc.path,
-                        &doc.file_name,
-                        doc.text,
-                        &doc.file_type,
-                        doc.modified_ts,
-                        &doc.content_hash,
-                        &doc.tags,
-                    ) {
-                        error!("Batch index error for {}: {}", doc.path_str, e);
-                        continue;
-                    }
-                }
-
-                // Trigger auto-tagging (status row already written in 2b)
-                if let Some(ref tx) = self.auto_tagger_tx {
-                    let request = AutoTagRequest::TagDocument {
-                        content_hash: doc.content_hash.clone(),
-                        filename: doc.file_name.clone(),
-                        text: doc.text.to_string(),
-                        content_hash_before_tag: doc.content_hash_before_tag.clone(),
-                    };
-                    // Bounded channel: brief backpressure, then drop — the
-                    // row stays 'pending' and is recovered at next startup.
-                    if tx
-                        .send_timeout(request, Duration::from_millis(100))
-                        .is_err()
-                    {
-                        debug!("auto-tag queue full — request dropped (recovered at next startup)");
-                    }
-                }
-
-                processed += 1;
-                self.pending_count += 1;
-                let _ = self.progress_tx.send(IndexerProgress::Progress {
-                    processed: offset + processed,
-                });
+        for (doc, ok) in docs.iter().zip(&sqlite_ok) {
+            if !ok {
+                continue;
             }
+            {
+                let mut engine = self.search_engine.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(ref old_hash) = doc.old_hash_to_delete {
+                    let _ = engine.delete_by_hash(old_hash);
+                }
+                if let Err(e) = engine.index_document(
+                    &doc.doc_id,
+                    doc.path,
+                    &doc.file_name,
+                    doc.text,
+                    &doc.file_type,
+                    doc.modified_ts,
+                    &doc.content_hash,
+                    &doc.tags,
+                ) {
+                    error!("Batch index error for {}: {}", doc.path_str, e);
+                    continue;
+                }
+            }
+
+            // Trigger auto-tagging (status row already written in 2b)
+            if let Some(ref tx) = self.auto_tagger_tx {
+                let request = AutoTagRequest::TagDocument {
+                    content_hash: doc.content_hash.clone(),
+                    filename: doc.file_name.clone(),
+                    text: doc.text.to_string(),
+                    content_hash_before_tag: doc.content_hash_before_tag.clone(),
+                };
+                // Bounded channel: brief backpressure, then drop — the
+                // row stays 'pending' and is recovered at next startup.
+                if tx
+                    .send_timeout(request, Duration::from_millis(100))
+                    .is_err()
+                {
+                    debug!("auto-tag queue full — request dropped (recovered at next startup)");
+                }
+            }
+
+            processed += 1;
+            self.pending_count += 1;
+            let _ = self.progress_tx.send(IndexerProgress::Progress {
+                processed: offset + processed,
+            });
         }
 
         // Commit after each batch

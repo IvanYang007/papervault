@@ -30,6 +30,9 @@ pub struct FolderRuntime {
     pub tag_tx: Option<Sender<TagUpdate>>,
     pub auto_tagger_tx: Option<Sender<AutoTagRequest>>,
     pub auto_tag_progress: Arc<AtomicUsize>,
+    /// Last content hash whose auto-tag status changed (any worker, any
+    /// path). Polled by the UI to drop stale display-cache entries.
+    pub auto_tag_completed: Arc<std::sync::Mutex<Option<String>>>,
     pub progress_rx: Receiver<IndexerProgress>,
     pub render_tx: Sender<RenderRequest>,
     pub render_result_rx: Receiver<RenderResult>,
@@ -72,6 +75,10 @@ impl FolderRuntime {
         let breaker = Arc::new(crate::auto_tagger::thread::ApiCircuitBreaker::new(
             6, 60_000,
         ));
+        // Last-completed content hash — lets the UI drop stale cache entries
+        // for docs that finished tagging outside an explicit batch.
+        let auto_tag_completed: Arc<std::sync::Mutex<Option<String>>> =
+            Arc::new(std::sync::Mutex::new(None));
         let num_workers = 3usize;
         let auto_tagger_handles: Vec<_> = (0..num_workers)
             .map(|i| {
@@ -87,6 +94,7 @@ impl FolderRuntime {
                 let sd = at_shutdown.clone();
                 let prg = progress.clone();
                 let brk = breaker.clone();
+                let cmp = auto_tag_completed.clone();
                 std::thread::Builder::new()
                     .name(format!("auto-tagger-{}", i))
                     .spawn(move || {
@@ -98,6 +106,7 @@ impl FolderRuntime {
                             sd,
                             Some(prg),
                             brk,
+                            Some(cmp),
                         );
                     })
             })
@@ -163,6 +172,7 @@ impl FolderRuntime {
             auto_tagger_shutdown,
             watcher_tx: Some(watcher_tx),
             browser_refresh_flag,
+            auto_tag_completed,
             tag_tx: Some(tag_tx),
             auto_tagger_tx: Some(auto_tagger_tx),
             auto_tag_progress: progress,

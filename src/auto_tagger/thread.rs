@@ -221,6 +221,7 @@ pub fn normalize_person_name(name: &str) -> Vec<String> {
     variants.into_iter().collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn run_auto_tagger(
     rx: Receiver<crate::app::AutoTagRequest>,
     tag_store: TagStore,
@@ -229,6 +230,7 @@ pub fn run_auto_tagger(
     shutdown_flag: Arc<AtomicBool>,
     progress: Option<Arc<AtomicUsize>>,
     breaker: Arc<ApiCircuitBreaker>,
+    completed: Option<Arc<std::sync::Mutex<Option<String>>>>,
 ) {
     info!("AutoTagger thread started");
     // Process any pending documents from DB (recovery after crash or channel
@@ -249,6 +251,7 @@ pub fn run_auto_tagger(
                 &auto_tag_config,
                 progress.as_deref(),
                 &breaker,
+                completed.as_deref(),
             );
         }
     }
@@ -265,12 +268,36 @@ pub fn run_auto_tagger(
                     &auto_tag_config,
                     progress.as_deref(),
                     &breaker,
+                    completed.as_deref(),
                 );
                 if is_shutdown {
                     break;
                 }
             }
-            Err(crossbeam::channel::RecvTimeoutError::Timeout) => continue,
+            Err(crossbeam::channel::RecvTimeoutError::Timeout) => {
+                // Channel idle — drain pending rows from the DB (the durable
+                // queue). This also recovers requests dropped by a full
+                // bounded channel instead of waiting for the next startup.
+                if let Ok(pending) = tag_store.claim_pending_auto_tags(8) {
+                    for p in pending {
+                        if shutdown_flag.load(Ordering::Acquire) {
+                            break;
+                        }
+                        tag_document(
+                            &p.content_hash,
+                            &p.filename,
+                            "",
+                            &p.content_hash_before_tag,
+                            &tag_store,
+                            provider.as_ref(),
+                            &auto_tag_config,
+                            progress.as_deref(),
+                            &breaker,
+                            completed.as_deref(),
+                        );
+                    }
+                }
+            }
             Err(crossbeam::channel::RecvTimeoutError::Disconnected) => {
                 info!("AutoTagger channel disconnected, shutting down");
                 break;
@@ -287,6 +314,7 @@ fn process_request(
     config: &crate::auto_tagger::config::AutoTagConfig,
     progress: Option<&std::sync::atomic::AtomicUsize>,
     breaker: &ApiCircuitBreaker,
+    completed: Option<&std::sync::Mutex<Option<String>>>,
 ) -> bool {
     match request {
         crate::app::AutoTagRequest::TagDocument {
@@ -295,6 +323,15 @@ fn process_request(
             text,
             content_hash_before_tag,
         } => {
+            // Another worker may have claimed this row (startup recovery or
+            // idle re-claim) — tier 1 only short-circuits 'tagged', so skip
+            // rows owned elsewhere to avoid a duplicate AI call.
+            if let Ok(Some(status)) = tag_store.auto_tag_status(&content_hash) {
+                if status.status == "processing" {
+                    debug!("skipping {filename}: row claimed by another worker");
+                    return false;
+                }
+            }
             tag_document(
                 &content_hash,
                 &filename,
@@ -305,6 +342,7 @@ fn process_request(
                 config,
                 progress,
                 breaker,
+                completed,
             );
             false
         }
@@ -326,9 +364,20 @@ fn tag_document(
     config: &crate::auto_tagger::config::AutoTagConfig,
     progress: Option<&std::sync::atomic::AtomicUsize>,
     breaker: &ApiCircuitBreaker,
+    completed: Option<&std::sync::Mutex<Option<String>>>,
 ) {
     if !config.enabled {
         debug!("auto-tagger disabled, skipping {filename}");
+        // Claimed rows must not stay 'processing' — restore 'pending' so a
+        // later session (or a reindex) can claim them again.
+        let _ = tag_store.upsert_auto_tag_status(
+            content_hash,
+            filename,
+            content_hash_before_tag,
+            "pending",
+            None,
+            None,
+        );
         return;
     }
 
@@ -378,6 +427,11 @@ fn tag_document(
             if let Some(p) = progress {
                 p.fetch_add(1, Ordering::Relaxed);
             }
+            if let Some(m) = completed {
+                if let Ok(mut g) = m.lock() {
+                    *g = Some(content_hash.to_string());
+                }
+            }
             return;
         }
     } else if !tokens.is_empty() {
@@ -402,6 +456,11 @@ fn tag_document(
             .map_err(|e| warn!("failed to write breaker skip for {content_hash}: {e}"));
         if let Some(p) = progress {
             p.fetch_add(1, Ordering::Relaxed);
+        }
+        if let Some(m) = completed {
+            if let Ok(mut g) = m.lock() {
+                *g = Some(content_hash.to_string());
+            }
         }
         return;
     }
@@ -467,6 +526,11 @@ fn tag_document(
                 if let Some(p) = progress {
                     p.fetch_add(1, Ordering::Relaxed);
                 }
+                if let Some(m) = completed {
+                    if let Ok(mut g) = m.lock() {
+                        *g = Some(content_hash.to_string());
+                    }
+                }
                 return;
             }
             Err(e) => {
@@ -506,6 +570,11 @@ fn tag_document(
     }
     if let Some(p) = progress {
         p.fetch_add(1, Ordering::Relaxed);
+    }
+    if let Some(m) = completed {
+        if let Ok(mut g) = m.lock() {
+            *g = Some(content_hash.to_string());
+        }
     }
 }
 
@@ -678,6 +747,7 @@ mod tests {
             &config,
             Some(&progress),
             &breaker,
+            None,
         );
 
         // Disabled config returns before the breaker — force enabled to reach
@@ -695,6 +765,7 @@ mod tests {
             &config,
             Some(&progress),
             &breaker,
+            None,
         );
 
         assert_eq!(
@@ -713,6 +784,178 @@ mod tests {
                 .contains("circuit breaker"),
             "status must record the breaker skip: {:?}",
             status.last_error
+        );
+    }
+
+    /// Full-schema test store (matches production DDL).
+    fn auto_tagger_test_store() -> (TagStore, tempfile::TempDir) {
+        use rusqlite::Connection;
+        let dir = tempfile::TempDir::new().unwrap();
+        let conn = Connection::open(dir.path().join("test.db")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE documents (content_hash TEXT PRIMARY KEY, file_path TEXT NOT NULL, file_type TEXT NOT NULL, file_size INTEGER DEFAULT 0, modified_ts INTEGER DEFAULT 0, indexed_at TEXT DEFAULT '', last_error TEXT); CREATE TABLE tags (id INTEGER PRIMARY KEY, name TEXT UNIQUE NOT NULL); CREATE TABLE document_tags (content_hash TEXT REFERENCES documents ON DELETE CASCADE, tag_id INTEGER REFERENCES tags ON DELETE CASCADE, PRIMARY KEY(content_hash, tag_id)); CREATE TABLE auto_tag_status (content_hash TEXT PRIMARY KEY REFERENCES documents ON DELETE CASCADE, filename TEXT NOT NULL, content_hash_before_tag TEXT NOT NULL, status TEXT DEFAULT 'pending', tags_json TEXT, attempts INTEGER DEFAULT 0, last_error TEXT, created_at TEXT DEFAULT (datetime('now')), updated_at TEXT DEFAULT (datetime('now'))); CREATE TABLE auto_tag_cache (id INTEGER PRIMARY KEY AUTOINCREMENT, filename_tokens TEXT NOT NULL, tags_json TEXT NOT NULL, source_hash TEXT NOT NULL, hit_count INTEGER DEFAULT 1, created_at TEXT DEFAULT (datetime('now')), updated_at TEXT DEFAULT (datetime('now')));",
+        )
+        .unwrap();
+        (TagStore::new_for_test(conn), dir)
+    }
+
+    struct DummyProvider;
+    impl TagProvider for DummyProvider {
+        fn generate_tags(
+            &self,
+            _: &str,
+            _: &str,
+            _: &[String],
+        ) -> Result<super::super::provider::TagResponse, super::super::provider::TagError> {
+            Ok(super::super::provider::TagResponse {
+                tags: vec![],
+                entities: super::super::provider::Entities::default(),
+            })
+        }
+    }
+
+    #[test]
+    fn process_request_skips_rows_claimed_by_another_worker() {
+        use crate::auto_tagger::config::AutoTagConfig;
+        use crate::auto_tagger::provider::{Entities, TagError, TagProvider, TagResponse};
+
+        struct CountingProvider(std::sync::atomic::AtomicUsize);
+        impl TagProvider for CountingProvider {
+            fn generate_tags(
+                &self,
+                _: &str,
+                _: &str,
+                _: &[String],
+            ) -> Result<TagResponse, TagError> {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                Ok(TagResponse {
+                    tags: vec![],
+                    entities: Entities::default(),
+                })
+            }
+        }
+
+        let (store, _dir) = auto_tagger_test_store();
+        store.upsert_document("h1", "/a.pdf", "pdf", 0, 0).unwrap();
+        // Row claimed by another worker (startup recovery in flight).
+        store
+            .upsert_auto_tag_status("h1", "a.pdf", "x", "pending", None, None)
+            .unwrap();
+        store
+            .with_conn(|conn| {
+                conn.execute(
+                    "UPDATE auto_tag_status SET status = 'processing' WHERE content_hash = 'h1'",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        let provider = CountingProvider(std::sync::atomic::AtomicUsize::new(0));
+        let config = AutoTagConfig {
+            enabled: true,
+            ..AutoTagConfig::default()
+        };
+        let breaker = ApiCircuitBreaker::new(6, 60_000);
+        let completed = std::sync::Mutex::new(None::<String>);
+        let result = process_request(
+            crate::app::AutoTagRequest::TagDocument {
+                content_hash: "h1".into(),
+                filename: "a.pdf".into(),
+                text: "text".into(),
+                content_hash_before_tag: "x".into(),
+            },
+            &store,
+            &provider,
+            &config,
+            None,
+            &breaker,
+            Some(&completed),
+        );
+        assert!(!result);
+        assert_eq!(
+            provider.0.load(Ordering::Relaxed),
+            0,
+            "a row claimed by another worker must not trigger a duplicate AI call"
+        );
+    }
+
+    #[test]
+    fn tag_document_disabled_restores_pending() {
+        use crate::auto_tagger::config::AutoTagConfig;
+        let (store, _dir) = auto_tagger_test_store();
+        store.upsert_document("h1", "/a.pdf", "pdf", 0, 0).unwrap();
+        store
+            .upsert_auto_tag_status("h1", "a.pdf", "x", "pending", None, None)
+            .unwrap();
+        store
+            .with_conn(|conn| {
+                conn.execute(
+                    "UPDATE auto_tag_status SET status = 'processing' WHERE content_hash = 'h1'",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        let config = AutoTagConfig::default(); // enabled = false
+        let breaker = ApiCircuitBreaker::new(6, 60_000);
+        tag_document(
+            "h1",
+            "a.pdf",
+            "",
+            "x",
+            &store,
+            &DummyProvider,
+            &config,
+            None,
+            &breaker,
+            None,
+        );
+
+        let status = store.auto_tag_status("h1").unwrap().unwrap();
+        assert_eq!(
+            status.status, "pending",
+            "a claimed row must not stay 'processing' when tagging is disabled"
+        );
+    }
+
+    #[test]
+    fn tag_document_signals_completed_hash() {
+        use crate::auto_tagger::config::AutoTagConfig;
+        let (store, _dir) = auto_tagger_test_store();
+        store.upsert_document("h1", "/a.pdf", "pdf", 0, 0).unwrap();
+        store
+            .upsert_auto_tag_status("h1", "a.pdf", "x", "pending", None, None)
+            .unwrap();
+
+        let config = AutoTagConfig {
+            enabled: true,
+            ..AutoTagConfig::default()
+        };
+        let breaker = ApiCircuitBreaker::new(6, 60_000);
+        let completed = std::sync::Mutex::new(None::<String>);
+        tag_document(
+            "h1",
+            "a.pdf",
+            "some text",
+            "x",
+            &store,
+            &DummyProvider,
+            &config,
+            None,
+            &breaker,
+            Some(&completed),
+        );
+
+        assert_eq!(
+            *completed.lock().unwrap(),
+            Some("h1".to_string()),
+            "completion signal must carry the hash so the UI can drop its stale entry"
+        );
+        assert_eq!(
+            store.auto_tag_status("h1").unwrap().unwrap().status,
+            "tagged"
         );
     }
 
@@ -754,6 +997,7 @@ mod tests {
             &config,
             None,
             &breaker,
+            None,
         );
         assert!(result, "Shutdown request should return true");
     }

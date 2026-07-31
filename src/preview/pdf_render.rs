@@ -217,6 +217,12 @@ impl PdfRenderer {
                 path.display(),
                 file_size as f64 / (1024.0 * 1024.0)
             );
+            // Don't parse here — do_render loads oversized files once per
+            // render (fallback path). Parsing twice (once to discard, once
+            // to render) would double the cost of the slow path.
+            self.page_cache.clear();
+            self.cached_doc = None;
+            return Ok(());
         }
 
         let bytes =

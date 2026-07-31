@@ -145,6 +145,13 @@ fn build_file_browser_rows(docs: &[DocumentInfo]) -> Vec<FileBrowserRow> {
                 _ => "📎",
             };
             let sparkle = if doc.has_tags { "✨" } else { "" };
+            // Cap pathological names — SelectableLabel wraps by default, and
+            // virtualized rows need a uniform height (30px).
+            const MAX_NAME_CHARS: usize = 40;
+            let mut name: String = file_name.chars().take(MAX_NAME_CHARS).collect();
+            if file_name.chars().count() > MAX_NAME_CHARS {
+                name.push('…');
+            }
             let date_str = DateTime::from_timestamp(doc.modified_ts as i64, 0)
                 .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
                 .unwrap_or_default();
@@ -153,7 +160,7 @@ fn build_file_browser_rows(docs: &[DocumentInfo]) -> Vec<FileBrowserRow> {
                 file_path: doc.file_path.clone(),
                 content_hash: doc.content_hash.clone(),
                 has_tags: doc.has_tags,
-                label: format!("{} {}{}", icon, sparkle, file_name),
+                label: format!("{} {}{}", icon, sparkle, name),
                 date_size: format!("{} · {}", date_str, size_str),
             }
         })
@@ -790,6 +797,19 @@ impl PapervaultApp {
         // No per-frame tag query.
     }
 
+    /// Take the last-completed hash from the auto-tagger signal and drop its
+    /// stale display-cache entry (if any).
+    fn consume_auto_tag_completed(
+        signal: &std::sync::Mutex<Option<String>>,
+        cache: &mut std::collections::HashMap<String, Option<std::sync::Arc<CachedAutoTag>>>,
+    ) {
+        if let Ok(mut g) = signal.lock() {
+            if let Some(hash) = g.take() {
+                cache.remove(&hash);
+            }
+        }
+    }
+
     /// Apply a file-browser snapshot computed on the indexer thread.
     fn apply_docs_snapshot(&mut self, docs: Vec<DocumentInfo>) {
         self.file_browser_docs = docs;
@@ -990,6 +1010,9 @@ impl PapervaultApp {
                     "Queue full — tagged {}/{} files (retry when current batch completes)",
                     queued, total
                 );
+                // No more sends will complete — clear the progress state so
+                // the panel is not stuck at a partial count.
+                self.auto_tag_progress = None;
                 break;
             }
             tracing::info!("Queued for tagging: {}", file_name);
@@ -1081,6 +1104,11 @@ impl PapervaultApp {
                         })
                     });
                     self.auto_tag_cache.insert((*hash).to_string(), entry);
+                }
+                // Bound the in-memory display cache (the DB cache has its own
+                // cap) — a very large folder could otherwise grow it unbounded.
+                if self.auto_tag_cache.len() > 4096 {
+                    self.auto_tag_cache.clear();
                 }
             }
             Err(e) => {
@@ -1279,6 +1307,9 @@ impl eframe::App for PapervaultApp {
         // Manual batches via tag_selected_files() set progress locally and
         // use try_send — no shared counter tracking needed.
         if let Some(ref rt) = self.folder_runtime {
+            // A doc finished tagging outside any explicit batch — drop its
+            // stale display-cache entry so the UI shows the fresh tags.
+            Self::consume_auto_tag_completed(&rt.auto_tag_completed, &mut self.auto_tag_cache);
             if let Some((prev_completed, total)) = self.auto_tag_progress {
                 let completed = rt
                     .auto_tag_progress
@@ -1355,6 +1386,9 @@ impl eframe::App for PapervaultApp {
                                     "Re-index queued {}/{} files — queue full (run again to continue)",
                                     queued, total
                                 );
+                                // No more sends will complete — clear the
+                                // progress state so the panel is not stuck.
+                                self.auto_tag_progress = None;
                                 break;
                             }
                             queued += 1;
