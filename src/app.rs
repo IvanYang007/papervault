@@ -126,8 +126,10 @@ struct FileBrowserRow {
     has_tags: bool,
     /// e.g. "📄 ✨ 2023-tax-return.pdf"
     label: String,
-    /// e.g. "2023-11-15 10:30 · 1.2 MB"
-    date_size: String,
+    /// e.g. "2023-11-15 10:30"
+    date: String,
+    /// e.g. "1.2 MB"
+    size: String,
 }
 
 /// Build pre-rendered rows for the file browser panel.
@@ -155,13 +157,13 @@ fn build_file_browser_rows(docs: &[DocumentInfo]) -> Vec<FileBrowserRow> {
             let date_str = DateTime::from_timestamp(doc.modified_ts as i64, 0)
                 .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
                 .unwrap_or_default();
-            let size_str = format_file_size(doc.file_size);
             FileBrowserRow {
                 file_path: doc.file_path.clone(),
                 content_hash: doc.content_hash.clone(),
                 has_tags: doc.has_tags,
                 label: format!("{} {}{}", icon, sparkle, name),
-                date_size: format!("{} · {}", date_str, size_str),
+                date: date_str,
+                size: format_file_size(doc.file_size),
             }
         })
         .collect()
@@ -1782,135 +1784,152 @@ impl eframe::App for PapervaultApp {
                     });
                     ui.separator();
 
-                    // Column header row
-                    ui.horizontal(|ui| {
-                        // Name
-                        let name_indicator = match self.sort_column {
-                            SortColumn::Name => match self.sort_direction {
-                                SortDirection::Ascending => " ▲",
-                                SortDirection::Descending => " ▼",
-                            },
-                            _ => "",
-                        };
-                        let name_text = RichText::new(format!("Name{}", name_indicator)).strong();
-                        if ui.selectable_label(false, name_text).clicked() {
-                            let (col, dir) = handle_sort_column_click(
-                                self.sort_column,
-                                self.sort_direction,
-                                SortColumn::Name,
-                            );
-                            self.sort_column = col;
-                            self.sort_direction = dir;
-                            self.file_browser_dirty = true;
-                        }
-
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            // Size
-                            let size_indicator = match self.sort_column {
-                                SortColumn::Size => match self.sort_direction {
-                                    SortDirection::Ascending => " ▲",
-                                    SortDirection::Descending => " ▼",
-                                },
-                                _ => "",
-                            };
-                            let size_text =
-                                RichText::new(format!("Size{}", size_indicator)).strong();
-                            if ui.selectable_label(false, size_text).clicked() {
-                                let (col, dir) = handle_sort_column_click(
-                                    self.sort_column,
-                                    self.sort_direction,
-                                    SortColumn::Size,
-                                );
-                                self.sort_column = col;
-                                self.sort_direction = dir;
-                                self.file_browser_dirty = true;
-                            }
-
-                            ui.label("  ");
-                            // Date
-                            let date_indicator = match self.sort_column {
-                                SortColumn::Date => match self.sort_direction {
-                                    SortDirection::Ascending => " ▲",
-                                    SortDirection::Descending => " ▼",
-                                },
-                                _ => "",
-                            };
-                            let date_text =
-                                RichText::new(format!("Modified{}", date_indicator)).strong();
-                            if ui.selectable_label(false, date_text).clicked() {
-                                let (col, dir) = handle_sort_column_click(
-                                    self.sort_column,
-                                    self.sort_direction,
-                                    SortColumn::Date,
-                                );
-                                self.sort_column = col;
-                                self.sort_direction = dir;
-                                self.file_browser_dirty = true;
-                            }
-                        });
-                    });
-
+                    // ── File table: Name | Modified | Size (Explorer-style resize) ──
                     let ctrl_held = ui.input(|i| i.modifiers.ctrl);
                     let mut clicked_file: Option<String> = None;
                     let mut toggled_file: Option<String> = None;
-                    // Fixed row height — required by show_rows virtualization.
-                    // Matches the real row content (~20px label + padding) so
-                    // the visible density matches the pre-virtualization list.
-                    // (The browsed file's auto-tags moved to a footer below the
-                    // list so rows stay uniform.)
+                    // Fixed row height — required by virtualized rows. Matches
+                    // the real row content so density matches the old list.
                     let row_height = 22.0;
-                    ScrollArea::vertical()
-                        .id_salt("file_browser_scroll")
-                        .show_rows(ui, row_height, self.file_browser_rows.len(), |ui, range| {
-                            for idx in range {
-                                let row = &self.file_browser_rows[idx];
-                                let is_selected = self.selected_files.contains(&row.file_path);
-                                let is_browsed =
-                                    self.browsed_file.as_deref() == Some(&row.file_path);
-                                // Background for selected files
-                                let sel_bg = if is_selected {
-                                    Color32::from_rgb(40, 80, 40)
-                                } else {
-                                    Color32::TRANSPARENT
+                    let sort_column = self.sort_column;
+                    let sort_direction = self.sort_direction;
+
+                    egui_extras::TableBuilder::new(ui)
+                        .striped(false)
+                        .sense(egui::Sense::click())
+                        .vscroll(true)
+                        .auto_shrink([false, false])
+                        .max_scroll_height(f32::INFINITY)
+                        .column(
+                            egui_extras::Column::initial(170.0)
+                                .at_least(80.0)
+                                .resizable(true),
+                        )
+                        .column(
+                            egui_extras::Column::initial(115.0)
+                                .at_least(60.0)
+                                .resizable(true),
+                        )
+                        .column(
+                            egui_extras::Column::initial(70.0)
+                                .at_least(40.0)
+                                .resizable(true),
+                        )
+                        .header(row_height, |mut header| {
+                            // Name
+                            header.col(|ui| {
+                                let name_indicator = match sort_column {
+                                    SortColumn::Name => match sort_direction {
+                                        SortDirection::Ascending => " ▲",
+                                        SortDirection::Descending => " ▼",
+                                    },
+                                    _ => "",
                                 };
-                                ui.set_min_height(row_height);
-                                let resp = Frame::default()
-                                    .fill(sel_bg)
-                                    .rounding(egui::Rounding::same(2.0))
-                                    .show(ui, |ui| {
-                                        ui.horizontal(|ui| {
-                                            // Left: clickable filename
-                                            // (selectable_label provides click
-                                            // sense and browsed highlight)
-                                            let label_resp =
-                                                ui.selectable_label(is_browsed, &row.label);
-                                            // Right: date · size, pushed to the edge
-                                            ui.with_layout(
-                                                egui::Layout::right_to_left(egui::Align::Center),
-                                                |ui| {
-                                                    ui.label(
-                                                        RichText::new(&row.date_size)
-                                                            .size(11.0)
-                                                            .color(Color32::from_rgb(
-                                                                150, 150, 150,
-                                                            )),
-                                                    );
-                                                },
-                                            );
-                                            label_resp
-                                        })
-                                        .inner
-                                    });
-                                if resp.inner.clicked() {
+                                let name_text =
+                                    RichText::new(format!("Name{}", name_indicator)).strong();
+                                if ui.selectable_label(false, name_text).clicked() {
+                                    let (col, dir) = handle_sort_column_click(
+                                        sort_column,
+                                        sort_direction,
+                                        SortColumn::Name,
+                                    );
+                                    self.sort_column = col;
+                                    self.sort_direction = dir;
+                                    self.file_browser_dirty = true;
+                                }
+                            });
+                            // Modified
+                            header.col(|ui| {
+                                let date_indicator = match sort_column {
+                                    SortColumn::Date => match sort_direction {
+                                        SortDirection::Ascending => " ▲",
+                                        SortDirection::Descending => " ▼",
+                                    },
+                                    _ => "",
+                                };
+                                let date_text =
+                                    RichText::new(format!("Modified{}", date_indicator)).strong();
+                                if ui.selectable_label(false, date_text).clicked() {
+                                    let (col, dir) = handle_sort_column_click(
+                                        sort_column,
+                                        sort_direction,
+                                        SortColumn::Date,
+                                    );
+                                    self.sort_column = col;
+                                    self.sort_direction = dir;
+                                    self.file_browser_dirty = true;
+                                }
+                            });
+                            // Size
+                            header.col(|ui| {
+                                let size_indicator = match sort_column {
+                                    SortColumn::Size => match sort_direction {
+                                        SortDirection::Ascending => " ▲",
+                                        SortDirection::Descending => " ▼",
+                                    },
+                                    _ => "",
+                                };
+                                let size_text =
+                                    RichText::new(format!("Size{}", size_indicator)).strong();
+                                if ui.selectable_label(false, size_text).clicked() {
+                                    let (col, dir) = handle_sort_column_click(
+                                        sort_column,
+                                        sort_direction,
+                                        SortColumn::Size,
+                                    );
+                                    self.sort_column = col;
+                                    self.sort_direction = dir;
+                                    self.file_browser_dirty = true;
+                                }
+                            });
+                        })
+                        .body(|body| {
+                            body.rows(row_height, self.file_browser_rows.len(), |mut row| {
+                                let Some(row_data) = self.file_browser_rows.get(row.index()) else {
+                                    return;
+                                };
+                                let is_selected = self.selected_files.contains(&row_data.file_path);
+                                let is_browsed =
+                                    self.browsed_file.as_deref() == Some(&row_data.file_path);
+                                row.set_selected(is_browsed || is_selected);
+
+                                // Name cell — carries the click (browsed highlight)
+                                let mut clicked = false;
+                                row.col(|ui| {
+                                    let label_resp =
+                                        ui.selectable_label(is_browsed, &row_data.label);
+                                    if label_resp.clicked() {
+                                        clicked = true;
+                                    }
+                                });
+                                // Modified
+                                row.col(|ui| {
+                                    ui.label(
+                                        RichText::new(&row_data.date)
+                                            .size(11.0)
+                                            .color(Color32::from_rgb(150, 150, 150)),
+                                    );
+                                });
+                                // Size
+                                row.col(|ui| {
+                                    ui.label(
+                                        RichText::new(&row_data.size)
+                                            .size(11.0)
+                                            .color(Color32::from_rgb(150, 150, 150)),
+                                    );
+                                });
+
+                                if clicked {
                                     if ctrl_held {
-                                        toggled_file = Some(row.file_path.clone());
+                                        toggled_file = Some(row_data.file_path.clone());
                                     } else {
-                                        self.selected_hash = Some(row.content_hash.clone());
-                                        clicked_file = Some(row.file_path.clone());
+                                        self.selected_hash = Some(row_data.content_hash.clone());
+                                        clicked_file = Some(row_data.file_path.clone());
                                     }
                                 }
-                            }
+                            });
                         });
+
                     // Auto-tags for the browsed file — shown below the list so
                     // virtualized rows keep a uniform height. browsed_row is
                     // cached at refresh time (no per-frame scan of all rows).
@@ -2602,17 +2621,13 @@ mod tests {
 
         let rows = build_file_browser_rows(&docs);
         assert_eq!(rows.len(), 3);
-        // PDF row: icon + sparkle + name; size + separator formatted once.
+        // PDF row: icon + sparkle + name; date and size split into columns.
         assert_eq!(rows[0].label, "📄 ✨Tax Return.pdf");
-        assert!(
-            rows[0].date_size.contains("1.0 MB"),
-            "{}",
-            rows[0].date_size
-        );
-        assert!(rows[0].date_size.contains(" · "), "{}", rows[0].date_size);
+        assert_eq!(rows[0].size, "1.0 MB");
+        assert!(!rows[0].date.is_empty());
         // Plain txt row: no sparkle.
         assert_eq!(rows[1].label, "📝 notes.txt");
-        assert!(rows[1].date_size.contains("512 B"), "{}", rows[1].date_size);
+        assert_eq!(rows[1].size, "512 B");
         // Unknown type: generic icon.
         assert_eq!(rows[2].label, "📎 archive.tar.gz");
         // Identity fields survive for click handling.
