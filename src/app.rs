@@ -147,13 +147,8 @@ fn build_file_browser_rows(docs: &[DocumentInfo]) -> Vec<FileBrowserRow> {
                 _ => "📎",
             };
             let sparkle = if doc.has_tags { "✨" } else { "" };
-            // Cap pathological names — SelectableLabel wraps by default, and
-            // virtualized rows need a uniform height (30px).
-            const MAX_NAME_CHARS: usize = 40;
-            let mut name: String = file_name.chars().take(MAX_NAME_CHARS).collect();
-            if file_name.chars().count() > MAX_NAME_CHARS {
-                name.push('…');
-            }
+            // Full name — the table cell truncates it visually with an
+            // ellipsis, so widening the Name column reveals more (Explorer).
             let date_str = DateTime::from_timestamp(doc.modified_ts as i64, 0)
                 .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
                 .unwrap_or_default();
@@ -161,7 +156,7 @@ fn build_file_browser_rows(docs: &[DocumentInfo]) -> Vec<FileBrowserRow> {
                 file_path: doc.file_path.clone(),
                 content_hash: doc.content_hash.clone(),
                 has_tags: doc.has_tags,
-                label: format!("{} {}{}", icon, sparkle, name),
+                label: format!("{} {}{}", icon, sparkle, file_name),
                 date: date_str,
                 size: format_file_size(doc.file_size),
             }
@@ -1893,15 +1888,16 @@ impl eframe::App for PapervaultApp {
                                     self.browsed_file.as_deref() == Some(&row_data.file_path);
                                 row.set_selected(is_browsed || is_selected);
 
-                                // Name cell — carries the click (browsed highlight)
-                                let mut clicked = false;
+                                // Name cell — truncated label (widening the
+                                // column reveals the full name). Clicks are
+                                // detected at row level.
                                 row.col(|ui| {
-                                    let label_resp =
-                                        ui.selectable_label(is_browsed, &row_data.label);
-                                    if label_resp.clicked() {
-                                        clicked = true;
-                                    }
+                                    ui.add(
+                                        egui::Label::new(egui::RichText::new(&row_data.label))
+                                            .truncate(),
+                                    );
                                 });
+                                let clicked = row.response().clicked();
                                 // Modified
                                 row.col(|ui| {
                                     ui.label(
@@ -2630,6 +2626,19 @@ mod tests {
         assert_eq!(rows[1].size, "512 B");
         // Unknown type: generic icon.
         assert_eq!(rows[2].label, "📎 archive.tar.gz");
+        // Long names are NOT capped — the table cell truncates visually,
+        // and widening the Name column reveals the full name.
+        let mut long = make_doc(
+            "/docs/this-is-a-very-long-document-name-that-exceeds-forty-characters.pdf",
+            "pdf",
+            0,
+            0,
+        );
+        long.content_hash = "xyz".into();
+        let long_rows = build_file_browser_rows(&[long]);
+        assert!(long_rows[0]
+            .label
+            .contains("this-is-a-very-long-document-name-that-exceeds-forty-characters.pdf"));
         // Identity fields survive for click handling.
         assert_eq!(rows[0].file_path, "/docs/Tax Return.pdf");
         assert_eq!(rows[0].content_hash, "abc");
