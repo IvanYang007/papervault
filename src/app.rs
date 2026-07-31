@@ -329,6 +329,9 @@ pub struct PapervaultApp {
     file_browser_periodic_timer: usize,
     /// Currently previewed file path (from file browser, not search).
     browsed_file: Option<String>,
+    /// Cached (hash, has_tags) of the browsed file — avoids a per-frame
+    /// linear scan of file_browser_rows to render the footer tags.
+    browsed_row: Option<(String, bool)>,
     /// Multi-selected file paths for batch tagging (Ctrl+click in file browser).
     selected_files: HashSet<String>,
     /// Current sort column for the file browser.
@@ -433,6 +436,7 @@ impl PapervaultApp {
             file_browser_refresh_cooldown: 0,
             file_browser_periodic_timer: 0,
             browsed_file: None,
+            browsed_row: None,
             selected_files: HashSet::new(),
             sort_column: SortColumn::Name,
             sort_direction: SortDirection::Ascending,
@@ -578,6 +582,7 @@ impl PapervaultApp {
             return;
         }
         self.browsed_file = None;
+        self.browsed_row = None;
         self.selected_result = Some(index);
         self.selected_hash = Some(self.search_results[index].content_hash.clone());
         self.current_page = 1;
@@ -602,6 +607,7 @@ impl PapervaultApp {
     /// Preview a file from the file browser (not a search result).
     fn browse_file(&mut self, path: &str) {
         self.browsed_file = Some(path.to_string());
+        self.refresh_browsed_row();
         self.selected_result = None;
         self.current_page = 1;
         self.preview_texture = None;
@@ -820,6 +826,16 @@ impl PapervaultApp {
         }
     }
 
+    /// Re-derive the browsed-file footer cache from the current rows.
+    fn refresh_browsed_row(&mut self) {
+        self.browsed_row = self.browsed_file.as_ref().and_then(|b| {
+            self.file_browser_rows
+                .iter()
+                .find(|r| r.file_path == *b)
+                .map(|r| (r.content_hash.clone(), r.has_tags))
+        });
+    }
+
     /// Apply a file-browser snapshot computed on the indexer thread.
     fn apply_docs_snapshot(&mut self, docs: Vec<DocumentInfo>) {
         self.file_browser_docs = docs;
@@ -829,6 +845,7 @@ impl PapervaultApp {
             self.sort_direction,
         );
         self.file_browser_rows = build_file_browser_rows(&self.file_browser_docs);
+        self.refresh_browsed_row();
         self.file_browser_dirty = false;
     }
 
@@ -1696,6 +1713,7 @@ impl eframe::App for PapervaultApp {
                     // Pre-render display strings once per refresh — the per-frame
                     // loop below must not format dates/sizes or allocate per row.
                     self.file_browser_rows = build_file_browser_rows(&self.file_browser_docs);
+                    self.refresh_browsed_row();
                     self.file_browser_dirty = false;
                 }
             }
@@ -1857,27 +1875,21 @@ impl eframe::App for PapervaultApp {
                             }
                         });
                     // Auto-tags for the browsed file — shown below the list so
-                    // virtualized rows keep a uniform height.
-                    if let Some(ref browsed) = self.browsed_file {
-                        let row = self
-                            .file_browser_rows
-                            .iter()
-                            .find(|r| r.file_path == *browsed);
-                        if let Some(row) = row {
-                            if row.has_tags {
-                                let tags =
-                                    Self::tags_from_cache(&self.auto_tag_cache, &row.content_hash)
-                                        .unwrap_or_default();
-                                if !tags.is_empty() {
-                                    ui.add_space(4.0);
-                                    let preview: Vec<&str> =
-                                        tags.iter().map(|s| s.as_str()).take(5).collect();
-                                    ui.label(
-                                        RichText::new(format!("🏷 {}", preview.join(", ")))
-                                            .size(10.0)
-                                            .color(Color32::from_rgb(140, 160, 200)),
-                                    );
-                                }
+                    // virtualized rows keep a uniform height. browsed_row is
+                    // cached at refresh time (no per-frame scan of all rows).
+                    if let Some((ref hash, has_tags)) = self.browsed_row {
+                        if has_tags {
+                            let tags = Self::tags_from_cache(&self.auto_tag_cache, hash)
+                                .unwrap_or_default();
+                            if !tags.is_empty() {
+                                ui.add_space(4.0);
+                                let preview: Vec<&str> =
+                                    tags.iter().map(|s| s.as_str()).take(5).collect();
+                                ui.label(
+                                    RichText::new(format!("🏷 {}", preview.join(", ")))
+                                        .size(10.0)
+                                        .color(Color32::from_rgb(140, 160, 200)),
+                                );
                             }
                         }
                     }
