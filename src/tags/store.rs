@@ -370,6 +370,12 @@ impl TagStore {
 }
 
 /// Shared INSERT OR REPLACE for a document row (single and batch paths).
+/// Shared upsert for a document row (single and batch paths).
+///
+/// INSERT ... ON CONFLICT DO UPDATE — NOT INSERT OR REPLACE. REPLACE
+/// deletes the existing row before inserting, which fires the FK ON DELETE
+/// CASCADE and silently destroys the row's document_tags (manual tags) and
+/// auto_tag_status (AI tags). Re-indexing must keep them.
 fn upsert_document_sql(
     conn: &Connection,
     content_hash: &str,
@@ -378,8 +384,14 @@ fn upsert_document_sql(
     file_size: i64,
     modified_ts: i64,
 ) -> rusqlite::Result<()> {
-    conn.prepare_cached("INSERT OR REPLACE INTO documents (content_hash, file_path, file_type, file_size, modified_ts, indexed_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, datetime('now'))")?.execute(params![content_hash, file_path, file_type, file_size, modified_ts])?;
+    conn.prepare_cached("INSERT INTO documents (content_hash, file_path, file_type, file_size, modified_ts, indexed_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, datetime('now'))
+         ON CONFLICT(content_hash) DO UPDATE SET
+            file_path = excluded.file_path,
+            file_type = excluded.file_type,
+            file_size = excluded.file_size,
+            modified_ts = excluded.modified_ts,
+            indexed_at = excluded.indexed_at")?.execute(params![content_hash, file_path, file_type, file_size, modified_ts])?;
     Ok(())
 }
 
@@ -423,6 +435,10 @@ pub struct BatchDocumentUpsert<'a> {
     pub old_hash_to_delete: Option<&'a str>,
     pub filename: &'a str,
     pub content_hash_before_tag: &'a str,
+    /// True when this exact content is already tagged — the status row must
+    /// be left untouched (no 'pending' wipe, no lost tags) so no API call
+    /// is triggered for already-tagged files.
+    pub skip_auto_tag_status: bool,
 }
 
 /// Lightweight document info for the file browser panel.
@@ -636,15 +652,17 @@ impl TagStore {
                     item.file_size,
                     item.modified_ts,
                 )?;
-                upsert_auto_tag_status_sql(
-                    &tx,
-                    item.content_hash,
-                    item.filename,
-                    item.content_hash_before_tag,
-                    "pending",
-                    None,
-                    None,
-                )?;
+                if !item.skip_auto_tag_status {
+                    upsert_auto_tag_status_sql(
+                        &tx,
+                        item.content_hash,
+                        item.filename,
+                        item.content_hash_before_tag,
+                        "pending",
+                        None,
+                        None,
+                    )?;
+                }
             }
             tx.commit()?;
             Ok(())
@@ -1310,6 +1328,7 @@ mod tests {
                 old_hash_to_delete: None,
                 filename: "f.pdf",
                 content_hash_before_tag: "x",
+                skip_auto_tag_status: false,
             })
             .collect();
         store.upsert_documents_batch(&items).unwrap();
@@ -1350,6 +1369,7 @@ mod tests {
                 old_hash_to_delete: None,
                 filename: "a.pdf",
                 content_hash_before_tag: "x",
+                skip_auto_tag_status: false,
             },
             BatchDocumentUpsert {
                 content_hash: "h2",
@@ -1360,6 +1380,7 @@ mod tests {
                 old_hash_to_delete: None,
                 filename: "b.pdf",
                 content_hash_before_tag: "y",
+                skip_auto_tag_status: false,
             },
         ];
         assert!(store.upsert_documents_batch(&items).is_err());
@@ -1405,6 +1426,7 @@ mod tests {
             old_hash_to_delete: Some("old"),
             filename: "a.pdf",
             content_hash_before_tag: "y",
+            skip_auto_tag_status: false,
         }];
         store.upsert_documents_batch(&items).unwrap();
 
@@ -1463,6 +1485,7 @@ mod tests {
                     old_hash_to_delete: None,
                     filename: "f.pdf",
                     content_hash_before_tag: "x",
+                    skip_auto_tag_status: false,
                 })
                 .collect();
             store2.upsert_documents_batch(&items).unwrap();
@@ -1475,6 +1498,87 @@ mod tests {
             batched,
             per_file.as_secs_f64() / batched.as_secs_f64().max(1e-9)
         );
+    }
+
+    #[test]
+    fn upsert_documents_batch_skips_status_for_already_tagged() {
+        let (store, _dir) = setup_test_store();
+        // A pre-existing tagged row that must survive the batch untouched.
+        store.upsert_document("h1", "/a.pdf", "pdf", 0, 0).unwrap();
+        store
+            .upsert_auto_tag_status(
+                "h1",
+                "a.pdf",
+                "x",
+                "tagged",
+                Some(r#"{"tags":["tax"]}"#),
+                None,
+            )
+            .unwrap();
+
+        let items = vec![BatchDocumentUpsert {
+            content_hash: "h1",
+            file_path: "/a.pdf",
+            file_type: "pdf",
+            file_size: 10,
+            modified_ts: 2,
+            old_hash_to_delete: None,
+            filename: "a.pdf",
+            content_hash_before_tag: "x",
+            skip_auto_tag_status: true,
+        }];
+        store.upsert_documents_batch(&items).unwrap();
+
+        // The document row is updated, but the tagged status survives
+        // with its tags_json intact — no 'pending' wipe.
+        let status = store.auto_tag_status("h1").unwrap().unwrap();
+        assert_eq!(status.status, "tagged");
+        assert_eq!(status.tags_json.as_deref(), Some(r#"{"tags":["tax"]}"#));
+        assert_eq!(
+            store.get_hash_by_path("/a.pdf").unwrap().as_deref(),
+            Some("h1")
+        );
+    }
+
+    #[test]
+    fn upsert_document_preserves_manual_tags_and_status() {
+        let (store, _dir) = setup_test_store();
+        // FK on, so ON DELETE CASCADE would fire if the row were replaced.
+        store
+            .with_conn(|conn| {
+                conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+                Ok(())
+            })
+            .unwrap();
+        store
+            .upsert_document("h1", "/a.pdf", "pdf", 100, 1)
+            .unwrap();
+        let tag_id = store.create_tag("tax").unwrap().id;
+        store.assign_tag("h1", tag_id).unwrap();
+        store
+            .upsert_auto_tag_status(
+                "h1",
+                "a.pdf",
+                "x",
+                "tagged",
+                Some(r#"{"tags":["tax"]}"#),
+                None,
+            )
+            .unwrap();
+
+        // Re-index the same content: the row is updated, not replaced.
+        store
+            .upsert_document("h1", "/a.pdf", "pdf", 200, 2)
+            .unwrap();
+
+        assert_eq!(
+            store.get_tags_for_document("h1").unwrap().len(),
+            1,
+            "manual tags must survive re-indexing (no FK cascade)"
+        );
+        let status = store.auto_tag_status("h1").unwrap().unwrap();
+        assert_eq!(status.status, "tagged");
+        assert_eq!(status.tags_json.as_deref(), Some(r#"{"tags":["tax"]}"#));
     }
 
     #[test]

@@ -303,6 +303,7 @@ impl Pipeline {
             tags: Vec<String>,
             text: &'a str,
             content_hash_before_tag: String,
+            already_tagged: bool,
         }
         let mut docs: Vec<PendingDoc> = Vec::with_capacity(results.len());
         for (path, mtime, size, extracted) in &results {
@@ -365,6 +366,10 @@ impl Pipeline {
                 .map(|t| t.name)
                 .collect::<Vec<String>>();
             let content_hash_before_tag = compute_content_hash(&file_name, &extracted.text);
+            // Already-tagged content must keep its status row and tags — no
+            // API call, no 'pending' wipe (even if the API is down).
+            let already_tagged =
+                already_tagged(&self.tag_store, &content_hash, &content_hash_before_tag);
 
             docs.push(PendingDoc {
                 path,
@@ -379,6 +384,7 @@ impl Pipeline {
                 tags,
                 text: &extracted.text,
                 content_hash_before_tag,
+                already_tagged,
             });
         }
 
@@ -400,6 +406,7 @@ impl Pipeline {
                     old_hash_to_delete: d.old_hash_to_delete.as_deref(),
                     filename: &d.file_name,
                     content_hash_before_tag: &d.content_hash_before_tag,
+                    skip_auto_tag_status: d.already_tagged,
                 })
                 .collect();
             match self.tag_store.upsert_documents_batch(&items) {
@@ -425,17 +432,18 @@ impl Pipeline {
                                         d.modified_ts,
                                     )
                                     .is_ok()
-                                    && self
-                                        .tag_store
-                                        .upsert_auto_tag_status(
-                                            &d.content_hash,
-                                            &d.file_name,
-                                            &d.content_hash_before_tag,
-                                            "pending",
-                                            None,
-                                            None,
-                                        )
-                                        .is_ok()
+                                    && (d.already_tagged
+                                        || self
+                                            .tag_store
+                                            .upsert_auto_tag_status(
+                                                &d.content_hash,
+                                                &d.file_name,
+                                                &d.content_hash_before_tag,
+                                                "pending",
+                                                None,
+                                                None,
+                                            )
+                                            .is_ok())
                             };
                             if !ok {
                                 error!("Per-item upsert failed for {}", d.path_str);
@@ -473,21 +481,24 @@ impl Pipeline {
                 }
             }
 
-            // Trigger auto-tagging (status row already written in 2b)
-            if let Some(ref tx) = self.auto_tagger_tx {
-                let request = AutoTagRequest::TagDocument {
-                    content_hash: doc.content_hash.clone(),
-                    filename: doc.file_name.clone(),
-                    text: doc.text.to_string(),
-                    content_hash_before_tag: doc.content_hash_before_tag.clone(),
-                };
-                // Bounded channel: brief backpressure, then drop — the
-                // row stays 'pending' and is recovered at next startup.
-                if tx
-                    .send_timeout(request, Duration::from_millis(100))
-                    .is_err()
-                {
-                    debug!("auto-tag queue full — request dropped (recovered at next startup)");
+            // Trigger auto-tagging (status row already written in 2b) —
+            // except for already-tagged content, which must not re-call the API.
+            if !doc.already_tagged {
+                if let Some(ref tx) = self.auto_tagger_tx {
+                    let request = AutoTagRequest::TagDocument {
+                        content_hash: doc.content_hash.clone(),
+                        filename: doc.file_name.clone(),
+                        text: doc.text.to_string(),
+                        content_hash_before_tag: doc.content_hash_before_tag.clone(),
+                    };
+                    // Bounded channel: brief backpressure, then drop — the
+                    // row stays 'pending' and is recovered at next startup.
+                    if tx
+                        .send_timeout(request, Duration::from_millis(100))
+                        .is_err()
+                    {
+                        debug!("auto-tag queue full — request dropped (recovered at next startup)");
+                    }
                 }
             }
 
@@ -633,6 +644,15 @@ impl Pipeline {
         // (replaces the old channel-based queue that silently dropped documents)
         {
             let content_hash_before_tag = compute_content_hash(&file_name, extracted_text);
+            // Never re-request tags for content that is already tagged —
+            // the status row (and its tags) must survive re-indexing.
+            if already_tagged(&self.tag_store, &content_hash, &content_hash_before_tag) {
+                debug!(
+                    "Skipping auto-tag request for {} (already tagged)",
+                    path.display()
+                );
+                return Ok(());
+            }
             if let Err(e) = self.tag_store.upsert_auto_tag_status(
                 &content_hash,
                 &file_name,
@@ -703,6 +723,21 @@ pub fn compute_content_hash(text: &str, file_type: &str) -> String {
     hasher.update(text.as_bytes());
     hasher.update(file_type.as_bytes());
     hasher.finalize().to_hex().to_string()
+}
+
+/// True when the exact same content was already tagged and the tags are
+/// still stored. Re-indexing such a file must NOT wipe its status row or
+/// re-call the API — that would lose tags for no benefit (and permanently,
+/// if the API happens to be down at that moment).
+fn already_tagged(store: &TagStore, content_hash: &str, content_hash_before_tag: &str) -> bool {
+    match store.auto_tag_status(content_hash) {
+        Ok(Some(status)) => {
+            status.status == "tagged"
+                && status.tags_json.is_some()
+                && status.content_hash_before_tag == content_hash_before_tag
+        }
+        _ => false,
+    }
 }
 
 /// Run reconciliation on startup: ensure Tantivy and SQLite are consistent.
@@ -1397,5 +1432,185 @@ mod tests {
             0,
             "No docs should be indexed from corrupt file"
         );
+    }
+
+    /// Shared engine + pipeline harness for auto-tag request tests.
+    fn batch_harness() -> (
+        TagStore,
+        tempfile::TempDir,
+        Arc<std::sync::Mutex<SearchEngine>>,
+    ) {
+        use crate::search::engine::SearchEngine;
+        let (store, dir) = setup_tag_store();
+        let index_dir = tempfile::TempDir::new().unwrap();
+        let schema = crate::search::schema::build_schema();
+        let fields = crate::search::schema::SchemaFields::from_schema(&schema);
+        let index = tantivy::Index::create_in_dir(index_dir.path(), schema.clone()).unwrap();
+        let tokenizer = tantivy::tokenizer::TextAnalyzer::builder(
+            tantivy::tokenizer::SimpleTokenizer::default(),
+        )
+        .filter(tantivy::tokenizer::LowerCaser)
+        .build();
+        index.tokenizers().register("body", tokenizer);
+        let writer = index.writer(50_000_000).unwrap();
+        let reader = index
+            .reader_builder()
+            .reload_policy(tantivy::ReloadPolicy::Manual)
+            .try_into()
+            .unwrap();
+        let engine = SearchEngine {
+            index,
+            schema,
+            fields,
+            reader,
+            writer,
+        };
+        (store, dir, Arc::new(std::sync::Mutex::new(engine)))
+    }
+
+    #[test]
+    fn process_batch_preserves_tags_and_skips_request_for_tagged_content() {
+        use crate::app::TagUpdate;
+        use crate::watcher::watcher::IndexerMessage;
+        use std::path::PathBuf;
+
+        let (store, _dir, engine) = batch_harness();
+        let (_msg_tx, msg_rx) = crossbeam::channel::bounded::<IndexerMessage>(1);
+        let (_tag_tx, tag_rx) = crossbeam::channel::bounded::<TagUpdate>(1);
+        let (progress_tx, _progress_rx) = crossbeam::channel::unbounded::<IndexerProgress>();
+        let (auto_tx, auto_rx) = crossbeam::channel::bounded::<AutoTagRequest>(16);
+
+        // Seed: file already tagged with this exact content.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let f = tmp.path().join("a.txt");
+        let text = "hello world";
+        std::fs::write(&f, text).unwrap();
+        let meta = std::fs::metadata(&f).unwrap();
+        let file_name = "a.txt";
+        let content_hash = compute_content_hash(text, "txt");
+        let hash_before = compute_content_hash(file_name, text);
+        store
+            .upsert_document(&content_hash, f.to_str().unwrap(), "txt", 0, 0)
+            .unwrap();
+        store
+            .upsert_auto_tag_status(
+                &content_hash,
+                file_name,
+                &hash_before,
+                "tagged",
+                Some(r#"{"tags":["tax"]}"#),
+                None,
+            )
+            .unwrap();
+
+        let mut pipeline = Pipeline::new(
+            engine.clone(),
+            store.clone(),
+            PathBuf::from("/test"),
+            msg_rx,
+            tag_rx,
+            progress_tx,
+            Some(auto_tx),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let batch = vec![(
+            f.clone(),
+            meta.modified()
+                .unwrap()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            meta.len(),
+        )];
+        let processed = pipeline.process_batch(&batch, 0);
+        assert_eq!(processed, 1);
+
+        // Tags must survive re-indexing untouched — no 'pending' wipe.
+        let status = store.auto_tag_status(&content_hash).unwrap().unwrap();
+        assert_eq!(status.status, "tagged");
+        assert_eq!(status.tags_json.as_deref(), Some(r#"{"tags":["tax"]}"#));
+        // And NO auto-tag request may be queued for already-tagged content.
+        assert!(
+            auto_rx.is_empty(),
+            "no API request must be sent for already-tagged content"
+        );
+    }
+
+    #[test]
+    fn process_batch_requests_tags_for_changed_content() {
+        use crate::app::TagUpdate;
+        use crate::watcher::watcher::IndexerMessage;
+        use std::path::PathBuf;
+
+        let (store, _dir, engine) = batch_harness();
+        let (_msg_tx, msg_rx) = crossbeam::channel::bounded::<IndexerMessage>(1);
+        let (_tag_tx, tag_rx) = crossbeam::channel::bounded::<TagUpdate>(1);
+        let (progress_tx, _progress_rx) = crossbeam::channel::unbounded::<IndexerProgress>();
+        let (auto_tx, auto_rx) = crossbeam::channel::bounded::<AutoTagRequest>(16);
+
+        // Seed: the file WAS tagged, but its content has since changed — the
+        // stored hash-before differs from the current content's hash.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let f = tmp.path().join("a.txt");
+        let text = "hello world changed";
+        std::fs::write(&f, text).unwrap();
+        let meta = std::fs::metadata(&f).unwrap();
+        let file_name = "a.txt";
+        let content_hash = compute_content_hash(text, "txt");
+        let hash_before = compute_content_hash(file_name, text);
+        store
+            .upsert_document(&content_hash, f.to_str().unwrap(), "txt", 0, 0)
+            .unwrap();
+        store
+            .upsert_auto_tag_status(
+                &content_hash,
+                file_name,
+                "stale-hash-before", // tagged with DIFFERENT content
+                "tagged",
+                Some(r#"{"tags":["old"]}"#),
+                None,
+            )
+            .unwrap();
+
+        let mut pipeline = Pipeline::new(
+            engine.clone(),
+            store.clone(),
+            PathBuf::from("/test"),
+            msg_rx,
+            tag_rx,
+            progress_tx,
+            Some(auto_tx),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let batch = vec![(
+            f.clone(),
+            meta.modified()
+                .unwrap()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            meta.len(),
+        )];
+        let processed = pipeline.process_batch(&batch, 0);
+        assert_eq!(processed, 1);
+
+        // Changed content must be re-tagged: status reset to pending and a
+        // request queued for the fresh content.
+        let status = store.auto_tag_status(&content_hash).unwrap().unwrap();
+        assert_eq!(status.status, "pending");
+        let request = auto_rx.try_recv().unwrap();
+        match request {
+            AutoTagRequest::TagDocument {
+                content_hash: h,
+                content_hash_before_tag: hb,
+                ..
+            } => {
+                assert_eq!(h, content_hash);
+                assert_eq!(hb, hash_before);
+            }
+            AutoTagRequest::Shutdown => panic!("unexpected shutdown"),
+        }
     }
 }
