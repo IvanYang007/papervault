@@ -81,7 +81,8 @@ impl TagStore {
                 created_at      TEXT NOT NULL DEFAULT (datetime('now')),
                 updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
             );
-            CREATE INDEX IF NOT EXISTS idx_auto_tag_cache_tokens ON auto_tag_cache(filename_tokens);",
+            CREATE INDEX IF NOT EXISTS idx_auto_tag_cache_tokens ON auto_tag_cache(filename_tokens);
+            CREATE INDEX IF NOT EXISTS idx_auto_tag_cache_hit_count ON auto_tag_cache(hit_count DESC, updated_at ASC);",
         )?;
 
         Ok(Self {
@@ -407,6 +408,10 @@ fn upsert_auto_tag_status_sql(
     Ok(())
 }
 
+/// Max rows kept in auto_tag_cache. Lookups scan at most this many rows and
+/// the table cannot grow without bound (one row per unique filename-token set).
+pub(crate) const CACHE_MAX_ROWS: i64 = 2000;
+
 /// One document write inside a batch (single transaction).
 #[derive(Debug, Clone)]
 pub struct BatchDocumentUpsert<'a> {
@@ -692,6 +697,8 @@ impl TagStore {
     }
 
     /// Insert or update a cache entry. Increments hit_count if the same tokens already exist.
+    /// New rows evict the least-used entries beyond CACHE_MAX_ROWS so the table
+    /// cannot grow without bound (lookups scan at most the cap).
     pub fn upsert_cache_entry(
         &self,
         filename_tokens: &str,
@@ -699,8 +706,10 @@ impl TagStore {
         source_hash: &str,
     ) -> SqlResult<()> {
         self.with_conn(|conn| {
+            // Single transaction: insert + eviction commit together.
+            let tx = conn.transaction()?;
             // Check if tokens already exist
-            let existing: Option<(i64, i64)> = conn
+            let existing: Option<(i64, i64)> = tx
                 .query_row(
                     "SELECT id, hit_count FROM auto_tag_cache WHERE filename_tokens = ?1",
                     params![filename_tokens],
@@ -709,16 +718,34 @@ impl TagStore {
                 .ok();
 
             if let Some((id, hit_count)) = existing {
-                conn.execute(
+                tx.execute(
                     "UPDATE auto_tag_cache SET tags_json = ?1, hit_count = ?2, updated_at = datetime('now') WHERE id = ?3",
                     params![tags_json, hit_count + 1, id],
                 )?;
             } else {
-                conn.execute(
+                tx.execute(
                     "INSERT INTO auto_tag_cache (filename_tokens, tags_json, source_hash) VALUES (?1, ?2, ?3)",
                     params![filename_tokens, tags_json, source_hash],
                 )?;
+                // Evict the least-used rows beyond the cap (hit_count index
+                // makes the ORDER BY an index scan).
+                let overflow: i64 = tx.query_row(
+                    "SELECT COUNT(*) - ?1 FROM auto_tag_cache",
+                    params![CACHE_MAX_ROWS],
+                    |row| row.get(0),
+                )?;
+                if overflow > 0 {
+                    tx.execute(
+                        "DELETE FROM auto_tag_cache WHERE id IN (
+                            SELECT id FROM auto_tag_cache
+                            ORDER BY hit_count ASC, updated_at ASC
+                            LIMIT ?1
+                        )",
+                        params![overflow],
+                    )?;
+                }
             }
+            tx.commit()?;
             Ok(())
         })
     }
@@ -1605,5 +1632,94 @@ mod tests {
         let result = store.lookup_cache_by_tokens(&tokens, 0.5).unwrap();
         // Should hit the matching entry even with 250 rows (LIMIT 200 won't miss it since it matches)
         assert!(result.is_some());
+    }
+
+    #[test]
+    fn cache_eviction_caps_table_size() {
+        let (store, _dir) = setup_test_store();
+        // Bulk-insert cap + 50 rows in one transaction (fast path).
+        store
+            .with_conn(|conn| {
+                let tx = conn.transaction()?;
+                for i in 0..(CACHE_MAX_ROWS + 50) {
+                    tx.execute(
+                        "INSERT INTO auto_tag_cache (filename_tokens, tags_json, source_hash)
+                         VALUES (?1, '{}', 'src')",
+                        params![format!("tokens{}", i)],
+                    )?;
+                }
+                tx.commit()?;
+                Ok(())
+            })
+            .unwrap();
+
+        // A new entry triggers eviction back down to the cap.
+        store
+            .upsert_cache_entry("brand-new-tokens", "{}", "src")
+            .unwrap();
+        let count: i64 = store
+            .with_conn(|conn| {
+                conn.query_row("SELECT COUNT(*) FROM auto_tag_cache", [], |r| r.get(0))
+            })
+            .unwrap();
+        assert_eq!(
+            count, CACHE_MAX_ROWS,
+            "table must be capped at CACHE_MAX_ROWS"
+        );
+        // The new entry survives the eviction.
+        let hits = store
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM auto_tag_cache WHERE filename_tokens = 'brand-new-tokens'",
+                    [],
+                    |r| r.get::<_, i64>(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(hits, 1);
+    }
+
+    #[test]
+    fn cache_eviction_keeps_high_hit_rows() {
+        let (store, _dir) = setup_test_store();
+        store
+            .with_conn(|conn| {
+                let tx = conn.transaction()?;
+                for i in 0..(CACHE_MAX_ROWS + 50) {
+                    tx.execute(
+                        "INSERT INTO auto_tag_cache (filename_tokens, tags_json, source_hash)
+                         VALUES (?1, '{}', 'src')",
+                        params![format!("tokens{}", i)],
+                    )?;
+                }
+                // Make one row heavily used — eviction must keep it.
+                tx.execute(
+                    "UPDATE auto_tag_cache SET hit_count = 500 WHERE filename_tokens = 'tokens0'",
+                    [],
+                )?;
+                tx.commit()?;
+                Ok(())
+            })
+            .unwrap();
+
+        store
+            .upsert_cache_entry("brand-new-tokens", "{}", "src")
+            .unwrap();
+        let survivors: i64 = store
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM auto_tag_cache WHERE filename_tokens = 'tokens0'",
+                    [],
+                    |r| r.get(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(survivors, 1, "high-hit rows must survive eviction");
+        let count: i64 = store
+            .with_conn(|conn| {
+                conn.query_row("SELECT COUNT(*) FROM auto_tag_cache", [], |r| r.get(0))
+            })
+            .unwrap();
+        assert_eq!(count, CACHE_MAX_ROWS);
     }
 }
