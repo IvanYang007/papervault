@@ -1889,12 +1889,16 @@ impl eframe::App for PapervaultApp {
                                 row.set_selected(is_browsed || is_selected);
 
                                 // Name cell — truncated label (widening the
-                                // column reveals the full name). Clicks are
-                                // detected at row level.
+                                // column reveals the full name; hovering shows
+                                // it as a tooltip). NOT selectable: a selectable
+                                // label senses click-and-drag and would swallow
+                                // presses over the text. Clicks are detected at
+                                // row level instead.
                                 row.col(|ui| {
                                     ui.add(
                                         egui::Label::new(egui::RichText::new(&row_data.label))
-                                            .truncate(),
+                                            .truncate()
+                                            .selectable(false),
                                     );
                                 });
                                 let clicked = row.response().clicked();
