@@ -46,7 +46,7 @@ impl FolderRuntime {
         let (tag_tx, tag_rx) = channel::unbounded::<TagUpdate>();
         let (render_tx, render_rx) = channel::unbounded::<RenderRequest>();
         let (render_result_tx, render_result_rx) = channel::unbounded::<RenderResult>();
-        let (auto_tagger_tx, auto_tagger_rx) = channel::unbounded::<AutoTagRequest>();
+        let (auto_tagger_tx, auto_tagger_rx) = channel::bounded::<AutoTagRequest>(256);
 
         // ── Search Engine ──
         let engine = SearchEngine::open_or_create(folder)?;
@@ -194,7 +194,9 @@ impl FolderRuntime {
         self.auto_tagger_shutdown.store(true, Ordering::Release);
         if let Some(ref tx) = self.auto_tagger_tx {
             for _ in &self.auto_tagger_handles {
-                let _ = tx.send(crate::app::AutoTagRequest::Shutdown);
+                // Best-effort: workers also exit via the shutdown flag within
+                // their 100ms recv timeout, so a full queue cannot block stop().
+                let _ = tx.try_send(crate::app::AutoTagRequest::Shutdown);
             }
         }
         drop(self.auto_tagger_tx.take());

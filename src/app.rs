@@ -869,6 +869,13 @@ impl PapervaultApp {
         });
     }
 
+    /// Send an auto-tag request from the UI thread without ever blocking.
+    /// Returns false when the queue is full or disconnected — the caller
+    /// should stop queueing and report the partial count.
+    fn try_queue_auto_tag(tx: &Sender<AutoTagRequest>, request: AutoTagRequest) -> bool {
+        tx.try_send(request).is_ok()
+    }
+
     /// Manually trigger auto-tagging for all currently selected files in the file browser.
     fn tag_selected_files(&mut self) {
         let tx = match &self.auto_tagger_tx {
@@ -950,33 +957,25 @@ impl PapervaultApp {
             // Reset wipes tags_json — drop the stale display cache entry.
             self.auto_tag_cache.remove(&doc.content_hash);
 
-            match tx.try_send(AutoTagRequest::TagDocument {
+            let request = AutoTagRequest::TagDocument {
                 content_hash: doc.content_hash.clone(),
                 filename: file_name.to_string(),
                 text: content,
                 content_hash_before_tag,
-            }) {
-                Ok(()) => {
-                    tracing::info!("Queued for tagging: {}", file_name);
-                }
-                Err(crossbeam::channel::TrySendError::Full(_)) => {
-                    tracing::warn!(
-                        "Auto-tagger queue full, stopping batch at {}/{}",
-                        completed,
-                        total
-                    );
-                    self.status_message = format!(
-                        "Queue full — tagged {}/{} files (retry when current batch completes)",
-                        queued, total
-                    );
-                    break;
-                }
-                Err(crossbeam::channel::TrySendError::Disconnected(_)) => {
-                    tracing::warn!("Auto-tagger disconnected");
-                    break;
-                }
+            };
+            if !Self::try_queue_auto_tag(&tx, request) {
+                tracing::warn!(
+                    "Auto-tagger queue full, stopping batch at {}/{}",
+                    completed,
+                    total
+                );
+                self.status_message = format!(
+                    "Queue full — tagged {}/{} files (retry when current batch completes)",
+                    queued, total
+                );
+                break;
             }
-
+            tracing::info!("Queued for tagging: {}", file_name);
             queued += 1;
             completed += 1;
             self.auto_tag_progress = Some((completed, total));
@@ -1359,6 +1358,7 @@ impl eframe::App for PapervaultApp {
                                 .store(0, std::sync::atomic::Ordering::Relaxed);
                         }
                         self.auto_tag_progress = Some((0, total));
+                        let mut queued = 0usize;
                         for doc in docs {
                             let file_name = std::path::Path::new(&doc.file_path)
                                 .file_name()
@@ -1371,13 +1371,30 @@ impl eframe::App for PapervaultApp {
                                 hasher.update(b"reindex");
                                 hasher.finalize().to_hex().to_string()
                             };
-                            let _ = tx.send(AutoTagRequest::TagDocument {
+                            // Never block the UI thread on the bounded queue.
+                            if !Self::try_queue_auto_tag(
+                                tx,
+                                AutoTagRequest::TagDocument {
                                     content_hash: doc.content_hash.clone(),
                                     filename: file_name,
                                     text: "[Document text could not be extracted. Use filename to determine topic.]".to_string(),
                                     content_hash_before_tag,
-                                });
+                                },
+                            ) {
+                                tracing::warn!(
+                                    "Auto-tagger queue full during reindex — queued {}/{}",
+                                    queued,
+                                    total
+                                );
+                                self.status_message = format!(
+                                    "Re-index queued {}/{} files — queue full (run again to continue)",
+                                    queued, total
+                                );
+                                break;
+                            }
+                            queued += 1;
                         }
+                        self.auto_tag_progress = Some((queued, total));
                         // All docs re-queued — any cached auto-tag display is now stale
                         self.auto_tag_cache.clear();
                     }
@@ -2807,6 +2824,29 @@ mod tests {
         assert!(
             preview.contains("Hello"),
             "non-UTF-8 file should contain readable content"
+        );
+    }
+
+    #[test]
+    fn try_queue_auto_tag_respects_bounded_channel() {
+        use crate::app::AutoTagRequest;
+        let (tx, rx) = crossbeam::channel::bounded::<AutoTagRequest>(1);
+        let req = |h: &str| AutoTagRequest::TagDocument {
+            content_hash: h.to_string(),
+            filename: "a.pdf".to_string(),
+            text: "text".to_string(),
+            content_hash_before_tag: "x".to_string(),
+        };
+
+        assert!(PapervaultApp::try_queue_auto_tag(&tx, req("h1")));
+        assert!(
+            !PapervaultApp::try_queue_auto_tag(&tx, req("h2")),
+            "full bounded queue must report backpressure, not block"
+        );
+        drop(rx);
+        assert!(
+            !PapervaultApp::try_queue_auto_tag(&tx, req("h3")),
+            "disconnected queue must report failure"
         );
     }
 

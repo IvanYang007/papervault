@@ -314,12 +314,22 @@ impl Pipeline {
                     .to_string();
                 if let Some(ref tx) = self.auto_tagger_tx {
                     let content_hash_before_tag = compute_content_hash(&file_name, "[no text]");
-                    let _ = tx.try_send(AutoTagRequest::TagDocument {
-                        content_hash: format!("batch_failed_{}", file_name),
-                        filename: file_name,
-                        text: "[Document text could not be extracted. Use filename to determine topic.]".to_string(),
-                        content_hash_before_tag,
-                    });
+                    // Bounded channel: brief backpressure, then drop — the
+                    // row stays 'pending' and is recovered at next startup.
+                    if tx
+                        .send_timeout(
+                            AutoTagRequest::TagDocument {
+                                content_hash: format!("batch_failed_{}", file_name),
+                                filename: file_name,
+                                text: "[Document text could not be extracted. Use filename to determine topic.]".to_string(),
+                                content_hash_before_tag,
+                            },
+                            Duration::from_millis(100),
+                        )
+                        .is_err()
+                    {
+                        debug!("auto-tag queue full — request dropped (recovered at next startup)");
+                    }
                 }
                 continue;
             };
@@ -432,7 +442,14 @@ impl Pipeline {
                         text: doc.text.to_string(),
                         content_hash_before_tag: doc.content_hash_before_tag.clone(),
                     };
-                    let _ = tx.try_send(request);
+                    // Bounded channel: brief backpressure, then drop — the
+                    // row stays 'pending' and is recovered at next startup.
+                    if tx
+                        .send_timeout(request, Duration::from_millis(100))
+                        .is_err()
+                    {
+                        debug!("auto-tag queue full — request dropped (recovered at next startup)");
+                    }
                 }
 
                 processed += 1;
@@ -601,7 +618,14 @@ impl Pipeline {
                     text: extracted_text.to_string(),
                     content_hash_before_tag,
                 };
-                let _ = tx.try_send(request);
+                // Bounded channel: brief backpressure, then drop — the row
+                // stays 'pending' and is recovered at next startup.
+                if tx
+                    .send_timeout(request, Duration::from_millis(100))
+                    .is_err()
+                {
+                    debug!("auto-tag queue full — request dropped (recovered at next startup)");
+                }
             }
         }
 
