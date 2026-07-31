@@ -26,6 +26,10 @@ pub struct Pipeline {
     commit_batch_size: usize,
     /// Shared shutdown flag — checked during initial scan to allow fast close.
     shutdown: Arc<AtomicBool>,
+    /// Set by the UI when the file browser needs a fresh document snapshot.
+    /// Serviced by this thread so list_all_documents never runs on the UI
+    /// thread (it is a full scan under the SQLite mutex).
+    browser_refresh: Arc<AtomicBool>,
 }
 
 impl Pipeline {
@@ -39,6 +43,7 @@ impl Pipeline {
         progress_tx: Sender<IndexerProgress>,
         auto_tagger_tx: Option<Sender<AutoTagRequest>>,
         shutdown: Arc<AtomicBool>,
+        browser_refresh: Arc<AtomicBool>,
     ) -> Self {
         Self {
             search_engine,
@@ -51,6 +56,24 @@ impl Pipeline {
             pending_count: 0,
             commit_batch_size: 10,
             shutdown,
+            browser_refresh,
+        }
+    }
+
+    /// Send a fresh file-browser snapshot if the UI asked for one.
+    fn maybe_send_docs_snapshot(&mut self) {
+        if !self.browser_refresh.swap(false, Ordering::Relaxed) {
+            return;
+        }
+        match self.tag_store.list_all_documents() {
+            Ok(docs) => {
+                let _ = self
+                    .progress_tx
+                    .send(IndexerProgress::DocsSnapshot { docs });
+            }
+            Err(e) => {
+                error!("Failed to build file-browser snapshot: {}", e);
+            }
         }
     }
 
@@ -112,6 +135,7 @@ impl Pipeline {
                             let batch_start = scan_processed;
                             scan_processed += self.process_batch(&batch, batch_start);
                             batch.clear();
+                            self.maybe_send_docs_snapshot();
                         }
                     }
                     IndexerMessage::Delete { path } => {
@@ -152,6 +176,9 @@ impl Pipeline {
         let stages = crate::indexer::stages::create_extractor_chain();
 
         loop {
+            // Service UI-requested file-browser refreshes (off the UI thread)
+            self.maybe_send_docs_snapshot();
+
             // Use recv_timeout to periodically check commit timer even when idle
             match self.msg_rx.recv_timeout(Duration::from_millis(500)) {
                 Ok(msg) => match msg {
@@ -962,6 +989,7 @@ mod tests {
             progress_tx,
             None,
             shutdown,
+            Arc::new(AtomicBool::new(false)),
         );
 
         // Run should process the document, then shutdown and commit
@@ -978,6 +1006,80 @@ mod tests {
                 "Document should be committed after pipeline shutdown"
             );
         }
+    }
+
+    #[test]
+    fn browser_refresh_flag_sends_docs_snapshot() {
+        use crate::app::TagUpdate;
+        use crate::search::engine::SearchEngine;
+        use crate::tags::store::DocumentInfo;
+        use crate::watcher::watcher::IndexerMessage;
+
+        let (store, _dir) = setup_tag_store();
+        store
+            .upsert_document("h1", "/test/doc.pdf", "pdf", 10, 1)
+            .unwrap();
+
+        // Create a temp-search engine
+        let index_dir = tempfile::TempDir::new().unwrap();
+        let schema = crate::search::schema::build_schema();
+        let fields = crate::search::schema::SchemaFields::from_schema(&schema);
+        let index = tantivy::Index::create_in_dir(index_dir.path(), schema.clone()).unwrap();
+        let tokenizer = tantivy::tokenizer::TextAnalyzer::builder(
+            tantivy::tokenizer::SimpleTokenizer::default(),
+        )
+        .filter(tantivy::tokenizer::LowerCaser)
+        .build();
+        index.tokenizers().register("body", tokenizer);
+        let writer = index.writer(50_000_000).unwrap();
+        let reader = index
+            .reader_builder()
+            .reload_policy(tantivy::ReloadPolicy::Manual)
+            .try_into()
+            .unwrap();
+        let engine = SearchEngine {
+            index,
+            schema,
+            fields,
+            reader,
+            writer,
+        };
+        let engine = Arc::new(std::sync::Mutex::new(engine));
+
+        let (msg_tx, msg_rx) = crossbeam::channel::bounded::<IndexerMessage>(100);
+        let (tag_tx, tag_rx) = crossbeam::channel::bounded::<TagUpdate>(100);
+        let (progress_tx, progress_rx) = crossbeam::channel::unbounded::<IndexerProgress>();
+
+        // UI asked for a refresh before the pipeline even starts.
+        let browser_refresh = Arc::new(AtomicBool::new(true));
+        let mut pipeline = Pipeline::new(
+            engine.clone(),
+            store,
+            PathBuf::from("/test"),
+            msg_rx,
+            tag_rx,
+            progress_tx,
+            None,
+            Arc::new(AtomicBool::new(false)),
+            browser_refresh,
+        );
+
+        // No messages — the channel disconnects immediately; run() must still
+        // service the refresh flag on its first iteration.
+        drop(msg_tx);
+        drop(tag_tx);
+        pipeline.run();
+
+        let mut snapshots: Vec<Vec<DocumentInfo>> = Vec::new();
+        while let Ok(msg) = progress_rx.try_recv() {
+            if let IndexerProgress::DocsSnapshot { docs } = msg {
+                snapshots.push(docs);
+            }
+        }
+        let last = snapshots.last().expect("at least one DocsSnapshot");
+        assert_eq!(last.len(), 1, "snapshot must include the seeded document");
+        assert_eq!(last[0].content_hash, "h1");
+        assert_eq!(last[0].file_path, "/test/doc.pdf");
     }
 
     #[test]
@@ -1052,6 +1154,7 @@ mod tests {
             tag_rx,
             progress_tx,
             None,
+            Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicBool::new(false)),
         );
 
@@ -1140,6 +1243,7 @@ mod tests {
             progress_tx,
             None,
             Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
         );
 
         // Process with offset 10 (simulating second batch)
@@ -1216,6 +1320,7 @@ mod tests {
             tag_rx,
             progress_tx,
             None,
+            Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicBool::new(false)),
         );
 

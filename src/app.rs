@@ -18,7 +18,7 @@ use egui::{
 use raw_window_handle::HasWindowHandle;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tracing::warn;
@@ -152,6 +152,10 @@ pub enum IndexerProgress {
     ScanComplete { total: usize },
     /// An error occurred processing a file.
     Error { path: PathBuf, error: String },
+    /// Fresh file-browser snapshot, computed on the indexer thread.
+    /// Keeps list_all_documents (a full scan under the DB mutex) off the
+    /// UI thread.
+    DocsSnapshot { docs: Vec<DocumentInfo> },
 }
 
 /// Messages from the UI thread to the indexer thread for tag updates.
@@ -759,11 +763,26 @@ impl PapervaultApp {
                 IndexerProgress::Error { path, error } => {
                     self.status_message = format!("Error indexing {}: {}", path.display(), error);
                 }
+                IndexerProgress::DocsSnapshot { docs } => {
+                    self.apply_docs_snapshot(docs);
+                }
             }
         }
 
         // Tags are now loaded at startup and refreshed only after create/delete.
         // No per-frame tag query.
+    }
+
+    /// Apply a file-browser snapshot computed on the indexer thread.
+    fn apply_docs_snapshot(&mut self, docs: Vec<DocumentInfo>) {
+        self.file_browser_docs = docs;
+        sort_docs(
+            &mut self.file_browser_docs,
+            self.sort_column,
+            self.sort_direction,
+        );
+        self.file_browser_rows = build_file_browser_rows(&self.file_browser_docs);
+        self.file_browser_dirty = false;
     }
 
     // ── Tag operations ──
@@ -1629,22 +1648,30 @@ impl eframe::App for PapervaultApp {
 
         // ── Left panel: file browser ──
         if self.config.watched_folder.is_some() {
-            // Refresh file list if dirty and apply current sort
+            // Refresh request: with a live runtime the indexer thread computes
+            // the snapshot (list_all_documents is a full scan under the DB
+            // mutex — it must not run on the UI thread). The result arrives
+            // as IndexerProgress::DocsSnapshot. Without a runtime, fall back
+            // to an inline refresh.
             if self.file_browser_dirty {
-                if let Some(ref store) = self.tag_store {
-                    if let Ok(docs) = store.list_all_documents() {
-                        self.file_browser_docs = docs;
+                if let Some(ref rt) = self.folder_runtime {
+                    rt.browser_refresh_flag.store(true, Ordering::Relaxed);
+                } else {
+                    if let Some(ref store) = self.tag_store {
+                        if let Ok(docs) = store.list_all_documents() {
+                            self.file_browser_docs = docs;
+                        }
                     }
+                    sort_docs(
+                        &mut self.file_browser_docs,
+                        self.sort_column,
+                        self.sort_direction,
+                    );
+                    // Pre-render display strings once per refresh — the per-frame
+                    // loop below must not format dates/sizes or allocate per row.
+                    self.file_browser_rows = build_file_browser_rows(&self.file_browser_docs);
+                    self.file_browser_dirty = false;
                 }
-                sort_docs(
-                    &mut self.file_browser_docs,
-                    self.sort_column,
-                    self.sort_direction,
-                );
-                // Pre-render display strings once per refresh — the per-frame
-                // loop below must not format dates/sizes or allocate per row.
-                self.file_browser_rows = build_file_browser_rows(&self.file_browser_docs);
-                self.file_browser_dirty = false;
             }
 
             // Ensure the browsed file's auto-tags are cached before the row loop
@@ -2519,6 +2546,24 @@ mod tests {
         assert_eq!(rows[0].content_hash, "abc");
         assert!(rows[0].has_tags);
         assert!(!rows[1].has_tags);
+    }
+
+    #[test]
+    fn apply_docs_snapshot_sorts_and_builds_rows() {
+        let mut app = make_transition_test_app();
+        let docs = vec![
+            make_doc("/b.txt", "txt", 100, 2),
+            make_doc("/a.pdf", "pdf", 200, 1),
+        ];
+        app.apply_docs_snapshot(docs);
+
+        assert_eq!(app.file_browser_docs.len(), 2);
+        assert_eq!(app.file_browser_rows.len(), 2);
+        assert!(!app.file_browser_dirty, "snapshot satisfies the refresh");
+        // Default sort is Name ascending — a.pdf first, rows aligned with docs.
+        assert_eq!(app.file_browser_docs[0].file_path, "/a.pdf");
+        assert!(app.file_browser_rows[0].label.contains("a.pdf"));
+        assert!(app.file_browser_rows[1].label.contains("b.txt"));
     }
 
     // ── select_result / browse_file state transition tests ──

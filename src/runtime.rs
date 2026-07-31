@@ -24,6 +24,9 @@ pub struct FolderRuntime {
     auto_tagger_handles: Vec<JoinHandle<()>>,
     auto_tagger_shutdown: Arc<AtomicBool>,
     watcher_tx: Option<Sender<IndexerMessage>>,
+    /// Set by the UI when the file browser needs a fresh snapshot; the
+    /// indexer thread services it and sends IndexerProgress::DocsSnapshot.
+    pub browser_refresh_flag: Arc<AtomicBool>,
     pub tag_tx: Option<Sender<TagUpdate>>,
     pub auto_tagger_tx: Option<Sender<AutoTagRequest>>,
     pub auto_tag_progress: Arc<AtomicUsize>,
@@ -100,6 +103,8 @@ impl FolderRuntime {
         let watcher_folder = folder.to_path_buf();
         let indexer_auto_tagger_tx = auto_tagger_tx.clone();
         let indexer_shutdown = watcher_shutdown.clone();
+        let browser_refresh_flag = Arc::new(AtomicBool::new(false));
+        let indexer_browser_refresh = browser_refresh_flag.clone();
         let indexer_handle =
             std::thread::Builder::new()
                 .name("indexer".into())
@@ -113,6 +118,7 @@ impl FolderRuntime {
                         progress_tx_clone,
                         Some(indexer_auto_tagger_tx),
                         indexer_shutdown,
+                        indexer_browser_refresh,
                     );
                     p.run();
                 })?;
@@ -149,6 +155,7 @@ impl FolderRuntime {
             auto_tagger_handles,
             auto_tagger_shutdown,
             watcher_tx: Some(watcher_tx),
+            browser_refresh_flag,
             tag_tx: Some(tag_tx),
             auto_tagger_tx: Some(auto_tagger_tx),
             auto_tag_progress: progress,
