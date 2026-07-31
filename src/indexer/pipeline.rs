@@ -1,7 +1,7 @@
 use crate::app::{AutoTagRequest, IndexerProgress, TagUpdate};
 use crate::indexer::stages;
 use crate::search::engine::SearchEngine;
-use crate::tags::store::TagStore;
+use crate::tags::store::{BatchDocumentUpsert, TagStore};
 use crate::watcher::watcher::IndexerMessage;
 use crossbeam::channel::{Receiver, Sender};
 use std::path::{Path, PathBuf};
@@ -261,8 +261,22 @@ impl Pipeline {
             })
             .collect();
 
-        // Phase 2: Index sequentially (Tantivy is single-writer, SQLite under Mutex)
-        let mut processed = 0usize;
+        // Phase 2a: reads + derived data for the whole batch (no writes yet)
+        struct PendingDoc<'a> {
+            path: &'a PathBuf,
+            path_str: String,
+            file_type: String,
+            content_hash: String,
+            doc_id: String,
+            file_name: String,
+            modified_ts: i64,
+            size: u64,
+            old_hash_to_delete: Option<String>,
+            tags: Vec<String>,
+            text: &'a str,
+            content_hash_before_tag: String,
+        }
+        let mut docs: Vec<PendingDoc> = Vec::with_capacity(results.len());
         for (path, mtime, size, extracted) in &results {
             let Some(extracted) = extracted else {
                 // Extraction failed — still try to auto-tag from filename
@@ -297,9 +311,6 @@ impl Pipeline {
                 .ok()
                 .flatten()
                 .filter(|old| old.as_str() != content_hash);
-            if old_hash_to_delete.is_some() {
-                let _ = self.tag_store.delete_document_by_path(&path_str);
-            }
 
             let file_name = path
                 .file_name()
@@ -315,72 +326,94 @@ impl Pipeline {
                 .into_iter()
                 .map(|t| t.name)
                 .collect::<Vec<String>>();
+            let content_hash_before_tag = compute_content_hash(&file_name, &extracted.text);
 
-            if let Err(e) = self.tag_store.upsert_document(
-                &content_hash,
-                &path_str,
-                &file_type,
-                *size as i64,
+            docs.push(PendingDoc {
+                path,
+                path_str,
+                file_type,
+                content_hash,
+                doc_id,
+                file_name,
                 modified_ts,
-            ) {
-                error!("Batch upsert error for {}: {}", path_str, e);
-                continue;
-            }
+                size: *size,
+                old_hash_to_delete,
+                tags,
+                text: &extracted.text,
+                content_hash_before_tag,
+            });
+        }
 
-            // Single lock scope: delete old + index new (avoids double Mutex acquire)
-            {
-                let mut engine = self.search_engine.lock().unwrap_or_else(|e| e.into_inner());
-                if let Some(ref old_hash) = old_hash_to_delete {
-                    let _ = engine.delete_by_hash(old_hash);
-                }
-                if let Err(e) = engine.index_document(
-                    &doc_id,
-                    path,
-                    &file_name,
-                    &extracted.text,
-                    &file_type,
-                    modified_ts,
-                    &content_hash,
-                    &tags,
-                ) {
-                    error!("Batch index error for {}: {}", path_str, e);
-                    continue;
+        // Phase 2b: ONE transaction for all SQLite writes in this batch.
+        // (Previously each file cost 2-3 autocommit WAL fsyncs.) All-or-nothing:
+        // a failed batch skips Tantivy indexing so no Tantivy row is ever
+        // orphaned without its SQLite row.
+        let batch_ok = if docs.is_empty() {
+            true
+        } else {
+            let items: Vec<BatchDocumentUpsert> = docs
+                .iter()
+                .map(|d| BatchDocumentUpsert {
+                    content_hash: &d.content_hash,
+                    file_path: &d.path_str,
+                    file_type: &d.file_type,
+                    file_size: d.size as i64,
+                    modified_ts: d.modified_ts,
+                    old_hash_to_delete: d.old_hash_to_delete.as_deref(),
+                    filename: &d.file_name,
+                    content_hash_before_tag: &d.content_hash_before_tag,
+                })
+                .collect();
+            match self.tag_store.upsert_documents_batch(&items) {
+                Ok(()) => true,
+                Err(e) => {
+                    error!("Batch upsert error ({} files skipped): {}", docs.len(), e);
+                    false
                 }
             }
+        };
 
-            // Trigger auto-tagging (same as process_upsert path)
-            {
-                let content_hash_before_tag = compute_content_hash(&file_name, &extracted.text);
-                if let Err(e) = self.tag_store.upsert_auto_tag_status(
-                    &content_hash,
-                    &file_name,
-                    &content_hash_before_tag,
-                    "pending",
-                    None,
-                    None,
-                ) {
-                    tracing::warn!(
-                        "failed to write pending auto-tag status for {}: {}",
-                        content_hash,
-                        e
-                    );
+        // Phase 2c: Tantivy writes (single lock scope) + auto-tag requests
+        let mut processed = 0usize;
+        if batch_ok {
+            for doc in &docs {
+                {
+                    let mut engine = self.search_engine.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Some(ref old_hash) = doc.old_hash_to_delete {
+                        let _ = engine.delete_by_hash(old_hash);
+                    }
+                    if let Err(e) = engine.index_document(
+                        &doc.doc_id,
+                        doc.path,
+                        &doc.file_name,
+                        doc.text,
+                        &doc.file_type,
+                        doc.modified_ts,
+                        &doc.content_hash,
+                        &doc.tags,
+                    ) {
+                        error!("Batch index error for {}: {}", doc.path_str, e);
+                        continue;
+                    }
                 }
+
+                // Trigger auto-tagging (status row already written in 2b)
                 if let Some(ref tx) = self.auto_tagger_tx {
                     let request = AutoTagRequest::TagDocument {
-                        content_hash: content_hash.clone(),
-                        filename: file_name.clone(),
-                        text: extracted.text.clone(),
-                        content_hash_before_tag,
+                        content_hash: doc.content_hash.clone(),
+                        filename: doc.file_name.clone(),
+                        text: doc.text.to_string(),
+                        content_hash_before_tag: doc.content_hash_before_tag.clone(),
                     };
                     let _ = tx.try_send(request);
                 }
-            }
 
-            processed += 1;
-            self.pending_count += 1;
-            let _ = self.progress_tx.send(IndexerProgress::Progress {
-                processed: offset + processed,
-            });
+                processed += 1;
+                self.pending_count += 1;
+                let _ = self.progress_tx.send(IndexerProgress::Progress {
+                    processed: offset + processed,
+                });
+            }
         }
 
         // Commit after each batch
@@ -720,6 +753,26 @@ mod tests {
                 content_hash TEXT NOT NULL REFERENCES documents(content_hash) ON DELETE CASCADE,
                 tag_id      INTEGER NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
                 PRIMARY KEY (content_hash, tag_id)
+            );
+            CREATE TABLE auto_tag_status (
+                content_hash TEXT PRIMARY KEY REFERENCES documents(content_hash) ON DELETE CASCADE,
+                filename     TEXT NOT NULL,
+                content_hash_before_tag TEXT NOT NULL,
+                status       TEXT NOT NULL DEFAULT 'pending',
+                tags_json    TEXT,
+                attempts     INTEGER NOT NULL DEFAULT 0,
+                last_error   TEXT,
+                created_at   TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at   TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE TABLE auto_tag_cache (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                filename_tokens TEXT NOT NULL,
+                tags_json       TEXT NOT NULL,
+                source_hash     TEXT NOT NULL,
+                hit_count       INTEGER NOT NULL DEFAULT 1,
+                created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
             );",
         )
         .unwrap();

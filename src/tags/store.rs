@@ -17,7 +17,8 @@ impl TagStore {
     #[cfg(test)]
     pub fn new_for_test(conn: Connection) -> Self {
         conn.execute_batch(
-            "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys = ON;",
+            "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys = ON;
+             PRAGMA synchronous = NORMAL;",
         )
         .ok();
         Self {
@@ -33,7 +34,8 @@ impl TagStore {
 
         let conn = Connection::open(&db_path)?;
         conn.execute_batch(
-            "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys = ON;",
+            "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys = ON;
+             PRAGMA synchronous = NORMAL;",
         )?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS documents (
@@ -95,10 +97,10 @@ impl TagStore {
     /// Access the underlying connection. Caller must hold the lock briefly.
     pub(crate) fn with_conn<F, T>(&self, f: F) -> SqlResult<T>
     where
-        F: FnOnce(&Connection) -> SqlResult<T>,
+        F: FnOnce(&mut Connection) -> SqlResult<T>,
     {
-        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        f(&conn)
+        let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        f(&mut conn)
     }
 
     // ── Tag CRUD ──
@@ -283,10 +285,13 @@ impl TagStore {
         modified_ts: i64,
     ) -> SqlResult<()> {
         self.with_conn(|conn| {
-            conn.execute(
-                "INSERT OR REPLACE INTO documents (content_hash, file_path, file_type, file_size, modified_ts, indexed_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, datetime('now'))",
-                params![content_hash, file_path, file_type, file_size, modified_ts],
+            upsert_document_sql(
+                conn,
+                content_hash,
+                file_path,
+                file_type,
+                file_size,
+                modified_ts,
             )?;
             Ok(())
         })
@@ -359,6 +364,64 @@ impl TagStore {
     }
 }
 
+/// Shared INSERT OR REPLACE for a document row (single and batch paths).
+fn upsert_document_sql(
+    conn: &Connection,
+    content_hash: &str,
+    file_path: &str,
+    file_type: &str,
+    file_size: i64,
+    modified_ts: i64,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO documents (content_hash, file_path, file_type, file_size, modified_ts, indexed_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, datetime('now'))",
+        params![content_hash, file_path, file_type, file_size, modified_ts],
+    )?;
+    Ok(())
+}
+
+/// Shared INSERT OR REPLACE for an auto-tag status row (single and batch paths).
+fn upsert_auto_tag_status_sql(
+    conn: &Connection,
+    content_hash: &str,
+    filename: &str,
+    content_hash_before_tag: &str,
+    status: &str,
+    tags_json: Option<&str>,
+    last_error: Option<&str>,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO auto_tag_status
+         (content_hash, filename, content_hash_before_tag, status, tags_json, last_error, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, datetime('now'))",
+        params![
+            content_hash,
+            filename,
+            content_hash_before_tag,
+            status,
+            tags_json,
+            last_error
+        ],
+    )?;
+    Ok(())
+}
+
+/// One document write inside a batch (single transaction).
+#[derive(Debug, Clone)]
+pub struct BatchDocumentUpsert<'a> {
+    pub content_hash: &'a str,
+    pub file_path: &'a str,
+    pub file_type: &'a str,
+    pub file_size: i64,
+    pub modified_ts: i64,
+    /// If the path previously pointed at a different hash, delete that row
+    /// (cascades to its tags and auto-tag status) before the upsert.
+    pub old_hash_to_delete: Option<&'a str>,
+    pub filename: &'a str,
+    pub content_hash_before_tag: &'a str,
+}
+
 /// Lightweight document info for the file browser panel.
 #[derive(Debug, Clone)]
 pub struct DocumentInfo {
@@ -387,18 +450,14 @@ impl TagStore {
         last_error: Option<&str>,
     ) -> SqlResult<()> {
         self.with_conn(|conn| {
-            conn.execute(
-                "INSERT OR REPLACE INTO auto_tag_status
-                 (content_hash, filename, content_hash_before_tag, status, tags_json, last_error, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, datetime('now'))",
-                params![
-                    content_hash,
-                    filename,
-                    content_hash_before_tag,
-                    status,
-                    tags_json,
-                    last_error
-                ],
+            upsert_auto_tag_status_sql(
+                conn,
+                content_hash,
+                filename,
+                content_hash_before_tag,
+                status,
+                tags_json,
+                last_error,
             )?;
             Ok(())
         })
@@ -550,6 +609,46 @@ impl TagStore {
                     )?;
                 }
             }
+            Ok(())
+        })
+    }
+
+    /// Persist a batch of document writes in ONE transaction.
+    /// Without this, every file costs 2-3 WAL commits (fsyncs) — a full
+    /// folder scan of 10k files turns into ~30k fsyncs. All-or-nothing:
+    /// a failing item rolls back the whole batch.
+    pub fn upsert_documents_batch(&self, items: &[BatchDocumentUpsert]) -> SqlResult<()> {
+        self.with_conn(|conn| {
+            let tx = conn.transaction()?;
+            for item in items {
+                if let Some(old_hash) = item.old_hash_to_delete {
+                    // Delete the old row by path (same semantics as
+                    // delete_document_by_path, inside this transaction).
+                    tx.execute(
+                        "DELETE FROM documents WHERE file_path = ?1",
+                        params![item.file_path],
+                    )?;
+                    debug_assert_ne!(old_hash, item.content_hash);
+                }
+                upsert_document_sql(
+                    &tx,
+                    item.content_hash,
+                    item.file_path,
+                    item.file_type,
+                    item.file_size,
+                    item.modified_ts,
+                )?;
+                upsert_auto_tag_status_sql(
+                    &tx,
+                    item.content_hash,
+                    item.filename,
+                    item.content_hash_before_tag,
+                    "pending",
+                    None,
+                    None,
+                )?;
+            }
+            tx.commit()?;
             Ok(())
         })
     }
@@ -1147,6 +1246,191 @@ mod tests {
             "stale processing row must be re-claimable"
         );
         assert_eq!(claimed[0].content_hash, "h1");
+    }
+
+    #[test]
+    fn upsert_documents_batch_commits_all_items() {
+        let (store, _dir) = setup_test_store();
+        let hashes: Vec<String> = (0..5).map(|i| format!("h{}", i)).collect();
+        let paths: Vec<String> = (0..5).map(|i| format!("/f{}.pdf", i)).collect();
+        let items: Vec<BatchDocumentUpsert> = hashes
+            .iter()
+            .zip(paths.iter())
+            .enumerate()
+            .map(|(i, (h, p))| BatchDocumentUpsert {
+                content_hash: h,
+                file_path: p,
+                file_type: "pdf",
+                file_size: 100 + i as i64,
+                modified_ts: 1700000000 + i as i64,
+                old_hash_to_delete: None,
+                filename: "f.pdf",
+                content_hash_before_tag: "x",
+            })
+            .collect();
+        store.upsert_documents_batch(&items).unwrap();
+
+        for i in 0..5 {
+            let hash = store.get_hash_by_path(&paths[i]).unwrap();
+            assert_eq!(hash.as_deref(), Some(hashes[i].as_str()));
+            let status = store.auto_tag_status(&hashes[i]).unwrap();
+            assert!(status.is_some(), "status row must be written for h{}", i);
+            assert_eq!(status.unwrap().status, "pending");
+        }
+    }
+
+    #[test]
+    fn upsert_documents_batch_rolls_back_on_error() {
+        let (store, _dir) = setup_test_store();
+        // A trigger aborts the insert of h2 — the whole batch must roll back,
+        // leaving no partial rows (h1 must not survive).
+        store
+            .with_conn(|conn| {
+                conn.execute_batch(
+                    "CREATE TRIGGER fail_on_h2 BEFORE INSERT ON documents
+                     WHEN NEW.content_hash = 'h2' BEGIN
+                        SELECT RAISE(ABORT, 'boom');
+                     END;",
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        let items = vec![
+            BatchDocumentUpsert {
+                content_hash: "h1",
+                file_path: "/a.pdf",
+                file_type: "pdf",
+                file_size: 100,
+                modified_ts: 1,
+                old_hash_to_delete: None,
+                filename: "a.pdf",
+                content_hash_before_tag: "x",
+            },
+            BatchDocumentUpsert {
+                content_hash: "h2",
+                file_path: "/b.pdf",
+                file_type: "pdf",
+                file_size: 100,
+                modified_ts: 1,
+                old_hash_to_delete: None,
+                filename: "b.pdf",
+                content_hash_before_tag: "y",
+            },
+        ];
+        assert!(store.upsert_documents_batch(&items).is_err());
+        assert!(
+            store.get_hash_by_path("/a.pdf").unwrap().is_none(),
+            "first item must be rolled back too"
+        );
+        assert!(store.get_hash_by_path("/b.pdf").unwrap().is_none());
+    }
+
+    #[test]
+    fn upsert_documents_batch_moves_path_between_hashes() {
+        let (store, _dir) = setup_test_store();
+        // Enable FK enforcement so the cascade is exercised (production has it).
+        store
+            .with_conn(|conn| {
+                conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+                Ok(())
+            })
+            .unwrap();
+        store.upsert_document("old", "/a.pdf", "pdf", 0, 0).unwrap();
+        store
+            .upsert_auto_tag_status(
+                "old",
+                "a.pdf",
+                "x",
+                "tagged",
+                Some(r#"{"tags":["stale"]}"#),
+                None,
+            )
+            .unwrap();
+        let tag_id = store.create_tag("stale").unwrap().id;
+        store.assign_tag("old", tag_id).unwrap(); // document_tags row for old hash
+
+        // New content at the same path: old hash must be deleted (cascading
+        // its tags and status), new hash written with a fresh pending status.
+        let items = vec![BatchDocumentUpsert {
+            content_hash: "new",
+            file_path: "/a.pdf",
+            file_type: "pdf",
+            file_size: 10,
+            modified_ts: 2,
+            old_hash_to_delete: Some("old"),
+            filename: "a.pdf",
+            content_hash_before_tag: "y",
+        }];
+        store.upsert_documents_batch(&items).unwrap();
+
+        assert_eq!(
+            store.get_hash_by_path("/a.pdf").unwrap().as_deref(),
+            Some("new")
+        );
+        assert!(
+            store.auto_tag_status("old").unwrap().is_none(),
+            "old hash's status must cascade-delete"
+        );
+        assert!(
+            store.get_tags_for_document("old").unwrap().is_empty(),
+            "old hash's tags must cascade-delete"
+        );
+        let status = store.auto_tag_status("new").unwrap().unwrap();
+        assert_eq!(status.status, "pending");
+    }
+
+    /// Measurement: batched (one transaction per 32 files) vs per-file
+    /// autocommit writes on a 5000-file scan. Run with
+    /// `cargo test --release batch_write_timing -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn batch_write_timing() {
+        use std::time::Instant;
+        let (store, _dir) = setup_test_store();
+
+        // Baseline: per-file autocommit (2 writes each), the old pipeline path.
+        let start = Instant::now();
+        for i in 0..5000 {
+            store
+                .upsert_document(&format!("h{}", i), &format!("/f{}.pdf", i), "pdf", 100, i)
+                .unwrap();
+            store
+                .upsert_auto_tag_status(&format!("h{}", i), "f.pdf", "x", "pending", None, None)
+                .unwrap();
+        }
+        let per_file = start.elapsed();
+
+        // New path: one transaction per 32-file batch.
+        let (store2, _dir2) = setup_test_store();
+        let hashes: Vec<String> = (0..5000).map(|i| format!("h{}", i)).collect();
+        let paths: Vec<String> = (0..5000).map(|i| format!("/f{}.pdf", i)).collect();
+        let start = Instant::now();
+        for (chunk_hashes, chunk_paths) in hashes.chunks(32).zip(paths.chunks(32)) {
+            let items: Vec<BatchDocumentUpsert> = chunk_hashes
+                .iter()
+                .zip(chunk_paths.iter())
+                .map(|(h, p)| BatchDocumentUpsert {
+                    content_hash: h,
+                    file_path: p,
+                    file_type: "pdf",
+                    file_size: 100,
+                    modified_ts: 1,
+                    old_hash_to_delete: None,
+                    filename: "f.pdf",
+                    content_hash_before_tag: "x",
+                })
+                .collect();
+            store2.upsert_documents_batch(&items).unwrap();
+        }
+        let batched = start.elapsed();
+
+        eprintln!(
+            "per-file autocommit x5000: {:?}, batched x157: {:?}, speedup {:.1}x",
+            per_file,
+            batched,
+            per_file.as_secs_f64() / batched.as_secs_f64().max(1e-9)
+        );
     }
 
     #[test]
