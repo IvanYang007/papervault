@@ -14,7 +14,7 @@
 ```powershell
 cd D:\Github\papervalt2
 git checkout feat/auto-tagging-deepseek
-cargo test                    # Expect 93 passed, 0 failed
+cargo test                    # Expect 176 passed, 0 failed
 cargo build --release
 ```
 
@@ -116,7 +116,7 @@ Key log messages:
 
 | Feature | Test |
 |---------|------|
-| [ ] 93 tests pass | `cargo test` |
+| [ ] 176 tests pass | `cargo test` |
 | [ ] App starts | Launch exe |
 | [ ] Opt-in checkbox on import | Folder picker dialog |
 | [ ] Privacy disclosure visible | Text below checkbox |
