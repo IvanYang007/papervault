@@ -526,37 +526,6 @@ impl TagStore {
         })
     }
 
-    /// Get documents that need auto-tagging (status = 'pending'), ordered by creation time.
-    pub fn pending_auto_tags(&self, limit: usize) -> SqlResult<Vec<AutoTagStatus>> {
-        self.with_conn(|conn| {
-            let mut stmt = conn.prepare(
-                "SELECT content_hash, filename, content_hash_before_tag, status,
-                        tags_json, attempts, last_error, created_at, updated_at
-                 FROM auto_tag_status
-                 WHERE status = 'pending'
-                 ORDER BY created_at ASC
-                 LIMIT ?1",
-            )?;
-            let rows = stmt
-                .query_map(params![limit as i64], |row| {
-                    Ok(AutoTagStatus {
-                        content_hash: row.get(0)?,
-                        filename: row.get(1)?,
-                        content_hash_before_tag: row.get(2)?,
-                        status: row.get(3)?,
-                        tags_json: row.get(4)?,
-                        attempts: row.get(5)?,
-                        last_error: row.get(6)?,
-                        created_at: row.get(7)?,
-                        updated_at: row.get(8)?,
-                    })
-                })?
-                .filter_map(|r| r.ok())
-                .collect();
-            Ok(rows)
-        })
-    }
-
     /// Remove a specific tag from the auto-tag JSON for a document.
     pub fn dismiss_auto_tag(&self, content_hash: &str, tag_name: &str) -> SqlResult<()> {
         self.with_conn(|conn| {
@@ -1046,28 +1015,6 @@ mod tests {
             batch,
             per_row.as_secs_f64() / batch.as_secs_f64().max(1e-9)
         );
-    }
-
-    #[test]
-    fn pending_auto_tags_returns_only_pending() {
-        let (store, _dir) = setup_test_store();
-        store.upsert_document("h1", "/a.pdf", "pdf", 0, 0).unwrap();
-        store.upsert_document("h2", "/b.pdf", "pdf", 0, 0).unwrap();
-        store.upsert_document("h3", "/c.pdf", "pdf", 0, 0).unwrap();
-
-        store
-            .upsert_auto_tag_status("h1", "a.pdf", "x", "pending", None, None)
-            .unwrap();
-        store
-            .upsert_auto_tag_status("h2", "b.pdf", "y", "tagged", None, None)
-            .unwrap();
-        store
-            .upsert_auto_tag_status("h3", "c.pdf", "z", "failed", None, None)
-            .unwrap();
-
-        let pending = store.pending_auto_tags(10).unwrap();
-        assert_eq!(pending.len(), 1);
-        assert_eq!(pending[0].status, "pending");
     }
 
     #[test]
