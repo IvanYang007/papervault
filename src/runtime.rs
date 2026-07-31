@@ -67,6 +67,11 @@ impl FolderRuntime {
         }
         let at_shutdown = auto_tagger_shutdown.clone();
         let progress = Arc::new(AtomicUsize::new(0));
+        // Trip after 6 consecutive provider failures (2 per worker), reopen
+        // after 60s with a probe call.
+        let breaker = Arc::new(crate::auto_tagger::thread::ApiCircuitBreaker::new(
+            6, 60_000,
+        ));
         let num_workers = 3usize;
         let auto_tagger_handles: Vec<_> = (0..num_workers)
             .map(|i| {
@@ -81,6 +86,7 @@ impl FolderRuntime {
                 let rx = auto_tagger_rx.clone();
                 let sd = at_shutdown.clone();
                 let prg = progress.clone();
+                let brk = breaker.clone();
                 std::thread::Builder::new()
                     .name(format!("auto-tagger-{}", i))
                     .spawn(move || {
@@ -91,6 +97,7 @@ impl FolderRuntime {
                             at_config,
                             sd,
                             Some(prg),
+                            brk,
                         );
                     })
             })

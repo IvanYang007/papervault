@@ -8,6 +8,75 @@ use tracing::{debug, error, info, warn};
 use super::provider::TagProvider;
 use crate::tags::store::TagStore;
 
+/// Shared API circuit breaker for the auto-tagger workers.
+///
+/// When the provider is down (consecutive `Unavailable` errors), the breaker
+/// opens and every worker fails fast WITHOUT calling the API or sleeping —
+/// otherwise 3 workers x pending docs x 3 retries x 30s timeouts churn for
+/// hours against a dead endpoint. After the cooldown, one probe call is
+/// allowed (half-open); success closes the breaker, failure re-trips it.
+///
+/// Atomics only — safe to share across the worker threads.
+pub struct ApiCircuitBreaker {
+    consecutive_failures: AtomicUsize,
+    /// Millis since UNIX epoch when the breaker tripped (0 = closed).
+    tripped_at_ms: AtomicUsize,
+    trip_threshold: usize,
+    cooldown_ms: u64,
+}
+
+impl ApiCircuitBreaker {
+    pub fn new(trip_threshold: usize, cooldown_ms: u64) -> Self {
+        Self {
+            consecutive_failures: AtomicUsize::new(0),
+            tripped_at_ms: AtomicUsize::new(0),
+            trip_threshold: trip_threshold.max(1),
+            cooldown_ms,
+        }
+    }
+
+    fn now_ms() -> usize {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as usize)
+            .unwrap_or(0)
+    }
+
+    /// Whether an API call is allowed right now (closed, or half-open probe).
+    pub fn allow_request(&self) -> bool {
+        let tripped = self.tripped_at_ms.load(Ordering::Relaxed);
+        if tripped == 0 {
+            return true;
+        }
+        if Self::now_ms().saturating_sub(tripped) >= self.cooldown_ms as usize {
+            // Half-open: allow one probe and clear the stamp — a failure must
+            // re-trip through the threshold, a success closes the breaker.
+            let _ = self.tripped_at_ms.compare_exchange(
+                tripped,
+                0,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            );
+            return true;
+        }
+        false
+    }
+
+    /// Record a transient provider failure (5xx/timeout/network).
+    pub fn record_failure(&self) {
+        let n = self.consecutive_failures.fetch_add(1, Ordering::Relaxed) + 1;
+        if n >= self.trip_threshold {
+            self.tripped_at_ms.store(Self::now_ms(), Ordering::Relaxed);
+        }
+    }
+
+    /// Record a successful provider call — closes the breaker.
+    pub fn record_success(&self) {
+        self.consecutive_failures.store(0, Ordering::Relaxed);
+        self.tripped_at_ms.store(0, Ordering::Relaxed);
+    }
+}
+
 fn is_combining_mark(c: char) -> bool {
     matches!(
         c,
@@ -159,6 +228,7 @@ pub fn run_auto_tagger(
     auto_tag_config: crate::auto_tagger::config::AutoTagConfig,
     shutdown_flag: Arc<AtomicBool>,
     progress: Option<Arc<AtomicUsize>>,
+    breaker: Arc<ApiCircuitBreaker>,
 ) {
     info!("AutoTagger thread started");
     // Process any pending documents from DB (recovery after crash or channel
@@ -178,6 +248,7 @@ pub fn run_auto_tagger(
                 provider.as_ref(),
                 &auto_tag_config,
                 progress.as_deref(),
+                &breaker,
             );
         }
     }
@@ -193,6 +264,7 @@ pub fn run_auto_tagger(
                     provider.as_ref(),
                     &auto_tag_config,
                     progress.as_deref(),
+                    &breaker,
                 );
                 if is_shutdown {
                     break;
@@ -214,6 +286,7 @@ fn process_request(
     provider: &dyn TagProvider,
     config: &crate::auto_tagger::config::AutoTagConfig,
     progress: Option<&std::sync::atomic::AtomicUsize>,
+    breaker: &ApiCircuitBreaker,
 ) -> bool {
     match request {
         crate::app::AutoTagRequest::TagDocument {
@@ -231,6 +304,7 @@ fn process_request(
                 provider,
                 config,
                 progress,
+                breaker,
             );
             false
         }
@@ -251,6 +325,7 @@ fn tag_document(
     provider: &dyn TagProvider,
     config: &crate::auto_tagger::config::AutoTagConfig,
     progress: Option<&std::sync::atomic::AtomicUsize>,
+    breaker: &ApiCircuitBreaker,
 ) {
     if !config.enabled {
         debug!("auto-tagger disabled, skipping {filename}");
@@ -310,6 +385,26 @@ fn tag_document(
     }
 
     // Tier 3: AI fallback
+    // Circuit breaker: while the provider is down, fail fast — no API call,
+    // no retry sleeps. The docs stay marked 'failed' and can be re-queued
+    // after the outage (manual retag or re-index).
+    if !breaker.allow_request() {
+        info!("  → circuit breaker open — skipping AI call for {filename}");
+        let _ = tag_store
+            .upsert_auto_tag_status(
+                content_hash,
+                filename,
+                content_hash_before_tag,
+                "failed",
+                None,
+                Some("Skipped: API circuit breaker open (provider unavailable)"),
+            )
+            .map_err(|e| warn!("failed to write breaker skip for {content_hash}: {e}"));
+        if let Some(p) = progress {
+            p.fetch_add(1, Ordering::Relaxed);
+        }
+        return;
+    }
     info!("  → tier 3 (AI fallback): {filename} — calling DeepSeek");
     let existing_tags: Vec<String> = tag_store
         .list_tags()
@@ -322,6 +417,7 @@ fn tag_document(
     for attempt in 0..config.max_retries {
         match provider.generate_tags(filename, text, &existing_tags) {
             Ok(response) => {
+                breaker.record_success();
                 let mut entities = response.entities;
                 // Merge person names into tags — only one canonical form each
                 let mut all_tags = response.tags.clone();
@@ -375,6 +471,9 @@ fn tag_document(
             }
             Err(e) => {
                 let is_retryable = matches!(&e, super::provider::TagError::Unavailable(_));
+                if is_retryable {
+                    breaker.record_failure();
+                }
                 warn!(
                     "  ✗ AI attempt {}/{} for {filename}: {e}",
                     attempt + 1,
@@ -501,6 +600,123 @@ mod tests {
         assert!(t.contains(&"tax".to_string()));
     }
     #[test]
+    fn circuit_breaker_trips_after_threshold_and_resets_on_success() {
+        let breaker = ApiCircuitBreaker::new(3, 60_000);
+        assert!(breaker.allow_request(), "closed breaker allows calls");
+        breaker.record_failure();
+        breaker.record_failure();
+        assert!(breaker.allow_request(), "below threshold still allows");
+        breaker.record_failure();
+        assert!(
+            !breaker.allow_request(),
+            "threshold reached — circuit must be open"
+        );
+        breaker.record_success();
+        assert!(breaker.allow_request(), "success closes the circuit");
+    }
+
+    #[test]
+    fn circuit_breaker_reopens_after_cooldown() {
+        // 1ms cooldown: the half-open probe is allowed almost immediately.
+        let breaker = ApiCircuitBreaker::new(1, 1);
+        breaker.record_failure();
+        assert!(!breaker.allow_request());
+        std::thread::sleep(Duration::from_millis(10));
+        assert!(
+            breaker.allow_request(),
+            "after cooldown a probe call must be allowed"
+        );
+        // The probe re-trips on failure (threshold 1).
+        breaker.record_failure();
+        assert!(!breaker.allow_request());
+    }
+
+    #[test]
+    fn tag_document_skips_ai_call_when_breaker_open() {
+        use crate::auto_tagger::config::AutoTagConfig;
+        use crate::auto_tagger::provider::{Entities, TagError, TagProvider, TagResponse};
+        use rusqlite::Connection;
+
+        struct CountingProvider(std::sync::atomic::AtomicUsize);
+        impl TagProvider for CountingProvider {
+            fn generate_tags(
+                &self,
+                _: &str,
+                _: &str,
+                _: &[String],
+            ) -> Result<TagResponse, TagError> {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                Ok(TagResponse {
+                    tags: vec![],
+                    entities: Entities::default(),
+                })
+            }
+        }
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let conn = Connection::open(dir.path().join("test.db")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE documents (content_hash TEXT PRIMARY KEY, file_path TEXT NOT NULL, file_type TEXT NOT NULL, file_size INTEGER DEFAULT 0, modified_ts INTEGER DEFAULT 0, indexed_at TEXT DEFAULT '', last_error TEXT); CREATE TABLE tags (id INTEGER PRIMARY KEY, name TEXT UNIQUE NOT NULL); CREATE TABLE document_tags (content_hash TEXT REFERENCES documents ON DELETE CASCADE, tag_id INTEGER REFERENCES tags ON DELETE CASCADE, PRIMARY KEY(content_hash, tag_id)); CREATE TABLE auto_tag_status (content_hash TEXT PRIMARY KEY REFERENCES documents ON DELETE CASCADE, filename TEXT NOT NULL, content_hash_before_tag TEXT NOT NULL, status TEXT DEFAULT 'pending', tags_json TEXT, attempts INTEGER DEFAULT 0, last_error TEXT, created_at TEXT DEFAULT (datetime('now')), updated_at TEXT DEFAULT (datetime('now'))); CREATE TABLE auto_tag_cache (id INTEGER PRIMARY KEY AUTOINCREMENT, filename_tokens TEXT NOT NULL, tags_json TEXT NOT NULL, source_hash TEXT NOT NULL, hit_count INTEGER DEFAULT 1, created_at TEXT DEFAULT (datetime('now')), updated_at TEXT DEFAULT (datetime('now')));",
+        )
+        .unwrap();
+        let store = TagStore::new_for_test(conn);
+        store.upsert_document("h1", "/a.pdf", "pdf", 0, 0).unwrap();
+
+        let provider = CountingProvider(std::sync::atomic::AtomicUsize::new(0));
+        let config = AutoTagConfig::default(); // enabled = false
+        let breaker = ApiCircuitBreaker::new(1, 60_000);
+        breaker.record_failure(); // trip the breaker
+
+        let progress = Arc::new(AtomicUsize::new(0));
+        tag_document(
+            "h1",
+            "a.pdf",
+            "some text",
+            "hash-before",
+            &store,
+            &provider,
+            &config,
+            Some(&progress),
+            &breaker,
+        );
+
+        // Disabled config returns before the breaker — force enabled to reach
+        // the tier-3 skip path.
+        let mut config = config;
+        config.enabled = true;
+        let progress = Arc::new(AtomicUsize::new(0));
+        tag_document(
+            "h1",
+            "a.pdf",
+            "some text",
+            "hash-before",
+            &store,
+            &provider,
+            &config,
+            Some(&progress),
+            &breaker,
+        );
+
+        assert_eq!(
+            provider.0.load(Ordering::Relaxed),
+            0,
+            "no API call must be made while the breaker is open"
+        );
+        assert_eq!(progress.load(Ordering::Relaxed), 1);
+        let status = store.auto_tag_status("h1").unwrap().unwrap();
+        assert_eq!(status.status, "failed");
+        assert!(
+            status
+                .last_error
+                .as_deref()
+                .unwrap_or("")
+                .contains("circuit breaker"),
+            "status must record the breaker skip: {:?}",
+            status.last_error
+        );
+    }
+
+    #[test]
     fn shutdown_request_returns_true() {
         use crate::auto_tagger::config::AutoTagConfig;
         use crate::auto_tagger::provider::{Entities, TagError, TagProvider, TagResponse};
@@ -530,12 +746,14 @@ mod tests {
         let store = TagStore::new_for_test(conn);
         let provider = DummyProvider;
         let config = AutoTagConfig::default();
+        let breaker = ApiCircuitBreaker::new(1, 60_000);
         let result = process_request(
             crate::app::AutoTagRequest::Shutdown,
             &store,
             &provider,
             &config,
             None,
+            &breaker,
         );
         assert!(result, "Shutdown request should return true");
     }
