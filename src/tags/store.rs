@@ -21,6 +21,7 @@ impl TagStore {
              PRAGMA synchronous = NORMAL;",
         )
         .ok();
+        conn.set_prepared_statement_cache_capacity(64);
         Self {
             conn: Arc::new(Mutex::new(conn)),
         }
@@ -37,6 +38,8 @@ impl TagStore {
             "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys = ON;
              PRAGMA synchronous = NORMAL;",
         )?;
+        // ~25 distinct SQL statements are hot — keep them all compiled.
+        conn.set_prepared_statement_cache_capacity(64);
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS documents (
                 content_hash TEXT PRIMARY KEY,
@@ -108,7 +111,8 @@ impl TagStore {
 
     pub fn create_tag(&self, name: &str) -> SqlResult<Tag> {
         self.with_conn(|conn| {
-            conn.execute("INSERT INTO tags (name) VALUES (?1)", params![name])?;
+            conn.prepare_cached("INSERT INTO tags (name) VALUES (?1)")?
+                .execute(params![name])?;
             let id = conn.last_insert_rowid();
             Ok(Tag {
                 id,
@@ -119,7 +123,7 @@ impl TagStore {
 
     pub fn list_tags(&self) -> SqlResult<Vec<Tag>> {
         self.with_conn(|conn| {
-            let mut stmt = conn.prepare("SELECT id, name FROM tags ORDER BY name")?;
+            let mut stmt = conn.prepare_cached("SELECT id, name FROM tags ORDER BY name")?;
             let tags = stmt
                 .query_map([], |row| {
                     Ok(Tag {
@@ -136,7 +140,8 @@ impl TagStore {
     #[allow(dead_code)]
     pub fn delete_tag(&self, tag_id: i64) -> SqlResult<()> {
         self.with_conn(|conn| {
-            conn.execute("DELETE FROM tags WHERE id = ?1", params![tag_id])?;
+            conn.prepare_cached("DELETE FROM tags WHERE id = ?1")?
+                .execute(params![tag_id])?;
             Ok(())
         })
     }
@@ -145,10 +150,10 @@ impl TagStore {
 
     pub fn assign_tag(&self, content_hash: &str, tag_id: i64) -> SqlResult<()> {
         self.with_conn(|conn| {
-            conn.execute(
+            conn.prepare_cached(
                 "INSERT OR IGNORE INTO document_tags (content_hash, tag_id) VALUES (?1, ?2)",
-                params![content_hash, tag_id],
-            )?;
+            )?
+            .execute(params![content_hash, tag_id])?;
             Ok(())
         })
     }
@@ -156,17 +161,17 @@ impl TagStore {
     #[allow(dead_code)]
     pub fn remove_tag(&self, content_hash: &str, tag_id: i64) -> SqlResult<()> {
         self.with_conn(|conn| {
-            conn.execute(
+            conn.prepare_cached(
                 "DELETE FROM document_tags WHERE content_hash = ?1 AND tag_id = ?2",
-                params![content_hash, tag_id],
-            )?;
+            )?
+            .execute(params![content_hash, tag_id])?;
             Ok(())
         })
     }
 
     pub fn get_tags_for_document(&self, content_hash: &str) -> SqlResult<Vec<Tag>> {
         self.with_conn(|conn| {
-            let mut stmt = conn.prepare(
+            let mut stmt = conn.prepare_cached(
                 "SELECT t.id, t.name FROM tags t
                  JOIN document_tags dt ON t.id = dt.tag_id
                  WHERE dt.content_hash = ?1 ORDER BY t.name",
@@ -202,7 +207,7 @@ impl TagStore {
                     "SELECT dt.content_hash, t.id, t.name FROM document_tags dt JOIN tags t ON dt.tag_id = t.id WHERE dt.content_hash IN ({}) ORDER BY t.name",
                     placeholders
                 );
-                let mut stmt = conn.prepare(&sql)?;
+                let mut stmt = conn.prepare_cached(&sql)?;
                 let params: Vec<&dyn rusqlite::types::ToSql> = chunk
                     .iter()
                     .map(|s| s as &dyn rusqlite::types::ToSql)
@@ -228,7 +233,7 @@ impl TagStore {
     pub fn get_documents_with_tag(&self, tag_id: i64) -> SqlResult<Vec<String>> {
         self.with_conn(|conn| {
             let mut stmt =
-                conn.prepare("SELECT content_hash FROM document_tags WHERE tag_id = ?1")?;
+                conn.prepare_cached("SELECT content_hash FROM document_tags WHERE tag_id = ?1")?;
             let hashes = stmt
                 .query_map(params![tag_id], |row| row.get::<_, String>(0))?
                 .filter_map(|r| r.ok())
@@ -246,7 +251,7 @@ impl TagStore {
         mtime: u64,
     ) -> SqlResult<bool> {
         self.with_conn(|conn| {
-            let mut stmt = conn.prepare(
+            let mut stmt = conn.prepare_cached(
                 "SELECT COUNT(*) FROM documents
                  WHERE file_path = ?1 AND file_size = ?2 AND modified_ts = ?3",
             )?;
@@ -260,7 +265,7 @@ impl TagStore {
     pub fn already_indexed_by_hash(&self, content_hash: &str) -> SqlResult<bool> {
         self.with_conn(|conn| {
             let mut stmt =
-                conn.prepare("SELECT COUNT(*) FROM documents WHERE content_hash = ?1")?;
+                conn.prepare_cached("SELECT COUNT(*) FROM documents WHERE content_hash = ?1")?;
             let count: i64 = stmt.query_row(params![content_hash], |r| r.get(0))?;
             Ok(count > 0)
         })
@@ -269,10 +274,8 @@ impl TagStore {
     #[allow(dead_code)] // used by test and prior dedup path
     pub fn update_path(&self, content_hash: &str, new_path: &str) -> SqlResult<()> {
         self.with_conn(|conn| {
-            conn.execute(
-                "UPDATE documents SET file_path = ?1 WHERE content_hash = ?2",
-                params![new_path, content_hash],
-            )?;
+            conn.prepare_cached("UPDATE documents SET file_path = ?1 WHERE content_hash = ?2")?
+                .execute(params![new_path, content_hash])?;
             Ok(())
         })
     }
@@ -300,7 +303,8 @@ impl TagStore {
 
     pub fn delete_document_by_path(&self, path: &str) -> SqlResult<()> {
         self.with_conn(|conn| {
-            conn.execute("DELETE FROM documents WHERE file_path = ?1", params![path])?;
+            conn.prepare_cached("DELETE FROM documents WHERE file_path = ?1")?
+                .execute(params![path])?;
             Ok(())
         })
     }
@@ -308,7 +312,7 @@ impl TagStore {
     pub fn get_hash_by_path(&self, path: &str) -> SqlResult<Option<String>> {
         self.with_conn(|conn| {
             let mut stmt =
-                conn.prepare("SELECT content_hash FROM documents WHERE file_path = ?1")?;
+                conn.prepare_cached("SELECT content_hash FROM documents WHERE file_path = ?1")?;
             match stmt.query_row(params![path], |row| row.get(0)) {
                 Ok(hash) => Ok(Some(hash)),
                 Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
@@ -320,7 +324,7 @@ impl TagStore {
     /// List all indexed documents for the file browser.
     pub fn list_all_documents(&self) -> SqlResult<Vec<DocumentInfo>> {
         self.with_conn(|conn| {
-            let mut stmt = conn.prepare(
+            let mut stmt = conn.prepare_cached(
                 "SELECT d.file_path, d.file_type, d.content_hash, d.file_size, d.modified_ts,
                         CASE WHEN a.status = 'tagged' THEN 1 ELSE 0 END
                  FROM documents d
@@ -374,11 +378,8 @@ fn upsert_document_sql(
     file_size: i64,
     modified_ts: i64,
 ) -> rusqlite::Result<()> {
-    conn.execute(
-        "INSERT OR REPLACE INTO documents (content_hash, file_path, file_type, file_size, modified_ts, indexed_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, datetime('now'))",
-        params![content_hash, file_path, file_type, file_size, modified_ts],
-    )?;
+    conn.prepare_cached("INSERT OR REPLACE INTO documents (content_hash, file_path, file_type, file_size, modified_ts, indexed_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, datetime('now'))")?.execute(params![content_hash, file_path, file_type, file_size, modified_ts])?;
     Ok(())
 }
 
@@ -392,19 +393,16 @@ fn upsert_auto_tag_status_sql(
     tags_json: Option<&str>,
     last_error: Option<&str>,
 ) -> rusqlite::Result<()> {
-    conn.execute(
-        "INSERT OR REPLACE INTO auto_tag_status
+    conn.prepare_cached("INSERT OR REPLACE INTO auto_tag_status
          (content_hash, filename, content_hash_before_tag, status, tags_json, last_error, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, datetime('now'))",
-        params![
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, datetime('now'))")?.execute(params![
             content_hash,
             filename,
             content_hash_before_tag,
             status,
             tags_json,
             last_error
-        ],
-    )?;
+        ])?;
     Ok(())
 }
 
@@ -471,7 +469,7 @@ impl TagStore {
     /// Get auto-tagging status for a document.
     pub fn auto_tag_status(&self, content_hash: &str) -> SqlResult<Option<AutoTagStatus>> {
         self.with_conn(|conn| {
-            let mut stmt = conn.prepare(
+            let mut stmt = conn.prepare_cached(
                 "SELECT content_hash, filename, content_hash_before_tag, status,
                         tags_json, attempts, last_error, created_at, updated_at
                  FROM auto_tag_status WHERE content_hash = ?1",
@@ -517,7 +515,7 @@ impl TagStore {
                      FROM auto_tag_status WHERE content_hash IN ({})",
                     placeholders
                 );
-                let mut stmt = conn.prepare(&sql)?;
+                let mut stmt = conn.prepare_cached(&sql)?;
                 let params: Vec<&dyn rusqlite::types::ToSql> = chunk
                     .iter()
                     .map(|s| s as &dyn rusqlite::types::ToSql)
@@ -548,10 +546,10 @@ impl TagStore {
     /// rows a live worker already claimed.
     pub fn reset_stale_processing(&self) -> SqlResult<()> {
         self.with_conn(|conn| {
-            conn.execute(
+            conn.prepare_cached(
                 "UPDATE auto_tag_status SET status = 'pending' WHERE status = 'processing'",
-                [],
-            )?;
+            )?
+            .execute([])?;
             Ok(())
         })
     }
@@ -561,7 +559,7 @@ impl TagStore {
     /// even when multiple workers call concurrently (single UPDATE statement).
     pub fn claim_pending_auto_tags(&self, limit: usize) -> SqlResult<Vec<AutoTagStatus>> {
         self.with_conn(|conn| {
-            let mut stmt = conn.prepare(
+            let mut stmt = conn.prepare_cached(
                 "UPDATE auto_tag_status SET status = 'processing'
                  WHERE content_hash IN (
                     SELECT content_hash FROM auto_tag_status
@@ -593,7 +591,7 @@ impl TagStore {
     /// Remove a specific tag from the auto-tag JSON for a document.
     pub fn dismiss_auto_tag(&self, content_hash: &str, tag_name: &str) -> SqlResult<()> {
         self.with_conn(|conn| {
-            let mut stmt = conn.prepare(
+            let mut stmt = conn.prepare_cached(
                 "SELECT tags_json FROM auto_tag_status WHERE content_hash = ?1",
             )?;
             let json: Option<String> =
@@ -608,10 +606,7 @@ impl TagStore {
                         }
                     }
                     let updated = serde_json::to_string(&value).unwrap_or(json_str);
-                    conn.execute(
-                        "UPDATE auto_tag_status SET tags_json = ?1, updated_at = datetime('now') WHERE content_hash = ?2",
-                        params![updated, content_hash],
-                    )?;
+                    conn.prepare_cached("UPDATE auto_tag_status SET tags_json = ?1, updated_at = datetime('now') WHERE content_hash = ?2")?.execute(params![updated, content_hash])?;
                 }
             }
             Ok(())
@@ -629,10 +624,8 @@ impl TagStore {
                 if let Some(old_hash) = item.old_hash_to_delete {
                     // Delete the old row by path (same semantics as
                     // delete_document_by_path, inside this transaction).
-                    tx.execute(
-                        "DELETE FROM documents WHERE file_path = ?1",
-                        params![item.file_path],
-                    )?;
+                    tx.prepare_cached("DELETE FROM documents WHERE file_path = ?1")?
+                        .execute(params![item.file_path])?;
                     debug_assert_ne!(old_hash, item.content_hash);
                 }
                 upsert_document_sql(
@@ -676,7 +669,7 @@ impl TagStore {
                 tokens.iter().map(|s| s.as_str()).collect();
 
             let mut stmt =
-                conn.prepare("SELECT filename_tokens, tags_json FROM auto_tag_cache ORDER BY hit_count DESC LIMIT 200")?;
+                conn.prepare_cached("SELECT filename_tokens, tags_json FROM auto_tag_cache ORDER BY hit_count DESC LIMIT 200")?;
             let rows: Vec<(String, String)> = stmt
                 .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
                 .filter_map(|r| r.ok())
@@ -718,15 +711,9 @@ impl TagStore {
                 .ok();
 
             if let Some((id, hit_count)) = existing {
-                tx.execute(
-                    "UPDATE auto_tag_cache SET tags_json = ?1, hit_count = ?2, updated_at = datetime('now') WHERE id = ?3",
-                    params![tags_json, hit_count + 1, id],
-                )?;
+                tx.prepare_cached("UPDATE auto_tag_cache SET tags_json = ?1, hit_count = ?2, updated_at = datetime('now') WHERE id = ?3")?.execute(params![tags_json, hit_count + 1, id])?;
             } else {
-                tx.execute(
-                    "INSERT INTO auto_tag_cache (filename_tokens, tags_json, source_hash) VALUES (?1, ?2, ?3)",
-                    params![filename_tokens, tags_json, source_hash],
-                )?;
+                tx.prepare_cached("INSERT INTO auto_tag_cache (filename_tokens, tags_json, source_hash) VALUES (?1, ?2, ?3)")?.execute(params![filename_tokens, tags_json, source_hash])?;
                 // Evict the least-used rows beyond the cap (hit_count index
                 // makes the ORDER BY an index scan).
                 let overflow: i64 = tx.query_row(
@@ -735,14 +722,11 @@ impl TagStore {
                     |row| row.get(0),
                 )?;
                 if overflow > 0 {
-                    tx.execute(
-                        "DELETE FROM auto_tag_cache WHERE id IN (
+                    tx.prepare_cached("DELETE FROM auto_tag_cache WHERE id IN (
                             SELECT id FROM auto_tag_cache
                             ORDER BY hit_count ASC, updated_at ASC
                             LIMIT ?1
-                        )",
-                        params![overflow],
-                    )?;
+                        )")?.execute(params![overflow])?;
                 }
             }
             tx.commit()?;
@@ -1257,10 +1241,10 @@ mod tests {
         // Simulate a crash mid-processing: the row is stuck 'processing'.
         store
             .with_conn(|conn| {
-                conn.execute(
+                conn.prepare_cached(
                     "UPDATE auto_tag_status SET status = 'processing' WHERE content_hash = 'h1'",
-                    [],
-                )?;
+                )?
+                .execute([])?;
                 Ok(())
             })
             .unwrap();
@@ -1642,11 +1626,11 @@ mod tests {
             .with_conn(|conn| {
                 let tx = conn.transaction()?;
                 for i in 0..(CACHE_MAX_ROWS + 50) {
-                    tx.execute(
+                    tx.prepare_cached(
                         "INSERT INTO auto_tag_cache (filename_tokens, tags_json, source_hash)
                          VALUES (?1, '{}', 'src')",
-                        params![format!("tokens{}", i)],
-                    )?;
+                    )?
+                    .execute(params![format!("tokens{}", i)])?;
                 }
                 tx.commit()?;
                 Ok(())
@@ -1659,7 +1643,8 @@ mod tests {
             .unwrap();
         let count: i64 = store
             .with_conn(|conn| {
-                conn.query_row("SELECT COUNT(*) FROM auto_tag_cache", [], |r| r.get(0))
+                conn.prepare_cached("SELECT COUNT(*) FROM auto_tag_cache")?
+                    .query_row([], |r| r.get(0))
             })
             .unwrap();
         assert_eq!(
@@ -1669,11 +1654,10 @@ mod tests {
         // The new entry survives the eviction.
         let hits = store
             .with_conn(|conn| {
-                conn.query_row(
+                conn.prepare_cached(
                     "SELECT COUNT(*) FROM auto_tag_cache WHERE filename_tokens = 'brand-new-tokens'",
-                    [],
-                    |r| r.get::<_, i64>(0),
-                )
+                )?
+                .query_row([], |r| r.get::<_, i64>(0))
             })
             .unwrap();
         assert_eq!(hits, 1);
@@ -1686,17 +1670,17 @@ mod tests {
             .with_conn(|conn| {
                 let tx = conn.transaction()?;
                 for i in 0..(CACHE_MAX_ROWS + 50) {
-                    tx.execute(
+                    tx.prepare_cached(
                         "INSERT INTO auto_tag_cache (filename_tokens, tags_json, source_hash)
                          VALUES (?1, '{}', 'src')",
-                        params![format!("tokens{}", i)],
-                    )?;
+                    )?
+                    .execute(params![format!("tokens{}", i)])?;
                 }
                 // Make one row heavily used — eviction must keep it.
-                tx.execute(
+                tx.prepare_cached(
                     "UPDATE auto_tag_cache SET hit_count = 500 WHERE filename_tokens = 'tokens0'",
-                    [],
-                )?;
+                )?
+                .execute([])?;
                 tx.commit()?;
                 Ok(())
             })
@@ -1707,17 +1691,17 @@ mod tests {
             .unwrap();
         let survivors: i64 = store
             .with_conn(|conn| {
-                conn.query_row(
+                conn.prepare_cached(
                     "SELECT COUNT(*) FROM auto_tag_cache WHERE filename_tokens = 'tokens0'",
-                    [],
-                    |r| r.get(0),
-                )
+                )?
+                .query_row([], |r| r.get(0))
             })
             .unwrap();
         assert_eq!(survivors, 1, "high-hit rows must survive eviction");
         let count: i64 = store
             .with_conn(|conn| {
-                conn.query_row("SELECT COUNT(*) FROM auto_tag_cache", [], |r| r.get(0))
+                conn.prepare_cached("SELECT COUNT(*) FROM auto_tag_cache")?
+                    .query_row([], |r| r.get(0))
             })
             .unwrap();
         assert_eq!(count, CACHE_MAX_ROWS);
