@@ -100,6 +100,49 @@ fn format_file_size(size: u64) -> String {
     }
 }
 
+/// Pre-rendered file browser row — display strings are computed once per
+/// refresh, so the per-frame render loop only borrows them (no allocations,
+/// no date formatting, no size formatting per row per frame).
+struct FileBrowserRow {
+    file_path: String,
+    content_hash: String,
+    has_tags: bool,
+    /// e.g. "📄 ✨ 2023-tax-return.pdf"
+    label: String,
+    /// e.g. "2023-11-15 10:30 · 1.2 MB"
+    date_size: String,
+}
+
+/// Build pre-rendered rows for the file browser panel.
+fn build_file_browser_rows(docs: &[DocumentInfo]) -> Vec<FileBrowserRow> {
+    docs.iter()
+        .map(|doc| {
+            let file_name = std::path::Path::new(&doc.file_path)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(&doc.file_path);
+            let icon = match doc.file_type.as_str() {
+                PDF_TYPE => "📄",
+                "txt" => "📝",
+                "md" => "📋",
+                _ => "📎",
+            };
+            let sparkle = if doc.has_tags { "✨" } else { "" };
+            let date_str = DateTime::from_timestamp(doc.modified_ts as i64, 0)
+                .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
+                .unwrap_or_default();
+            let size_str = format_file_size(doc.file_size);
+            FileBrowserRow {
+                file_path: doc.file_path.clone(),
+                content_hash: doc.content_hash.clone(),
+                has_tags: doc.has_tags,
+                label: format!("{} {}{}", icon, sparkle, file_name),
+                date_size: format!("{} · {}", date_str, size_str),
+            }
+        })
+        .collect()
+}
+
 /// Messages from the indexer thread to the UI thread.
 #[derive(Debug, Clone)]
 pub enum IndexerProgress {
@@ -248,6 +291,8 @@ pub struct PapervaultApp {
     background_error: Option<Arc<Mutex<Option<String>>>>,
     /// Cached file list for the file browser panel.
     file_browser_docs: Vec<DocumentInfo>,
+    /// Pre-rendered rows for the file browser (see FileBrowserRow).
+    file_browser_rows: Vec<FileBrowserRow>,
     /// Whether the file browser needs a refresh.
     file_browser_dirty: bool,
     /// Cooldown counter: only refresh file browser every N frames during active indexing.
@@ -355,6 +400,7 @@ impl PapervaultApp {
             pending_runtime: None,
             background_error: None,
             file_browser_docs: Vec::new(),
+            file_browser_rows: Vec::new(),
             file_browser_dirty: true,
             file_browser_refresh_cooldown: 0,
             file_browser_periodic_timer: 0,
@@ -1595,6 +1641,9 @@ impl eframe::App for PapervaultApp {
                     self.sort_column,
                     self.sort_direction,
                 );
+                // Pre-render display strings once per refresh — the per-frame
+                // loop below must not format dates/sizes or allocate per row.
+                self.file_browser_rows = build_file_browser_rows(&self.file_browser_docs);
                 self.file_browser_dirty = false;
             }
 
@@ -1698,55 +1747,45 @@ impl eframe::App for PapervaultApp {
                     let ctrl_held = ui.input(|i| i.modifiers.ctrl);
                     let mut clicked_file: Option<String> = None;
                     let mut toggled_file: Option<String> = None;
+                    // Fixed row height — required by show_rows virtualization.
+                    // (The browsed file's auto-tags moved to a footer below the
+                    // list so rows stay uniform.)
+                    let row_height = 30.0;
                     ScrollArea::vertical()
                         .id_salt("file_browser_scroll")
-                        .show(ui, |ui| {
-                            for doc in &self.file_browser_docs {
-                                let file_name = std::path::Path::new(&doc.file_path)
-                                    .file_name()
-                                    .and_then(|n| n.to_str())
-                                    .unwrap_or(&doc.file_path);
-                                let icon = match doc.file_type.as_str() {
-                                    PDF_TYPE => "📄",
-                                    "txt" => "📝",
-                                    "md" => "📋",
-                                    _ => "📎",
-                                };
-                                let sparkle = if doc.has_tags { "✨" } else { "" };
-                                let is_selected = self.selected_files.contains(&doc.file_path);
+                        .show_rows(ui, row_height, self.file_browser_rows.len(), |ui, range| {
+                            for idx in range {
+                                let row = &self.file_browser_rows[idx];
+                                let is_selected = self.selected_files.contains(&row.file_path);
                                 let is_browsed =
-                                    self.browsed_file.as_deref() == Some(&doc.file_path);
+                                    self.browsed_file.as_deref() == Some(&row.file_path);
                                 // Background for selected files
                                 let sel_bg = if is_selected {
                                     Color32::from_rgb(40, 80, 40)
                                 } else {
                                     Color32::TRANSPARENT
                                 };
-                                let label = format!("{} {}{}", icon, sparkle, file_name);
-                                let date_str = DateTime::from_timestamp(doc.modified_ts as i64, 0)
-                                    .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
-                                    .unwrap_or_default();
-                                let size_str = format_file_size(doc.file_size);
+                                ui.set_min_height(row_height);
                                 let resp = Frame::default()
                                     .fill(sel_bg)
                                     .rounding(egui::Rounding::same(2.0))
                                     .show(ui, |ui| {
                                         ui.horizontal(|ui| {
-                                            // Left: clickable filename (selectable_label
-                                            // provides click sense and browsed highlight)
+                                            // Left: clickable filename
+                                            // (selectable_label provides click
+                                            // sense and browsed highlight)
                                             let label_resp =
-                                                ui.selectable_label(is_browsed, &label);
+                                                ui.selectable_label(is_browsed, &row.label);
                                             // Right: date · size, pushed to the edge
                                             ui.with_layout(
                                                 egui::Layout::right_to_left(egui::Align::Center),
                                                 |ui| {
                                                     ui.label(
-                                                        RichText::new(format!(
-                                                            "{} · {}",
-                                                            date_str, size_str
-                                                        ))
-                                                        .size(11.0)
-                                                        .color(Color32::from_rgb(150, 150, 150)),
+                                                        RichText::new(&row.date_size)
+                                                            .size(11.0)
+                                                            .color(Color32::from_rgb(
+                                                                150, 150, 150,
+                                                            )),
                                                     );
                                                 },
                                             );
@@ -1756,31 +1795,39 @@ impl eframe::App for PapervaultApp {
                                     });
                                 if resp.inner.clicked() {
                                     if ctrl_held {
-                                        toggled_file = Some(doc.file_path.clone());
+                                        toggled_file = Some(row.file_path.clone());
                                     } else {
-                                        self.selected_hash = Some(doc.content_hash.clone());
-                                        clicked_file = Some(doc.file_path.clone());
-                                    }
-                                }
-                                // Show auto-tags inline for browsed file
-                                if is_browsed && doc.has_tags {
-                                    let tags = Self::tags_from_cache(
-                                        &self.auto_tag_cache,
-                                        &doc.content_hash,
-                                    )
-                                    .unwrap_or_default();
-                                    if !tags.is_empty() {
-                                        let preview: Vec<&str> =
-                                            tags.iter().map(|s| s.as_str()).take(5).collect();
-                                        ui.label(
-                                            RichText::new(format!("  🏷 {}", preview.join(", ")))
-                                                .size(10.0)
-                                                .color(Color32::from_rgb(140, 160, 200)),
-                                        );
+                                        self.selected_hash = Some(row.content_hash.clone());
+                                        clicked_file = Some(row.file_path.clone());
                                     }
                                 }
                             }
                         });
+                    // Auto-tags for the browsed file — shown below the list so
+                    // virtualized rows keep a uniform height.
+                    if let Some(ref browsed) = self.browsed_file {
+                        let row = self
+                            .file_browser_rows
+                            .iter()
+                            .find(|r| r.file_path == *browsed);
+                        if let Some(row) = row {
+                            if row.has_tags {
+                                let tags =
+                                    Self::tags_from_cache(&self.auto_tag_cache, &row.content_hash)
+                                        .unwrap_or_default();
+                                if !tags.is_empty() {
+                                    ui.add_space(4.0);
+                                    let preview: Vec<&str> =
+                                        tags.iter().map(|s| s.as_str()).take(5).collect();
+                                    ui.label(
+                                        RichText::new(format!("🏷 {}", preview.join(", ")))
+                                            .size(10.0)
+                                            .color(Color32::from_rgb(140, 160, 200)),
+                                    );
+                                }
+                            }
+                        }
+                    }
                     if let Some(path) = clicked_file {
                         self.selected_files.clear();
                         self.browse_file(&path);
@@ -2438,6 +2485,40 @@ mod tests {
         sort_docs(&mut docs, SortColumn::Size, SortDirection::Ascending);
         let names: Vec<&str> = docs.iter().map(|d| d.file_path.as_str()).collect();
         assert_eq!(names, vec!["/b.pdf", "/a.txt"]);
+    }
+
+    // ── build_file_browser_rows tests ──
+
+    #[test]
+    fn build_file_browser_rows_precomputes_display_strings() {
+        let mut docs = vec![
+            make_doc("/docs/Tax Return.pdf", "pdf", 1_048_576, 1700044200),
+            make_doc("/docs/notes.txt", "txt", 512, 0),
+            make_doc("/docs/archive.tar.gz", "gz", 1024, 0),
+        ];
+        docs[0].has_tags = true;
+        docs[0].content_hash = "abc".into();
+
+        let rows = build_file_browser_rows(&docs);
+        assert_eq!(rows.len(), 3);
+        // PDF row: icon + sparkle + name; size + separator formatted once.
+        assert_eq!(rows[0].label, "📄 ✨Tax Return.pdf");
+        assert!(
+            rows[0].date_size.contains("1.0 MB"),
+            "{}",
+            rows[0].date_size
+        );
+        assert!(rows[0].date_size.contains(" · "), "{}", rows[0].date_size);
+        // Plain txt row: no sparkle.
+        assert_eq!(rows[1].label, "📝 notes.txt");
+        assert!(rows[1].date_size.contains("512 B"), "{}", rows[1].date_size);
+        // Unknown type: generic icon.
+        assert_eq!(rows[2].label, "📎 archive.tar.gz");
+        // Identity fields survive for click handling.
+        assert_eq!(rows[0].file_path, "/docs/Tax Return.pdf");
+        assert_eq!(rows[0].content_hash, "abc");
+        assert!(rows[0].has_tags);
+        assert!(!rows[1].has_tags);
     }
 
     // ── select_result / browse_file state transition tests ──
