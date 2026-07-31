@@ -57,6 +57,11 @@ impl FolderRuntime {
 
         // ── Auto-Tagger ──
         let auto_tag_config = crate::auto_tagger::config::AutoTagConfig::load();
+        // Reset rows left 'processing' by a crashed session. Must run before
+        // workers spawn — claims below are exclusive per worker.
+        if let Err(e) = tag_store.reset_stale_processing() {
+            tracing::warn!("Failed to reset stale auto-tag rows: {}", e);
+        }
         let at_shutdown = auto_tagger_shutdown.clone();
         let progress = Arc::new(AtomicUsize::new(0));
         let num_workers = 3usize;

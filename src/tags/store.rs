@@ -479,6 +479,53 @@ impl TagStore {
         })
     }
 
+    /// Reset rows left `processing` by a crashed session.
+    /// Must run once BEFORE workers spawn — a concurrent reset would clobber
+    /// rows a live worker already claimed.
+    pub fn reset_stale_processing(&self) -> SqlResult<()> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "UPDATE auto_tag_status SET status = 'pending' WHERE status = 'processing'",
+                [],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Atomically claim up to `limit` rows that need tagging.
+    /// Claims are exclusive — each row is returned to exactly one caller,
+    /// even when multiple workers call concurrently (single UPDATE statement).
+    pub fn claim_pending_auto_tags(&self, limit: usize) -> SqlResult<Vec<AutoTagStatus>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "UPDATE auto_tag_status SET status = 'processing'
+                 WHERE content_hash IN (
+                    SELECT content_hash FROM auto_tag_status
+                    WHERE status = 'pending' ORDER BY created_at ASC LIMIT ?1
+                 )
+                 RETURNING content_hash, filename, content_hash_before_tag, status,
+                           tags_json, attempts, last_error, created_at, updated_at",
+            )?;
+            let rows = stmt
+                .query_map(params![limit as i64], |row| {
+                    Ok(AutoTagStatus {
+                        content_hash: row.get(0)?,
+                        filename: row.get(1)?,
+                        content_hash_before_tag: row.get(2)?,
+                        status: row.get(3)?,
+                        tags_json: row.get(4)?,
+                        attempts: row.get(5)?,
+                        last_error: row.get(6)?,
+                        created_at: row.get(7)?,
+                        updated_at: row.get(8)?,
+                    })
+                })?
+                .filter_map(|r| r.ok())
+                .collect();
+            Ok(rows)
+        })
+    }
+
     /// Get documents that need auto-tagging (status = 'pending'), ordered by creation time.
     pub fn pending_auto_tags(&self, limit: usize) -> SqlResult<Vec<AutoTagStatus>> {
         self.with_conn(|conn| {
@@ -1021,6 +1068,138 @@ mod tests {
         let pending = store.pending_auto_tags(10).unwrap();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].status, "pending");
+    }
+
+    #[test]
+    fn claim_pending_auto_tags_returns_disjoint_batches() {
+        let (store, _dir) = setup_test_store();
+        for i in 0..5 {
+            store
+                .upsert_document(&format!("h{}", i), "/a.pdf", "pdf", 0, 0)
+                .unwrap();
+            store
+                .upsert_auto_tag_status(&format!("h{}", i), "a.pdf", "x", "pending", None, None)
+                .unwrap();
+        }
+
+        // Simulate 3 workers claiming in sequence: no row may be claimed twice.
+        let batch1 = store.claim_pending_auto_tags(2).unwrap();
+        let batch2 = store.claim_pending_auto_tags(2).unwrap();
+        let batch3 = store.claim_pending_auto_tags(10).unwrap();
+
+        assert_eq!(batch1.len(), 2);
+        assert_eq!(batch2.len(), 2);
+        assert_eq!(batch3.len(), 1);
+        let mut all: Vec<String> = batch1
+            .into_iter()
+            .chain(batch2)
+            .chain(batch3)
+            .map(|s| s.content_hash)
+            .collect();
+        all.sort();
+        let unique: std::collections::HashSet<&str> = all.iter().map(|s| s.as_str()).collect();
+        assert_eq!(
+            unique.len(),
+            all.len(),
+            "each row must be claimed exactly once: {:?}",
+            all
+        );
+        assert_eq!(all.len(), 5, "all pending rows must be claimed");
+
+        // No pending rows remain for a fourth claim.
+        assert!(store.claim_pending_auto_tags(10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn claim_pending_auto_tags_skips_non_pending_rows() {
+        let (store, _dir) = setup_test_store();
+        for (h, status) in [("h1", "pending"), ("h2", "tagged"), ("h3", "failed")] {
+            store.upsert_document(h, "/a.pdf", "pdf", 0, 0).unwrap();
+            store
+                .upsert_auto_tag_status(h, "a.pdf", "x", status, None, None)
+                .unwrap();
+        }
+
+        let claimed = store.claim_pending_auto_tags(10).unwrap();
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].content_hash, "h1");
+    }
+
+    #[test]
+    fn claim_pending_auto_tags_concurrent_workers_no_duplicates() {
+        let (store, _dir) = setup_test_store();
+        for i in 0..300 {
+            store
+                .upsert_document(&format!("h{}", i), "/a.pdf", "pdf", 0, 0)
+                .unwrap();
+            store
+                .upsert_auto_tag_status(&format!("h{}", i), "a.pdf", "x", "pending", None, None)
+                .unwrap();
+        }
+
+        // 3 workers claim concurrently, exactly like FolderRuntime::start.
+        let workers: Vec<_> = (0..3)
+            .map(|_| {
+                let store = store.clone();
+                std::thread::spawn(move || {
+                    store
+                        .claim_pending_auto_tags(100)
+                        .unwrap()
+                        .into_iter()
+                        .map(|s| s.content_hash)
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        let mut all: Vec<String> = workers
+            .into_iter()
+            .flat_map(|w| w.join().unwrap())
+            .collect();
+        assert_eq!(
+            all.len(),
+            300,
+            "all pending rows must be claimed exactly once"
+        );
+        all.sort();
+        let unique: std::collections::HashSet<&str> = all.iter().map(|s| s.as_str()).collect();
+        assert_eq!(
+            unique.len(),
+            300,
+            "concurrent claims must be disjoint — duplicates: {:?}",
+            all.iter()
+                .enumerate()
+                .filter(|(i, h)| all.iter().position(|x| x == *h) != Some(*i))
+                .map(|(_, h)| h)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn reset_stale_processing_makes_rows_claimable() {
+        let (store, _dir) = setup_test_store();
+        store.upsert_document("h1", "/a.pdf", "pdf", 0, 0).unwrap();
+        store
+            .upsert_auto_tag_status("h1", "a.pdf", "x", "pending", None, None)
+            .unwrap();
+        // Simulate a crash mid-processing: the row is stuck 'processing'.
+        store
+            .with_conn(|conn| {
+                conn.execute(
+                    "UPDATE auto_tag_status SET status = 'processing' WHERE content_hash = 'h1'",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        store.reset_stale_processing().unwrap();
+        let claimed = store.claim_pending_auto_tags(10).unwrap();
+        assert_eq!(
+            claimed.len(),
+            1,
+            "stale processing row must be re-claimable"
+        );
+        assert_eq!(claimed[0].content_hash, "h1");
     }
 
     #[test]

@@ -161,8 +161,10 @@ pub fn run_auto_tagger(
     progress: Option<Arc<AtomicUsize>>,
 ) {
     info!("AutoTagger thread started");
-    // Process any pending documents from DB (recovery after crash or channel drops)
-    if let Ok(pending) = tag_store.pending_auto_tags(100) {
+    // Process any pending documents from DB (recovery after crash or channel
+    // drops). claim_pending_auto_tags is atomic — concurrent workers each get
+    // a disjoint batch, so no document is ever sent to the API twice.
+    if let Ok(pending) = tag_store.claim_pending_auto_tags(100) {
         for p in pending {
             if shutdown_flag.load(Ordering::Acquire) {
                 break;
