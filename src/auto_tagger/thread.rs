@@ -224,6 +224,28 @@ pub fn normalize_person_name(name: &str) -> Vec<String> {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Re-extract the document text for a DB-claimed row so the AI tags the
+/// real content instead of only the filename. Falls back to empty text
+/// when the file is missing or extraction fails (previous behavior).
+fn claimed_row_text(
+    tag_store: &TagStore,
+    content_hash: &str,
+    stages: &[Box<dyn crate::indexer::extractors::Extractor>],
+) -> String {
+    let path = match tag_store.file_path_for_content_hash(content_hash) {
+        Ok(Some(p)) => p,
+        _ => return String::new(),
+    };
+    let path = std::path::PathBuf::from(path);
+    if !path.exists() {
+        return String::new();
+    }
+    match crate::indexer::stages::run_chain(&path, stages) {
+        Ok(Some(content)) => content.text,
+        _ => String::new(),
+    }
+}
+
 pub fn run_auto_tagger(
     rx: Receiver<crate::app::AutoTagRequest>,
     tag_store: TagStore,
@@ -235,18 +257,26 @@ pub fn run_auto_tagger(
     completed: Option<Arc<std::sync::Mutex<Option<String>>>>,
 ) {
     info!("AutoTagger thread started");
+    // Watchdog: periodically sweep rows stranded in 'processing' (a worker
+    // died or a call stalled). Age-gated by the claim's updated_at refresh
+    // so in-flight calls are never double-claimed.
+    let mut last_sweep = std::time::Instant::now();
+    const SWEEP_INTERVAL: Duration = Duration::from_secs(60);
+    const STALE_PROCESSING_AGE_MINUTES: i64 = 10;
     // Process any pending documents from DB (recovery after crash or channel
     // drops). claim_pending_auto_tags is atomic — concurrent workers each get
     // a disjoint batch, so no document is ever sent to the API twice.
     if let Ok(pending) = tag_store.claim_pending_auto_tags(100) {
+        let stages = crate::indexer::stages::create_extractor_chain();
         for p in pending {
             if shutdown_flag.load(Ordering::Acquire) {
                 break;
             }
+            let text = claimed_row_text(&tag_store, &p.content_hash, &stages);
             tag_document(
                 &p.content_hash,
                 &p.filename,
-                "",
+                &text,
                 &p.content_hash_before_tag,
                 &tag_store,
                 provider.as_ref(),
@@ -277,18 +307,30 @@ pub fn run_auto_tagger(
                 }
             }
             Err(crossbeam::channel::RecvTimeoutError::Timeout) => {
+                // Watchdog sweep (idle time only — cheap, age-gated).
+                if last_sweep.elapsed() >= SWEEP_INTERVAL {
+                    match tag_store.reset_stale_processing_older_than(STALE_PROCESSING_AGE_MINUTES) {
+                        Ok(n) if n > 0 => {
+                            info!("Watchdog: reset {} stale 'processing' rows", n);
+                        }
+                        _ => {}
+                    }
+                    last_sweep = std::time::Instant::now();
+                }
                 // Channel idle — drain pending rows from the DB (the durable
                 // queue). This also recovers requests dropped by a full
                 // bounded channel instead of waiting for the next startup.
                 if let Ok(pending) = tag_store.claim_pending_auto_tags(8) {
+                    let stages = crate::indexer::stages::create_extractor_chain();
                     for p in pending {
                         if shutdown_flag.load(Ordering::Acquire) {
                             break;
                         }
+                        let text = claimed_row_text(&tag_store, &p.content_hash, &stages);
                         tag_document(
                             &p.content_hash,
                             &p.filename,
-                            "",
+                            &text,
                             &p.content_hash_before_tag,
                             &tag_store,
                             provider.as_ref(),
@@ -1156,5 +1198,151 @@ mod tests {
             None,
         );
         assert!(result, "Shutdown request should return true");
+    }
+
+    #[test]
+    fn db_claimed_rows_pass_extracted_text_to_provider() {
+        // A row recovered from the DB queue must be tagged from the
+        // document's extracted text, not an empty string — the extracted
+        // text is the entire point of the AI tagging call.
+        use crate::auto_tagger::config::AutoTagConfig;
+        use crate::auto_tagger::provider::{Entities, TagError, TagProvider, TagResponse};
+        use crate::tags::store::TagStore;
+        use rusqlite::Connection;
+
+        struct CapturingProvider(std::sync::Arc<std::sync::Mutex<Option<String>>>);
+        impl TagProvider for CapturingProvider {
+            fn generate_tags(
+                &self,
+                _filename: &str,
+                text: &str,
+                _tokens: &[String],
+            ) -> Result<TagResponse, TagError> {
+                *self.0.lock().unwrap() = Some(text.to_string());
+                Ok(TagResponse {
+                    tags: vec![],
+                    entities: Entities::default(),
+                })
+            }
+        }
+
+        // Real file on disk with extractable text.
+        let dir = tempfile::TempDir::new().unwrap();
+        let file = dir.path().join("notice.txt");
+        std::fs::write(
+            &file,
+            "Canada Revenue Agency tax assessment for Guorui Yang",
+        )
+        .unwrap();
+
+        let conn = Connection::open(dir.path().join("test.db")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE documents (content_hash TEXT PRIMARY KEY, file_path TEXT NOT NULL, file_type TEXT NOT NULL, file_size INTEGER DEFAULT 0, modified_ts INTEGER DEFAULT 0, indexed_at TEXT DEFAULT '', last_error TEXT); CREATE TABLE tags (id INTEGER PRIMARY KEY, name TEXT UNIQUE NOT NULL); CREATE TABLE document_tags (content_hash TEXT REFERENCES documents ON DELETE CASCADE, tag_id INTEGER REFERENCES tags ON DELETE CASCADE, PRIMARY KEY(content_hash, tag_id)); CREATE TABLE auto_tag_status (content_hash TEXT PRIMARY KEY REFERENCES documents ON DELETE CASCADE, filename TEXT NOT NULL, content_hash_before_tag TEXT NOT NULL, status TEXT DEFAULT 'pending', tags_json TEXT, attempts INTEGER DEFAULT 0, last_error TEXT, created_at TEXT DEFAULT (datetime('now')), updated_at TEXT DEFAULT (datetime('now'))); CREATE TABLE auto_tag_cache (id INTEGER PRIMARY KEY AUTOINCREMENT, filename_tokens TEXT NOT NULL, tags_json TEXT NOT NULL, source_hash TEXT NOT NULL, hit_count INTEGER DEFAULT 1, created_at TEXT DEFAULT (datetime('now')), updated_at TEXT DEFAULT (datetime('now')));",
+        )
+        .unwrap();
+        let store = TagStore::new_for_test(conn);
+        let path_str = file.display().to_string();
+        store
+            .upsert_document("h1", &path_str, "txt", 0, 0)
+            .unwrap();
+        store
+            .upsert_auto_tag_status("h1", "notice.txt", "before", "pending", None, None)
+            .unwrap();
+
+        let captured_text = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let provider = CapturingProvider(captured_text.clone());
+        let config = AutoTagConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let (tx, rx) = crossbeam::channel::bounded::<crate::app::AutoTagRequest>(1);
+        drop(tx); // no channel requests — DB claim path only
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let breaker = ApiCircuitBreaker::new(100, 60_000);
+        run_auto_tagger(
+            rx,
+            store,
+            Box::new(provider),
+            config,
+            shutdown,
+            None,
+            Arc::new(breaker),
+            None,
+        );
+
+        let captured = captured_text.lock().unwrap().clone();
+        assert_eq!(
+            captured.as_deref(),
+            Some("Canada Revenue Agency tax assessment for Guorui Yang"),
+            "DB-claimed rows must send the extracted document text to the API"
+        );
+    }
+
+    #[test]
+    fn db_claimed_row_with_missing_file_falls_back_to_empty_text() {
+        // A recovered row whose file was deleted must not crash — empty
+        // text keeps the previous filename-only behavior.
+        use crate::auto_tagger::config::AutoTagConfig;
+        use crate::auto_tagger::provider::{Entities, TagError, TagProvider, TagResponse};
+        use crate::tags::store::TagStore;
+        use rusqlite::Connection;
+
+        struct CapturingProvider(std::sync::Arc<std::sync::Mutex<Option<String>>>);
+        impl TagProvider for CapturingProvider {
+            fn generate_tags(
+                &self,
+                _filename: &str,
+                text: &str,
+                _tokens: &[String],
+            ) -> Result<TagResponse, TagError> {
+                *self.0.lock().unwrap() = Some(text.to_string());
+                Ok(TagResponse {
+                    tags: vec![],
+                    entities: Entities::default(),
+                })
+            }
+        }
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let conn = Connection::open(dir.path().join("test.db")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE documents (content_hash TEXT PRIMARY KEY, file_path TEXT NOT NULL, file_type TEXT NOT NULL, file_size INTEGER DEFAULT 0, modified_ts INTEGER DEFAULT 0, indexed_at TEXT DEFAULT '', last_error TEXT); CREATE TABLE tags (id INTEGER PRIMARY KEY, name TEXT UNIQUE NOT NULL); CREATE TABLE document_tags (content_hash TEXT REFERENCES documents ON DELETE CASCADE, tag_id INTEGER REFERENCES tags ON DELETE CASCADE, PRIMARY KEY(content_hash, tag_id)); CREATE TABLE auto_tag_status (content_hash TEXT PRIMARY KEY REFERENCES documents ON DELETE CASCADE, filename TEXT NOT NULL, content_hash_before_tag TEXT NOT NULL, status TEXT DEFAULT 'pending', tags_json TEXT, attempts INTEGER DEFAULT 0, last_error TEXT, created_at TEXT DEFAULT (datetime('now')), updated_at TEXT DEFAULT (datetime('now'))); CREATE TABLE auto_tag_cache (id INTEGER PRIMARY KEY AUTOINCREMENT, filename_tokens TEXT NOT NULL, tags_json TEXT NOT NULL, source_hash TEXT NOT NULL, hit_count INTEGER DEFAULT 1, created_at TEXT DEFAULT (datetime('now')), updated_at TEXT DEFAULT (datetime('now')));",
+        )
+        .unwrap();
+        let store = TagStore::new_for_test(conn);
+        store
+            .upsert_document("h1", "/gone/notice.pdf", "pdf", 0, 0)
+            .unwrap();
+        store
+            .upsert_auto_tag_status("h1", "notice.pdf", "before", "pending", None, None)
+            .unwrap();
+
+        let captured_text = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let provider = CapturingProvider(captured_text.clone());
+        let config = AutoTagConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let (tx, rx) = crossbeam::channel::bounded::<crate::app::AutoTagRequest>(1);
+        drop(tx);
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let breaker = ApiCircuitBreaker::new(100, 60_000);
+        run_auto_tagger(
+            rx,
+            store,
+            Box::new(provider),
+            config,
+            shutdown,
+            None,
+            Arc::new(breaker),
+            None,
+        );
+
+        let captured = captured_text.lock().unwrap().clone();
+        assert_eq!(
+            captured.as_deref(),
+            Some(""),
+            "missing file must fall back to empty text"
+        );
     }
 }
