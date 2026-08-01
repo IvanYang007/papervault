@@ -40,6 +40,7 @@ ureq = { version = "2", features = ["tls"] }
 tempfile = "3"
 printpdf = "0.7"
 lopdf = "0.34"
+filetime = "0.2"
 
 [profile.release]
 # Aggressive compile-speed tuning — binary size is not a concern.

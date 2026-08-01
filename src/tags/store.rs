@@ -560,13 +560,14 @@ impl TagStore {
     /// Reset rows left `processing` by a crashed session.
     /// Must run once BEFORE workers spawn — a concurrent reset would clobber
     /// rows a live worker already claimed.
-    pub fn reset_stale_processing(&self) -> SqlResult<()> {
+    pub fn reset_stale_processing(&self) -> SqlResult<usize> {
         self.with_conn(|conn| {
-            conn.prepare_cached(
-                "UPDATE auto_tag_status SET status = 'pending' WHERE status = 'processing'",
-            )?
-            .execute([])?;
-            Ok(())
+            let n = conn
+                .prepare_cached(
+                    "UPDATE auto_tag_status SET status = 'pending' WHERE status = 'processing'",
+                )?
+                .execute([])?;
+            Ok(n)
         })
     }
 

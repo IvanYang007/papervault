@@ -57,6 +57,7 @@ impl ApiCircuitBreaker {
                 .compare_exchange(tripped, 0, Ordering::Relaxed, Ordering::Relaxed)
                 .is_ok()
             {
+                info!("Circuit breaker closed — probe call allowed after cooldown");
                 return true;
             }
             return false;
@@ -68,14 +69,20 @@ impl ApiCircuitBreaker {
     pub fn record_failure(&self) {
         let n = self.consecutive_failures.fetch_add(1, Ordering::Relaxed) + 1;
         if n >= self.trip_threshold {
-            self.tripped_at_ms.store(Self::now_ms(), Ordering::Relaxed);
+            let was_open = self.tripped_at_ms.swap(Self::now_ms(), Ordering::Relaxed) != 0;
+            if !was_open {
+                warn!("Circuit breaker OPEN after {} consecutive API failures", n);
+            }
         }
     }
 
     /// Record a successful provider call — closes the breaker.
     pub fn record_success(&self) {
         self.consecutive_failures.store(0, Ordering::Relaxed);
-        self.tripped_at_ms.store(0, Ordering::Relaxed);
+        let was_open = self.tripped_at_ms.swap(0, Ordering::Relaxed) != 0;
+        if was_open {
+            info!("Circuit breaker closed after a successful probe");
+        }
     }
 }
 
@@ -390,8 +397,9 @@ fn tag_document(
     } else {
         text.to_string()
     };
+    let short_hash = &content_hash[..content_hash.len().min(12)];
     info!(
-        "Auto-tagging: {filename} (text={} chars, preview='{text_preview}')",
+        "Auto-tagging: {filename} [{short_hash}] (text={} chars, preview='{text_preview}')",
         text.len()
     );
 
@@ -543,7 +551,7 @@ fn tag_document(
                     breaker.record_failure();
                 }
                 warn!(
-                    "  ✗ AI attempt {}/{} for {filename}: {e}",
+                    "  ✗ AI attempt {}/{} for {filename} [{short_hash}]: {e}",
                     attempt + 1,
                     config.max_retries
                 );
