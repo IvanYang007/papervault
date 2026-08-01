@@ -76,8 +76,12 @@ impl FolderRuntime {
         }
         // Reset rows left 'failed' by transient provider errors (connection
         // timeouts, unparseable responses) so they get another chance.
-        if let Err(e) = tag_store.reset_failed_auto_tags() {
-            tracing::warn!("Failed to reset failed auto-tag rows: {}", e);
+        match tag_store.reset_failed_auto_tags() {
+            Ok(n) if n > 0 => {
+                tracing::info!("Startup: reset {} 'failed' auto-tag rows for retry", n);
+            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!("Failed to reset failed auto-tag rows: {}", e),
         }
         let at_shutdown = auto_tagger_shutdown.clone();
         let progress = Arc::new(AtomicUsize::new(0));
