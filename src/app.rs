@@ -900,9 +900,15 @@ impl PapervaultApp {
             return;
         }
 
-        // Re-extract text from the file
-        let Ok(content) = std::fs::read_to_string(path) else {
-            return;
+        // Re-extract text from the file. PDFs are binary — read_to_string
+        // fails on them — so use the same extractor chain the indexer uses.
+        let stages = crate::indexer::stages::create_extractor_chain();
+        let content = match crate::indexer::stages::run_chain(path, &stages) {
+            Ok(Some(extracted)) => extracted.text,
+            _ => {
+                tracing::warn!("Could not extract text for re-tag: {}", file_path);
+                return;
+            }
         };
         let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
 
@@ -925,12 +931,18 @@ impl PapervaultApp {
         // The pending reset wipes tags_json — drop the stale display cache entry.
         self.invalidate_auto_tag(&hash);
 
-        let _ = tx.send(AutoTagRequest::TagDocument {
+        // Non-blocking send — the UI thread must never wait on a full
+        // queue; a dropped request is recovered from the DB 'pending' row.
+        if tx.try_send(AutoTagRequest::TagDocument {
             content_hash: hash.clone(),
             filename: file_name.to_string(),
             text: content,
             content_hash_before_tag,
-        });
+        })
+        .is_err()
+        {
+            tracing::warn!("Auto-tagger queue full — re-tag will be picked up from the DB queue");
+        }
     }
 
     /// Send an auto-tag request from the UI thread without ever blocking.
@@ -1889,15 +1901,21 @@ impl eframe::App for PapervaultApp {
                                 row.set_selected(is_browsed || is_selected);
 
                                 // Name cell — truncated label (widening the
-                                // column reveals the full name). Clicks are
-                                // detected at row level.
+                                // column reveals the full name; hovering shows
+                                // it as a tooltip). The label itself senses
+                                // clicks over the text; the row response covers
+                                // the rest of the row — clicks work everywhere.
+                                let mut label_clicked = false;
                                 row.col(|ui| {
-                                    ui.add(
+                                    let resp = ui.add(
                                         egui::Label::new(egui::RichText::new(&row_data.label))
-                                            .truncate(),
+                                            .truncate()
+                                            .selectable(false)
+                                            .sense(egui::Sense::click()),
                                     );
+                                    label_clicked = resp.clicked();
                                 });
-                                let clicked = row.response().clicked();
+                                let clicked = label_clicked || row.response().clicked();
                                 // Modified
                                 row.col(|ui| {
                                     ui.label(

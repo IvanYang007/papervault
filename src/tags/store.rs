@@ -321,6 +321,21 @@ impl TagStore {
         })
     }
 
+    /// Look up the on-disk path for a content hash. Used by the auto-tagger
+    /// to re-extract the document text before tagging rows recovered from
+    /// the durable DB queue (the queue stores the filename only).
+    pub fn file_path_for_content_hash(&self, content_hash: &str) -> SqlResult<Option<String>> {
+        self.with_conn(|conn| {
+            let mut stmt =
+                conn.prepare_cached("SELECT file_path FROM documents WHERE content_hash = ?1")?;
+            match stmt.query_row(params![content_hash], |row| row.get(0)) {
+                Ok(path) => Ok(Some(path)),
+                Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+                Err(e) => Err(e),
+            }
+        })
+    }
+
     /// List all indexed documents for the file browser.
     pub fn list_all_documents(&self) -> SqlResult<Vec<DocumentInfo>> {
         self.with_conn(|conn| {
@@ -570,13 +585,46 @@ impl TagStore {
         })
     }
 
+    /// Reset rows left 'processing' longer than `max_age_minutes` back to
+    /// 'pending'. Age-gated so a call genuinely in flight is never
+    /// double-claimed; used by the worker watchdog for rows stranded by a
+    /// worker death or a stalled call.
+    pub fn reset_stale_processing_older_than(&self, max_age_minutes: i64) -> SqlResult<usize> {
+        self.with_conn(|conn| {
+            let n = conn
+                .prepare_cached(
+                    "UPDATE auto_tag_status SET status = 'pending' \
+                     WHERE status = 'processing' \
+                     AND updated_at < datetime('now', ?1)",
+                )?
+                .execute(params![format!("-{} minutes", max_age_minutes)])?;
+            Ok(n)
+        })
+    }
+
+    /// Reset rows left 'failed' by transient provider errors (connection
+    /// timeouts, unparseable responses) so a later session retries them.
+    /// Without this, a flaky API permanently strands documents untagged.
+    pub fn reset_failed_auto_tags(&self) -> SqlResult<usize> {
+        self.with_conn(|conn| {
+            let n = conn
+                .prepare_cached(
+                    "UPDATE auto_tag_status \
+                     SET status = 'pending', attempts = 0, last_error = NULL \
+                     WHERE status = 'failed'",
+                )?
+                .execute([])?;
+            Ok(n)
+        })
+    }
+
     /// Atomically claim up to `limit` rows that need tagging.
     /// Claims are exclusive — each row is returned to exactly one caller,
     /// even when multiple workers call concurrently (single UPDATE statement).
     pub fn claim_pending_auto_tags(&self, limit: usize) -> SqlResult<Vec<AutoTagStatus>> {
         self.with_conn(|conn| {
             let mut stmt = conn.prepare_cached(
-                "UPDATE auto_tag_status SET status = 'processing'
+                "UPDATE auto_tag_status SET status = 'processing', updated_at = datetime('now')
                  WHERE content_hash IN (
                     SELECT content_hash FROM auto_tag_status
                     WHERE status = 'pending' ORDER BY created_at ASC LIMIT ?1
@@ -1250,6 +1298,99 @@ mod tests {
     }
 
     #[test]
+    fn claim_pending_auto_tags_refreshes_updated_at() {
+        let (store, _dir) = setup_test_store();
+        store.upsert_document("h1", "/a.pdf", "pdf", 0, 0).unwrap();
+        store
+            .upsert_auto_tag_status("h1", "a.pdf", "x", "pending", None, None)
+            .unwrap();
+        // Age the row artificially so the claim's refresh is observable.
+        store
+            .with_conn(|conn| {
+                conn.execute(
+                    "UPDATE auto_tag_status SET updated_at = '2020-01-01 00:00:00' \
+                     WHERE content_hash = 'h1'",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        let claimed = store.claim_pending_auto_tags(10).unwrap();
+        assert_eq!(claimed.len(), 1);
+        let status = store.auto_tag_status("h1").unwrap().unwrap();
+        assert!(
+            status.updated_at.as_str() > "2020-01-01 00:00:00",
+            "claim must refresh updated_at so the stale-row watchdog can age rows: {}",
+            status.updated_at
+        );
+    }
+
+    #[test]
+    fn reset_failed_auto_tags_retries_failed_rows_only() {
+        let (store, _dir) = setup_test_store();
+        for (h, status) in [("h1", "failed"), ("h2", "pending"), ("h3", "tagged"), ("h4", "failed")] {
+            store.upsert_document(h, &format!("/{}.pdf", h), "pdf", 0, 0).unwrap();
+            store
+                .upsert_auto_tag_status(h, &format!("{}.pdf", h), "x", status, None, Some("boom"))
+                .unwrap();
+        }
+
+        let n = store.reset_failed_auto_tags().unwrap();
+        assert_eq!(n, 2, "exactly the failed rows must be reset");
+        let s1 = store.auto_tag_status("h1").unwrap().unwrap();
+        assert_eq!(s1.status, "pending");
+        assert_eq!(s1.attempts, 0, "attempts must reset for a fresh retry");
+        assert_eq!(s1.last_error, None, "last_error must clear");
+        assert_eq!(
+            store.auto_tag_status("h2").unwrap().unwrap().status,
+            "pending",
+            "pending rows untouched"
+        );
+        assert_eq!(
+            store.auto_tag_status("h3").unwrap().unwrap().status,
+            "tagged",
+            "tagged rows untouched"
+        );
+    }
+
+    #[test]
+    fn reset_stale_processing_older_than_resets_only_old_rows() {
+        let (store, _dir) = setup_test_store();
+        store.upsert_document("old", "/old.pdf", "pdf", 0, 0).unwrap();
+        store.upsert_document("fresh", "/fresh.pdf", "pdf", 0, 0).unwrap();
+        store
+            .upsert_auto_tag_status("old", "old.pdf", "x", "processing", None, None)
+            .unwrap();
+        store
+            .upsert_auto_tag_status("fresh", "fresh.pdf", "x", "processing", None, None)
+            .unwrap();
+        store
+            .with_conn(|conn| {
+                conn.execute(
+                    "UPDATE auto_tag_status SET updated_at = '2020-01-01 00:00:00' \
+                     WHERE content_hash = 'old'",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        let n = store.reset_stale_processing_older_than(10).unwrap();
+        assert_eq!(n, 1, "only the stale row may be reset");
+        assert_eq!(
+            store.auto_tag_status("old").unwrap().unwrap().status,
+            "pending",
+            "stale row must become claimable again"
+        );
+        assert_eq!(
+            store.auto_tag_status("fresh").unwrap().unwrap().status,
+            "processing",
+            "freshly claimed row must NOT be reset (would double-call the API)"
+        );
+    }
+
+    #[test]
     fn claim_pending_auto_tags_marks_rows_processing() {
         let (store, _dir) = setup_test_store();
         store.upsert_document("h1", "/a.pdf", "pdf", 0, 0).unwrap();
@@ -1842,5 +1983,23 @@ mod tests {
             })
             .unwrap();
         assert_eq!(count, CACHE_MAX_ROWS);
+    }
+
+    #[test]
+    fn file_path_for_content_hash_returns_path_and_none_for_missing() {
+        let (store, _dir) = setup_test_store();
+        store.upsert_document("h1", "/a/b/notice.pdf", "pdf", 0, 0).unwrap();
+        assert_eq!(
+            store
+                .file_path_for_content_hash("h1")
+                .unwrap()
+                .as_deref(),
+            Some("/a/b/notice.pdf")
+        );
+        assert_eq!(
+            store.file_path_for_content_hash("nope").unwrap(),
+            None,
+            "unknown hash must return None"
+        );
     }
 }
