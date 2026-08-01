@@ -1359,6 +1359,26 @@ mod tests {
             writer,
         }));
 
+        // Seed the "previous session" Tantivy state (doc_count > 0) so the
+        // old behavior (skip initial scan on non-empty index) would trigger
+        // — this test must fail on the old code.
+        {
+            let mut eng = engine.lock().unwrap_or_else(|e| e.into_inner());
+            eng.index_document(
+                "hash-staletxt",
+                &file,
+                "doc.txt",
+                "old content",
+                "txt",
+                0,
+                "hash-stale",
+                &[],
+            )
+            .unwrap();
+            eng.commit().unwrap();
+            eng.reload().unwrap(); // Manual reload policy: make the seed visible
+        }
+
         let (msg_tx, msg_rx) = crossbeam::channel::bounded::<IndexerMessage>(100);
         let (tag_tx, tag_rx) = crossbeam::channel::bounded::<TagUpdate>(100);
         let (progress_tx, progress_rx) = crossbeam::channel::unbounded::<IndexerProgress>();
