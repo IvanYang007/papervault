@@ -1623,19 +1623,21 @@ impl eframe::App for PapervaultApp {
                         let waiting = items.iter().filter(|i| i.status == "pending").count();
                         let in_flight = items.iter().filter(|i| i.status == "processing").count();
                         let failed = items.iter().filter(|i| i.status == "failed").count();
+                        // Retry button lives OUTSIDE the collapsed section so
+                        // it is always visible when files are stuck.
+                        if failed > 0
+                            && ui
+                                .small_button(format!("🔄 Retry failed ({failed})"))
+                                .clicked()
+                        {
+                            self.retry_failed_auto_tags();
+                        }
                         ui.collapsing(
                             format!(
                                 "⏳ Tagging queue: {} waiting, {} in flight, {} failed",
                                 waiting, in_flight, failed
                             ),
                             |ui| {
-                                if failed > 0
-                                    && ui
-                                        .small_button(format!("🔄 Retry failed ({failed})"))
-                                        .clicked()
-                                {
-                                    self.retry_failed_auto_tags();
-                                }
                                 egui::ScrollArea::vertical()
                                     .id_salt("auto-tag-queue-scroll")
                                     .max_height(180.0)
