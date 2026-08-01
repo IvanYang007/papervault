@@ -35,6 +35,7 @@ impl DeepSeekProvider {
         model: impl Into<String>,
         api_key_env: impl Into<String>,
         timeout_secs: u64,
+        max_text_words: usize,
     ) -> Self {
         Self {
             agent: ureq::AgentBuilder::new()
@@ -45,7 +46,7 @@ impl DeepSeekProvider {
             model: model.into(),
             api_key_env: api_key_env.into(),
             timeout: Duration::from_secs(timeout_secs),
-            max_text_words: 1500, // ~2 pages of text
+            max_text_words,
         }
     }
 
@@ -96,6 +97,9 @@ impl DeepSeekProvider {
     }
 
     /// Parse the DeepSeek API response JSON into a TagResponse.
+    /// The model's `content` is extracted robustly: LLMs frequently wrap
+    /// the JSON in markdown fences or prefix/suffix it with prose despite
+    /// the "output ONLY this JSON" instruction.
     fn parse_response(body: &str) -> Result<TagResponse, TagError> {
         let root: Value = serde_json::from_str(body)
             .map_err(|e| TagError::Parse(format!("invalid JSON from API: {}", e)))?;
@@ -108,7 +112,23 @@ impl DeepSeekProvider {
                 TagError::Parse("API response missing 'choices[0].message.content'".into())
             })?;
 
-        let tag_response: TagResponse = serde_json::from_str(content).map_err(|e| {
+        // Empty completions are transient model behavior — retryable so
+        // the worker's retry loop gives the model another chance.
+        if content.trim().is_empty() {
+            return Err(TagError::Unavailable(
+                "model returned empty content — retrying".into(),
+            ));
+        }
+
+        let tag_json = extract_json_object(content).ok_or_else(|| {
+            let preview: String = content.chars().take(200).collect();
+            TagError::Unavailable(format!(
+                "no JSON object in model output — retrying. Raw content: {}",
+                preview
+            ))
+        })?;
+
+        let tag_response: TagResponse = serde_json::from_str(tag_json).map_err(|e| {
             // char-safe preview — byte slicing panics inside CJK characters
             let preview: String = content.chars().take(200).collect();
             TagError::Parse(format!(
@@ -121,6 +141,50 @@ impl DeepSeekProvider {
     }
 }
 
+/// Extract the first top-level JSON object from a model reply.
+/// Strips markdown fences and leading/trailing prose, then finds the
+/// brace-balanced object. Brace counting is string-aware (braces inside
+/// quoted strings or escaped quotes do not affect nesting).
+fn extract_json_object(s: &str) -> Option<&str> {
+    let s = s.trim();
+    // Strip ```json / ``` fences if present.
+    let s = s
+        .strip_prefix("```json")
+        .or_else(|| s.strip_prefix("```"))
+        .unwrap_or(s);
+    let s = s.strip_suffix("```").unwrap_or(s);
+
+    let bytes = s.as_bytes();
+    let start = s.find('{')?;
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (i, &b) in bytes.iter().enumerate().skip(start) {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match b {
+            b'"' => in_string = true,
+            b'{' => depth += 1,
+            b'}' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Some(&s[start..=i]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None // truncated or unparseable — no balanced object
+}
+
 impl TagProvider for DeepSeekProvider {
     fn generate_tags(
         &self,
@@ -129,7 +193,10 @@ impl TagProvider for DeepSeekProvider {
         existing_tags: &[String],
     ) -> Result<TagResponse, TagError> {
         let api_key = self.api_key()?;
-        let prompt = self.build_prompt(filename, text, existing_tags);
+        // Truncate ONCE here: the prompt uses the truncated text and the
+        // log line reports the actual size sent (not the raw input size).
+        let truncated = self.truncate_text(text);
+        let prompt = self.build_prompt(filename, truncated, existing_tags);
 
         let body = serde_json::json!({
             "model": self.model,
@@ -150,7 +217,7 @@ impl TagProvider for DeepSeekProvider {
 
         info!(
             "🤖 DeepSeek API call: {filename} ({} chars of text)",
-            text.len()
+            truncated.len()
         );
         let started = std::time::Instant::now();
         let response = self
@@ -210,6 +277,7 @@ mod tests {
             "deepseek-chat",
             "DEEPSEEK_API_KEY",
             30,
+            500,
         )
     }
 
@@ -223,12 +291,12 @@ mod tests {
     #[test]
     fn truncate_text_at_word_boundary() {
         let provider = make_provider();
-        let words: Vec<String> = (0..1505).map(|i| format!("word{}", i)).collect();
+        let words: Vec<String> = (0..505).map(|i| format!("word{}", i)).collect();
         let text = words.join(" ");
         let truncated = provider.truncate_text(&text);
 
         let word_count = truncated.split_whitespace().count();
-        assert_eq!(word_count, 1500);
+        assert_eq!(word_count, 500, "provider must truncate to its max_text_words");
         assert!(!truncated.ends_with(' '));
     }
 
@@ -324,5 +392,77 @@ mod tests {
         }"#;
         let result = DeepSeekProvider::parse_response(body);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_response_accepts_markdown_fenced_json() {
+        // LLMs often wrap JSON in ```json fences despite the prompt.
+        let body = r#"{
+            "choices": [{
+                "message": {
+                    "content": "Here are the tags:\n```json\n{\"tags\": [\"tax\", \"CRA\"], \"entities\": {\"persons\": [], \"years\": [], \"organizations\": [], \"doc_id\": [], \"amounts\": []}}\n```"
+                }
+            }]
+        }"#;
+        let result = DeepSeekProvider::parse_response(body).unwrap();
+        assert_eq!(result.tags, vec!["tax", "CRA"]);
+    }
+
+    #[test]
+    fn parse_response_accepts_prose_around_json() {
+        // Prose before/after the object must not break parsing.
+        let body = r#"{
+            "choices": [{
+                "message": {
+                    "content": "Sure! Based on the document:\n{\"tags\": [\"notice\"], \"entities\": {\"persons\": [], \"years\": [], \"organizations\": [], \"doc_id\": [], \"amounts\": []}}\nHope that helps."
+                }
+            }]
+        }"#;
+        let result = DeepSeekProvider::parse_response(body).unwrap();
+        assert_eq!(result.tags, vec!["notice"]);
+    }
+
+    #[test]
+    fn parse_response_rejects_truncated_json() {
+        // Connection cut mid-output: no balanced object → retryable error.
+        let body = r#"{
+            "choices": [{
+                "message": {
+                    "content": "{\"tags\": [\"tax\"]"
+                }
+            }]
+        }"#;
+        let result = DeepSeekProvider::parse_response(body);
+        assert!(
+            matches!(result, Err(TagError::Unavailable(_))),
+            "truncated JSON must be a retryable Unavailable error"
+        );
+    }
+
+    #[test]
+    fn parse_response_retries_empty_model_content() {
+        // Empty completions happen under load — must be retryable, not
+        // a permanent failure.
+        let body = r#"{
+            "choices": [{
+                "message": {
+                    "content": ""
+                }
+            }]
+        }"#;
+        let result = DeepSeekProvider::parse_response(body);
+        assert!(
+            matches!(result, Err(TagError::Unavailable(_))),
+            "empty content must be retryable"
+        );
+    }
+
+    #[test]
+    fn extract_json_object_ignores_braces_inside_strings() {
+        // A tag containing braces must not confuse the extractor.
+        let s = r#"pre {"tags": ["a{b}"], "note": "}"} post"#;
+        let extracted = extract_json_object(s).unwrap();
+        let v: serde_json::Value = serde_json::from_str(extracted).unwrap();
+        assert_eq!(v["tags"][0], "a{b}");
     }
 }
