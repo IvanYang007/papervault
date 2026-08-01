@@ -257,6 +257,12 @@ pub fn run_auto_tagger(
     completed: Option<Arc<std::sync::Mutex<Option<String>>>>,
 ) {
     info!("AutoTagger thread started");
+    // Watchdog: periodically sweep rows stranded in 'processing' (a worker
+    // died or a call stalled). Age-gated by the claim's updated_at refresh
+    // so in-flight calls are never double-claimed.
+    let mut last_sweep = std::time::Instant::now();
+    const SWEEP_INTERVAL: Duration = Duration::from_secs(60);
+    const STALE_PROCESSING_AGE_MINUTES: i64 = 10;
     // Process any pending documents from DB (recovery after crash or channel
     // drops). claim_pending_auto_tags is atomic — concurrent workers each get
     // a disjoint batch, so no document is ever sent to the API twice.
@@ -301,6 +307,16 @@ pub fn run_auto_tagger(
                 }
             }
             Err(crossbeam::channel::RecvTimeoutError::Timeout) => {
+                // Watchdog sweep (idle time only — cheap, age-gated).
+                if last_sweep.elapsed() >= SWEEP_INTERVAL {
+                    match tag_store.reset_stale_processing_older_than(STALE_PROCESSING_AGE_MINUTES) {
+                        Ok(n) if n > 0 => {
+                            info!("Watchdog: reset {} stale 'processing' rows", n);
+                        }
+                        _ => {}
+                    }
+                    last_sweep = std::time::Instant::now();
+                }
                 // Channel idle — drain pending rows from the DB (the durable
                 // queue). This also recovers requests dropped by a full
                 // bounded channel instead of waiting for the next startup.
