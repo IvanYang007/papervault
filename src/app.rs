@@ -117,6 +117,14 @@ fn format_file_size(size: u64) -> String {
     }
 }
 
+/// Minutes since a queue row was created (created_at is UTC
+/// "YYYY-MM-DD HH:MM:SS"). None when unparseable.
+fn queue_age_minutes(created_at: &str) -> Option<i64> {
+    let created = chrono::NaiveDateTime::parse_from_str(created_at, "%Y-%m-%d %H:%M:%S").ok()?;
+    let now = chrono::Utc::now().naive_utc();
+    Some((now - created).num_minutes().max(0))
+}
+
 /// Pre-rendered file browser row — display strings are computed once per
 /// refresh, so the per-frame render loop only borrows them (no allocations,
 /// no date formatting, no size formatting per row per frame).
@@ -253,6 +261,9 @@ pub struct PapervaultApp {
     auto_tagger_tx: Option<Sender<AutoTagRequest>>,
     auto_tag_enabled: bool,
     auto_tag_progress: Option<(usize, usize)>,
+    /// Live auto-tag queue snapshot (waiting + in-flight rows), published
+    /// by the workers; the UI renders it without touching the DB.
+    auto_tag_queue: Option<Arc<std::sync::Mutex<Option<Vec<crate::tags::model::AutoTagQueueItem>>>>>,
     auto_tag_error: Option<String>,
     accepted_auto_tags: std::collections::HashMap<String, std::collections::HashSet<String>>,
     /// Parsed auto-tag data per content hash — avoids per-frame SQLite queries.
@@ -418,6 +429,9 @@ impl PapervaultApp {
             watcher_shutdown_tx,
             auto_tag_enabled: crate::auto_tagger::config::AutoTagConfig::load().enabled,
             auto_tag_progress: None,
+            auto_tag_queue: folder_runtime
+                .as_ref()
+                .map(|rt| rt.auto_tag_queue.clone()),
             auto_tag_error: None,
             accepted_auto_tags: std::collections::HashMap::new(),
             auto_tag_cache: std::collections::HashMap::new(),
@@ -476,6 +490,7 @@ impl PapervaultApp {
                 self.watcher_shutdown_flag = Some(runtime.watcher_shutdown());
                 self.watcher_shutdown_tx = runtime.watcher_shutdown_tx();
                 self.auto_tagger_tx = runtime.auto_tagger_tx.clone();
+                self.auto_tag_queue = Some(runtime.auto_tag_queue.clone());
                 self.folder_runtime = Some(runtime);
                 self.status_message = format!("Watching: {}", folder.display());
             }
@@ -869,6 +884,38 @@ impl PapervaultApp {
             self.active_tag_filters.insert(tag_name.to_string());
         }
         self.do_search();
+    }
+
+    /// Select a queued file in the file browser (click-to-select).
+    /// The left panel renders before the central panel, so the preview
+    /// picks the new selection up on the next frame.
+    fn select_queue_item(&mut self, content_hash: &str) {
+        let path = self
+            .file_browser_docs
+            .iter()
+            .find(|d| d.content_hash == content_hash)
+            .map(|d| d.file_path.clone());
+        if let Some(path) = path {
+            self.browse_file(&path);
+        }
+    }
+
+    /// Reset all 'failed' auto-tag rows to 'pending' so the workers
+    /// retry them immediately (same recovery the app runs at startup).
+    fn retry_failed_auto_tags(&mut self) {
+        let store = match &self.tag_store {
+            Some(s) => s.clone(),
+            None => return,
+        };
+        match store.reset_failed_auto_tags() {
+            Ok(n) => {
+                self.clear_auto_tag_cache();
+                self.status_message = format!("Retrying {n} failed files...");
+            }
+            Err(e) => {
+                self.status_message = format!("Failed to reset auto-tag rows: {}", e);
+            }
+        }
     }
 
     /// Re-trigger auto-tagging for the currently selected document.
@@ -1563,6 +1610,81 @@ impl eframe::App for PapervaultApp {
                                         .to_string();
                             }
                         });
+                        ui.separator();
+                    }
+
+                    // ── Live tagging queue: which files are waiting / in flight ──
+                    if let Some(queue_arc) = &self.auto_tag_queue {
+                        let items = queue_arc
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .clone()
+                            .unwrap_or_default();
+                        let waiting = items.iter().filter(|i| i.status == "pending").count();
+                        let in_flight = items.iter().filter(|i| i.status == "processing").count();
+                        let failed = items.iter().filter(|i| i.status == "failed").count();
+                        ui.collapsing(
+                            format!(
+                                "⏳ Tagging queue: {} waiting, {} in flight, {} failed",
+                                waiting, in_flight, failed
+                            ),
+                            |ui| {
+                                if failed > 0
+                                    && ui
+                                        .small_button(format!("🔄 Retry failed ({failed})"))
+                                        .clicked()
+                                {
+                                    self.retry_failed_auto_tags();
+                                }
+                                egui::ScrollArea::vertical()
+                                    .id_salt("auto-tag-queue-scroll")
+                                    .max_height(180.0)
+                                    .auto_shrink([false, true])
+                                    .show(ui, |ui| {
+                                        for item in &items {
+                                            ui.horizontal(|ui| {
+                                                let (glyph, color) = match item.status.as_str() {
+                                                    "processing" => {
+                                                        ("⏳", Color32::from_rgb(255, 180, 60))
+                                                    }
+                                                    "failed" => ("✗", Color32::from_rgb(230, 80, 80)),
+                                                    _ => ("⏸", Color32::GRAY),
+                                                };
+                                                let label = format!("{glyph} {}", item.filename);
+                                                if ui
+                                                    .small_button(
+                                                        RichText::new(&label).color(color),
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    self.select_queue_item(&item.content_hash);
+                                                }
+                                                if let Some(age) = queue_age_minutes(&item.created_at)
+                                                {
+                                                    ui.label(
+                                                        RichText::new(format!("{age}m"))
+                                                            .size(9.0)
+                                                            .color(Color32::GRAY),
+                                                    );
+                                                }
+                                                if item.status == "failed" {
+                                                    if let Some(err) = &item.last_error {
+                                                        let short: String =
+                                                            err.chars().take(60).collect();
+                                                        ui.label(
+                                                            RichText::new(short)
+                                                                .size(8.5)
+                                                                .color(Color32::from_rgb(
+                                                                    200, 120, 120,
+                                                                )),
+                                                        );
+                                                    }
+                                                }
+                                            });
+                                        }
+                                    });
+                            },
+                        );
                         ui.separator();
                     }
 

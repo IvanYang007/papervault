@@ -33,6 +33,8 @@ pub struct FolderRuntime {
     /// Last content hash whose auto-tag status changed (any worker, any
     /// path). Polled by the UI to drop stale display-cache entries.
     pub auto_tag_completed: Arc<std::sync::Mutex<Option<String>>>,
+    /// Live auto-tag queue snapshot (waiting + in-flight rows).
+    pub auto_tag_queue: Arc<std::sync::Mutex<Option<Vec<crate::tags::model::AutoTagQueueItem>>>>,
     pub progress_rx: Receiver<IndexerProgress>,
     pub render_tx: Sender<RenderRequest>,
     pub render_result_rx: Receiver<RenderResult>,
@@ -94,6 +96,11 @@ impl FolderRuntime {
         // for docs that finished tagging outside an explicit batch.
         let auto_tag_completed: Arc<std::sync::Mutex<Option<String>>> =
             Arc::new(std::sync::Mutex::new(None));
+        // Live auto-tag queue (waiting + in-flight rows) refreshed by the
+        // workers off the UI thread; the UI reads this per frame.
+        let auto_tag_queue_snapshot: Arc<
+            std::sync::Mutex<Option<Vec<crate::tags::model::AutoTagQueueItem>>>,
+        > = Arc::new(std::sync::Mutex::new(None));
         let num_workers = 3usize;
         let auto_tagger_handles: Vec<_> = (0..num_workers)
             .map(|i| {
@@ -110,6 +117,7 @@ impl FolderRuntime {
                 let prg = progress.clone();
                 let brk = breaker.clone();
                 let cmp = auto_tag_completed.clone();
+                let snap = auto_tag_queue_snapshot.clone();
                 std::thread::Builder::new()
                     .name(format!("auto-tagger-{}", i))
                     .spawn(move || {
@@ -122,6 +130,7 @@ impl FolderRuntime {
                             Some(prg),
                             brk,
                             Some(cmp),
+                            snap,
                         );
                     })
             })
@@ -188,6 +197,7 @@ impl FolderRuntime {
             watcher_tx: Some(watcher_tx),
             browser_refresh_flag,
             auto_tag_completed,
+            auto_tag_queue: auto_tag_queue_snapshot,
             tag_tx: Some(tag_tx),
             auto_tagger_tx: Some(auto_tagger_tx),
             auto_tag_progress: progress,
