@@ -152,6 +152,7 @@ impl TagProvider for DeepSeekProvider {
             "🤖 DeepSeek API call: {filename} ({} chars of text)",
             text.len()
         );
+        let started = std::time::Instant::now();
         let response = self
             .agent
             .post(&self.endpoint)
@@ -182,13 +183,18 @@ impl TagProvider for DeepSeekProvider {
         })?;
 
         let result = Self::parse_response(&body_str);
+        let elapsed_ms = started.elapsed().as_millis();
         match &result {
             Ok(r) => info!(
-                "📥 DeepSeek response for {filename}: {} tags, {} persons",
+                "📥 DeepSeek response for {filename}: {} tags, {} persons ({} ms)",
                 r.tags.len(),
-                r.entities.persons.len()
+                r.entities.persons.len(),
+                elapsed_ms
             ),
-            Err(e) => warn!("📥 DeepSeek parse error for {filename}: {e}"),
+            Err(e) => warn!(
+                "📥 DeepSeek parse error for {filename} ({} ms): {e}",
+                elapsed_ms
+            ),
         }
         result
     }

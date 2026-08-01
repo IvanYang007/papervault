@@ -1,15 +1,13 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use std::panic;
-
 use tracing::{error, info, warn};
-use tracing_subscriber::EnvFilter;
 
 mod app;
 mod auto_tagger;
 mod config;
 mod error;
 mod indexer;
+mod logging;
 mod preview;
 mod runtime;
 mod search;
@@ -27,42 +25,12 @@ fn main() -> eframe::Result {
     // ── CLI args ──
     let args: Vec<String> = std::env::args().collect();
     let start_minimized = args.iter().any(|a| a == "--minimized");
-    // Initialize tracing — console output
-    let log_dir = dirs_next::data_local_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join("papervault");
-    let _ = std::fs::create_dir_all(&log_dir);
-    let log_file =
-        std::fs::File::create(log_dir.join("papervault.log")).expect("failed to create log file");
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .with_writer(std::sync::Mutex::new(log_file))
-        .init();
 
-    // Set panic hook to log panics before crashing
-    panic::set_hook(Box::new(|info| {
-        let msg = info.to_string();
-        let tid = std::thread::current().id();
-        eprintln!("!!! PANIC in thread {:?}: {}", tid, msg);
-        error!("Panic in thread {:?}: {}", tid, msg);
-        if let Some(crash_dir) = dirs_next::data_local_dir() {
-            let crash_path = crash_dir.join("papervault").join("crash.log");
-            if let Some(parent) = crash_path.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            let _ = std::fs::write(
-                &crash_path,
-                format!(
-                    "Panic at {}: {}\n",
-                    chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
-                    msg
-                ),
-            );
-        }
-        eprintln!("FATAL: {}", msg);
-    }));
+    // ── Logging ──
+    // Per-session log files (never truncate a previous session), a 3-day
+    // retention sweep (one cheap scan at startup, no timers), append-only
+    // crash records, and debug diagnostics via RUST_LOG. See logging.rs.
+    let _session_id = logging::init();
 
     // ── Configuration ──
     let config = config::Config::load();
