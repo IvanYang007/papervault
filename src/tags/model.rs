@@ -28,7 +28,7 @@ pub struct AutoTagStatus {
 }
 
 /// One row of the live auto-tag queue: a document still waiting
-/// ('pending') or currently in flight ('processing').
+/// ('pending'), currently in flight ('processing'), or stuck ('failed').
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AutoTagQueueItem {
     pub content_hash: String,
@@ -36,4 +36,6 @@ pub struct AutoTagQueueItem {
     pub status: String,
     /// UTC "YYYY-MM-DD HH:MM:SS" — used to show how long a file waited.
     pub created_at: String,
+    /// Last provider error for failed rows (None otherwise).
+    pub last_error: Option<String>,
 }

@@ -394,7 +394,11 @@ fn refresh_queue_snapshot(
     };
     let waiting = items.iter().filter(|i| i.status == "pending").count();
     let in_flight = items.iter().filter(|i| i.status == "processing").count();
-    debug!("Auto-tag queue: {} waiting, {} in flight", waiting, in_flight);
+    let failed = items.iter().filter(|i| i.status == "failed").count();
+    debug!(
+        "Auto-tag queue: {} waiting, {} in flight, {} failed",
+        waiting, in_flight, failed
+    );
     let mut g = snapshot.lock().unwrap_or_else(|e| e.into_inner());
     *g = Some(items);
 }

@@ -573,17 +573,18 @@ impl TagStore {
     }
 
     /// Live snapshot of the auto-tag queue: rows still waiting
-    /// ('pending') or in flight ('processing'), oldest first. Tagged,
-    /// failed, and missing rows are excluded. The table is small (one row
-    /// per document), so this stays cheap even though `status` is not
-    /// indexed.
+    /// ('pending'), in flight ('processing'), or stuck ('failed'), ordered
+    /// in-flight first, then waiting, then failed (each by age). Tagged
+    /// rows are excluded. The table is small (one row per document), so
+    /// this stays cheap even though `status` is not indexed.
     pub fn list_auto_tag_queue(&self) -> SqlResult<Vec<AutoTagQueueItem>> {
         self.with_conn(|conn| {
             let mut stmt = conn.prepare_cached(
-                "SELECT content_hash, filename, status, created_at
+                "SELECT content_hash, filename, status, created_at, last_error
                  FROM auto_tag_status
-                 WHERE status IN ('pending', 'processing')
-                 ORDER BY created_at ASC, rowid ASC",
+                 WHERE status IN ('pending', 'processing', 'failed')
+                 ORDER BY CASE status WHEN 'processing' THEN 0 WHEN 'pending' THEN 1 ELSE 2 END,
+                          created_at ASC, rowid ASC",
             )?;
             let rows = stmt
                 .query_map([], |row| {
@@ -592,6 +593,7 @@ impl TagStore {
                         filename: row.get(1)?,
                         status: row.get(2)?,
                         created_at: row.get(3)?,
+                        last_error: row.get(4)?,
                     })
                 })?
                 .filter_map(|r| r.ok())
@@ -1453,7 +1455,7 @@ mod tests {
     }
 
     #[test]
-    fn list_auto_tag_queue_returns_waiting_and_in_flight_only_ordered() {
+    fn list_auto_tag_queue_groups_in_flight_waiting_failed_and_excludes_tagged() {
         let (store, _dir) = setup_test_store();
         // Distinct created_at values to make ordering deterministic.
         for (h, status, created) in [
@@ -1477,6 +1479,17 @@ mod tests {
                 })
                 .unwrap();
         }
+        // Only the failed row carries an error.
+        store
+            .with_conn(|conn| {
+                conn.execute(
+                    "UPDATE auto_tag_status SET last_error = 'provider timeout' \
+                     WHERE content_hash = 'h-failed'",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
 
         let queue = store.list_auto_tag_queue().unwrap();
         let names: Vec<(&str, &str)> = queue
@@ -1486,21 +1499,27 @@ mod tests {
         assert_eq!(
             names,
             vec![
-                ("h-old-pending.pdf", "pending"),
+                // In-flight first, then waiting, then failed — each by age.
                 ("h-in-flight.pdf", "processing"),
+                ("h-old-pending.pdf", "pending"),
                 ("h-new-pending.pdf", "pending"),
+                ("h-failed.pdf", "failed"),
             ],
-            "queue must contain pending+processing only, oldest first: {:?}",
+            "queue must group in-flight, waiting, failed (by age) and drop tagged: {:?}",
             names
         );
         assert!(
             queue.iter().all(|i| i.content_hash != "h-tagged"),
             "tagged rows must be excluded"
         );
-        assert!(
-            queue.iter().all(|i| i.content_hash != "h-failed"),
-            "failed rows must be excluded"
+        let failed = queue.iter().find(|i| i.content_hash == "h-failed").unwrap();
+        assert_eq!(
+            failed.last_error.as_deref(),
+            Some("provider timeout"),
+            "failed rows must carry their last error"
         );
+        let in_flight = queue.iter().find(|i| i.content_hash == "h-in-flight").unwrap();
+        assert_eq!(in_flight.last_error, None, "non-failed rows have no error");
     }
 
     #[test]

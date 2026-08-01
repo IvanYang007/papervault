@@ -900,6 +900,24 @@ impl PapervaultApp {
         }
     }
 
+    /// Reset all 'failed' auto-tag rows to 'pending' so the workers
+    /// retry them immediately (same recovery the app runs at startup).
+    fn retry_failed_auto_tags(&mut self) {
+        let store = match &self.tag_store {
+            Some(s) => s.clone(),
+            None => return,
+        };
+        match store.reset_failed_auto_tags() {
+            Ok(n) => {
+                self.clear_auto_tag_cache();
+                self.status_message = format!("Retrying {n} failed files...");
+            }
+            Err(e) => {
+                self.status_message = format!("Failed to reset auto-tag rows: {}", e);
+            }
+        }
+    }
+
     /// Re-trigger auto-tagging for the currently selected document.
     /// Reads the file from disk and sends it through the auto-tagger.
     fn retag_selected(&mut self) {
@@ -1604,12 +1622,20 @@ impl eframe::App for PapervaultApp {
                             .unwrap_or_default();
                         let waiting = items.iter().filter(|i| i.status == "pending").count();
                         let in_flight = items.iter().filter(|i| i.status == "processing").count();
+                        let failed = items.iter().filter(|i| i.status == "failed").count();
                         ui.collapsing(
                             format!(
-                                "⏳ Tagging queue: {} waiting, {} in flight",
-                                waiting, in_flight
+                                "⏳ Tagging queue: {} waiting, {} in flight, {} failed",
+                                waiting, in_flight, failed
                             ),
                             |ui| {
+                                if failed > 0
+                                    && ui
+                                        .small_button(format!("🔄 Retry failed ({failed})"))
+                                        .clicked()
+                                {
+                                    self.retry_failed_auto_tags();
+                                }
                                 egui::ScrollArea::vertical()
                                     .id_salt("auto-tag-queue-scroll")
                                     .max_height(180.0)
@@ -1617,10 +1643,12 @@ impl eframe::App for PapervaultApp {
                                     .show(ui, |ui| {
                                         for item in &items {
                                             ui.horizontal(|ui| {
-                                                let (glyph, color) = if item.status == "processing" {
-                                                    ("⏳", Color32::from_rgb(255, 180, 60))
-                                                } else {
-                                                    ("⏸", Color32::GRAY)
+                                                let (glyph, color) = match item.status.as_str() {
+                                                    "processing" => {
+                                                        ("⏳", Color32::from_rgb(255, 180, 60))
+                                                    }
+                                                    "failed" => ("✗", Color32::from_rgb(230, 80, 80)),
+                                                    _ => ("⏸", Color32::GRAY),
                                                 };
                                                 let label = format!("{glyph} {}", item.filename);
                                                 if ui
@@ -1638,6 +1666,19 @@ impl eframe::App for PapervaultApp {
                                                             .size(9.0)
                                                             .color(Color32::GRAY),
                                                     );
+                                                }
+                                                if item.status == "failed" {
+                                                    if let Some(err) = &item.last_error {
+                                                        let short: String =
+                                                            err.chars().take(60).collect();
+                                                        ui.label(
+                                                            RichText::new(short)
+                                                                .size(8.5)
+                                                                .color(Color32::from_rgb(
+                                                                    200, 120, 120,
+                                                                )),
+                                                        );
+                                                    }
                                                 }
                                             });
                                         }
