@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tracing::info;
 
-use super::model::{AutoTagStatus, Tag};
+use super::model::{AutoTagQueueItem, AutoTagStatus, Tag};
 
 /// Manages tag storage via a single persistent SQLite connection (WAL mode).
 /// Cloneable via Arc — all clones share the same connection.
@@ -569,6 +569,34 @@ impl TagStore {
                 }
             }
             Ok(result)
+        })
+    }
+
+    /// Live snapshot of the auto-tag queue: rows still waiting
+    /// ('pending') or in flight ('processing'), oldest first. Tagged,
+    /// failed, and missing rows are excluded. The table is small (one row
+    /// per document), so this stays cheap even though `status` is not
+    /// indexed.
+    pub fn list_auto_tag_queue(&self) -> SqlResult<Vec<AutoTagQueueItem>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare_cached(
+                "SELECT content_hash, filename, status, created_at
+                 FROM auto_tag_status
+                 WHERE status IN ('pending', 'processing')
+                 ORDER BY created_at ASC, rowid ASC",
+            )?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok(AutoTagQueueItem {
+                        content_hash: row.get(0)?,
+                        filename: row.get(1)?,
+                        status: row.get(2)?,
+                        created_at: row.get(3)?,
+                    })
+                })?
+                .filter_map(|r| r.ok())
+                .collect();
+            Ok(rows)
         })
     }
 
@@ -1421,6 +1449,57 @@ mod tests {
         assert_eq!(
             store.auto_tag_status("h1").unwrap().unwrap().status,
             "tagged"
+        );
+    }
+
+    #[test]
+    fn list_auto_tag_queue_returns_waiting_and_in_flight_only_ordered() {
+        let (store, _dir) = setup_test_store();
+        // Distinct created_at values to make ordering deterministic.
+        for (h, status, created) in [
+            ("h-old-pending", "pending", "2026-08-01 10:00:00"),
+            ("h-in-flight", "processing", "2026-08-01 10:05:00"),
+            ("h-new-pending", "pending", "2026-08-01 10:10:00"),
+            ("h-tagged", "tagged", "2026-08-01 10:15:00"),
+            ("h-failed", "failed", "2026-08-01 10:20:00"),
+        ] {
+            store.upsert_document(h, &format!("/{}.pdf", h), "pdf", 0, 0).unwrap();
+            store
+                .upsert_auto_tag_status(h, &format!("{}.pdf", h), "x", status, None, None)
+                .unwrap();
+            store
+                .with_conn(|conn| {
+                    conn.execute(
+                        "UPDATE auto_tag_status SET created_at = ?1 WHERE content_hash = ?2",
+                        rusqlite::params![created, h],
+                    )?;
+                    Ok(())
+                })
+                .unwrap();
+        }
+
+        let queue = store.list_auto_tag_queue().unwrap();
+        let names: Vec<(&str, &str)> = queue
+            .iter()
+            .map(|i| (i.filename.as_str(), i.status.as_str()))
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                ("h-old-pending.pdf", "pending"),
+                ("h-in-flight.pdf", "processing"),
+                ("h-new-pending.pdf", "pending"),
+            ],
+            "queue must contain pending+processing only, oldest first: {:?}",
+            names
+        );
+        assert!(
+            queue.iter().all(|i| i.content_hash != "h-tagged"),
+            "tagged rows must be excluded"
+        );
+        assert!(
+            queue.iter().all(|i| i.content_hash != "h-failed"),
+            "failed rows must be excluded"
         );
     }
 

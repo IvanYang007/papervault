@@ -262,6 +262,7 @@ pub fn run_auto_tagger(
     progress: Option<Arc<AtomicUsize>>,
     breaker: Arc<ApiCircuitBreaker>,
     completed: Option<Arc<std::sync::Mutex<Option<String>>>>,
+    queue_snapshot: Arc<std::sync::Mutex<Option<Vec<crate::tags::model::AutoTagQueueItem>>>>,
 ) {
     info!("AutoTagger thread started");
     // Watchdog: periodically sweep rows stranded in 'processing' (a worker
@@ -274,6 +275,9 @@ pub fn run_auto_tagger(
     // drops). claim_pending_auto_tags is atomic — concurrent workers each get
     // a disjoint batch, so no document is ever sent to the API twice.
     if let Ok(pending) = tag_store.claim_pending_auto_tags(100) {
+        // Publish immediately after the claim so the UI shows these rows
+        // as in-flight while the batch runs.
+        refresh_queue_snapshot(&tag_store, &queue_snapshot);
         let stages = crate::indexer::stages::create_extractor_chain();
         for p in pending {
             if shutdown_flag.load(Ordering::Acquire) {
@@ -293,7 +297,12 @@ pub fn run_auto_tagger(
                 completed.as_deref(),
             );
         }
+        // Batch finished — publish the queue state (rows that remain).
+        refresh_queue_snapshot(&tag_store, &queue_snapshot);
     }
+    // Cadence gate for idle refreshes — the snapshot must not cost a DB
+    // query per loop tick.
+    let mut last_queue_refresh = std::time::Instant::now();
     while !shutdown_flag.load(Ordering::Acquire) {
         match rx.recv_timeout(Duration::from_millis(100)) {
             Ok(request) => {
@@ -309,6 +318,8 @@ pub fn run_auto_tagger(
                     &breaker,
                     completed.as_deref(),
                 );
+                // A manual re-tag click should be visible immediately.
+                refresh_queue_snapshot(&tag_store, &queue_snapshot);
                 if is_shutdown {
                     break;
                 }
@@ -327,7 +338,15 @@ pub fn run_auto_tagger(
                 // Channel idle — drain pending rows from the DB (the durable
                 // queue). This also recovers requests dropped by a full
                 // bounded channel instead of waiting for the next startup.
+                // Publish the queue state after the claim (rows show as
+                // in-flight while the batch runs) and at a 2s cadence when
+                // idle.
+                if last_queue_refresh.elapsed() >= Duration::from_secs(2) {
+                    refresh_queue_snapshot(&tag_store, &queue_snapshot);
+                    last_queue_refresh = std::time::Instant::now();
+                }
                 if let Ok(pending) = tag_store.claim_pending_auto_tags(8) {
+                    refresh_queue_snapshot(&tag_store, &queue_snapshot);
                     let stages = crate::indexer::stages::create_extractor_chain();
                     for p in pending {
                         if shutdown_flag.load(Ordering::Acquire) {
@@ -347,6 +366,7 @@ pub fn run_auto_tagger(
                             completed.as_deref(),
                         );
                     }
+                    refresh_queue_snapshot(&tag_store, &queue_snapshot);
                 }
             }
             Err(crossbeam::channel::RecvTimeoutError::Disconnected) => {
@@ -356,6 +376,27 @@ pub fn run_auto_tagger(
         }
     }
     info!("AutoTagger thread stopped");
+}
+
+/// Publish the live auto-tag queue (waiting + in-flight rows) to the
+/// shared snapshot the UI reads. Runs off the UI thread; the table is
+/// small so a per-file or gated refresh stays cheap.
+fn refresh_queue_snapshot(
+    tag_store: &TagStore,
+    snapshot: &Arc<std::sync::Mutex<Option<Vec<crate::tags::model::AutoTagQueueItem>>>>,
+) {
+    let items = match tag_store.list_auto_tag_queue() {
+        Ok(items) => items,
+        Err(e) => {
+            warn!("Failed to refresh auto-tag queue snapshot: {}", e);
+            return;
+        }
+    };
+    let waiting = items.iter().filter(|i| i.status == "pending").count();
+    let in_flight = items.iter().filter(|i| i.status == "processing").count();
+    debug!("Auto-tag queue: {} waiting, {} in flight", waiting, in_flight);
+    let mut g = snapshot.lock().unwrap_or_else(|e| e.into_inner());
+    *g = Some(items);
 }
 
 fn process_request(
@@ -1267,6 +1308,7 @@ mod tests {
         drop(tx); // no channel requests — DB claim path only
         let shutdown = Arc::new(AtomicBool::new(false));
         let breaker = ApiCircuitBreaker::new(100, 60_000);
+        let queue_snapshot = Arc::new(std::sync::Mutex::new(None));
         run_auto_tagger(
             rx,
             store,
@@ -1276,6 +1318,7 @@ mod tests {
             None,
             Arc::new(breaker),
             None,
+            queue_snapshot,
         );
 
         let captured = captured_text.lock().unwrap().clone();
@@ -1335,6 +1378,7 @@ mod tests {
         drop(tx);
         let shutdown = Arc::new(AtomicBool::new(false));
         let breaker = ApiCircuitBreaker::new(100, 60_000);
+        let queue_snapshot = Arc::new(std::sync::Mutex::new(None));
         run_auto_tagger(
             rx,
             store,
@@ -1344,6 +1388,7 @@ mod tests {
             None,
             Arc::new(breaker),
             None,
+            queue_snapshot,
         );
 
         let captured = captured_text.lock().unwrap().clone();
@@ -1352,5 +1397,110 @@ mod tests {
             Some(""),
             "missing file must fall back to empty text"
         );
+    }
+
+    #[test]
+    fn queue_snapshot_shows_in_flight_row_and_clears_after_drain() {
+        // The live queue snapshot must list a claimed row as in-flight
+        // while its API call is running, and show an empty queue once
+        // the drain finishes.
+        use crate::auto_tagger::config::AutoTagConfig;
+        use crate::auto_tagger::provider::{Entities, TagError, TagProvider, TagResponse};
+        use crate::tags::model::AutoTagQueueItem;
+        use crate::tags::store::TagStore;
+        use rusqlite::Connection;
+
+        struct SlowProvider(std::sync::Arc<std::sync::Mutex<usize>>);
+        impl TagProvider for SlowProvider {
+            fn generate_tags(
+                &self,
+                _: &str,
+                _: &str,
+                _: &[String],
+            ) -> Result<TagResponse, TagError> {
+                *self.0.lock().unwrap() += 1;
+                std::thread::sleep(Duration::from_millis(400)); // API in flight
+                Ok(TagResponse {
+                    tags: vec!["tax".to_string()],
+                    entities: Entities::default(),
+                })
+            }
+        }
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let file = dir.path().join("notice.txt");
+        std::fs::write(&file, "Canada Revenue Agency tax assessment").unwrap();
+
+        let conn = Connection::open(dir.path().join("test.db")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE documents (content_hash TEXT PRIMARY KEY, file_path TEXT NOT NULL, file_type TEXT NOT NULL, file_size INTEGER DEFAULT 0, modified_ts INTEGER DEFAULT 0, indexed_at TEXT DEFAULT '', last_error TEXT); CREATE TABLE tags (id INTEGER PRIMARY KEY, name TEXT UNIQUE NOT NULL); CREATE TABLE document_tags (content_hash TEXT REFERENCES documents ON DELETE CASCADE, tag_id INTEGER REFERENCES tags ON DELETE CASCADE, PRIMARY KEY(content_hash, tag_id)); CREATE TABLE auto_tag_status (content_hash TEXT PRIMARY KEY REFERENCES documents ON DELETE CASCADE, filename TEXT NOT NULL, content_hash_before_tag TEXT NOT NULL, status TEXT DEFAULT 'pending', tags_json TEXT, attempts INTEGER DEFAULT 0, last_error TEXT, created_at TEXT DEFAULT (datetime('now')), updated_at TEXT DEFAULT (datetime('now'))); CREATE TABLE auto_tag_cache (id INTEGER PRIMARY KEY AUTOINCREMENT, filename_tokens TEXT NOT NULL, tags_json TEXT NOT NULL, source_hash TEXT NOT NULL, hit_count INTEGER DEFAULT 1, created_at TEXT DEFAULT (datetime('now')), updated_at TEXT DEFAULT (datetime('now')));",
+        )
+        .unwrap();
+        let store = TagStore::new_for_test(conn);
+        let path_str = file.display().to_string();
+        store
+            .upsert_document("h1", &path_str, "txt", 0, 0)
+            .unwrap();
+        store
+            .upsert_auto_tag_status("h1", "notice.txt", "before", "pending", None, None)
+            .unwrap();
+
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(0usize));
+        let provider = SlowProvider(calls.clone());
+        let config = AutoTagConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let (tx, rx) = crossbeam::channel::bounded::<crate::app::AutoTagRequest>(1);
+        drop(tx);
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let breaker = ApiCircuitBreaker::new(100, 60_000);
+        let queue_snapshot: Arc<std::sync::Mutex<Option<Vec<AutoTagQueueItem>>>> =
+            Arc::new(std::sync::Mutex::new(None));
+
+        let worker = {
+            let snapshot = queue_snapshot.clone();
+            std::thread::spawn(move || {
+                run_auto_tagger(
+                    rx,
+                    store,
+                    Box::new(provider),
+                    config,
+                    shutdown,
+                    None,
+                    Arc::new(breaker),
+                    None,
+                    snapshot,
+                );
+            })
+        };
+
+        // While the provider is blocked in the API call, the row must be
+        // visible as in-flight.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut seen_in_flight = false;
+        while std::time::Instant::now() < deadline {
+            let items = queue_snapshot.lock().unwrap().clone();
+            if let Some(items) = items {
+                if items.iter().any(|i| i.status == "processing" && i.filename == "notice.txt") {
+                    seen_in_flight = true;
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            seen_in_flight,
+            "the claimed row must appear in the snapshot as in-flight during the API call"
+        );
+
+        worker.join().unwrap();
+        let final_items = queue_snapshot.lock().unwrap().clone();
+        assert_eq!(
+            final_items,
+            Some(vec![]),
+            "once the drain finishes, the queue snapshot must be empty"
+        );
+        assert_eq!(*calls.lock().unwrap(), 1, "the API must have been called once");
     }
 }

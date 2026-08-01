@@ -26,3 +26,14 @@ pub struct AutoTagStatus {
     pub created_at: String,
     pub updated_at: String,
 }
+
+/// One row of the live auto-tag queue: a document still waiting
+/// ('pending') or currently in flight ('processing').
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AutoTagQueueItem {
+    pub content_hash: String,
+    pub filename: String,
+    pub status: String,
+    /// UTC "YYYY-MM-DD HH:MM:SS" — used to show how long a file waited.
+    pub created_at: String,
+}
