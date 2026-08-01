@@ -274,12 +274,16 @@ pub fn run_auto_tagger(
     // Process any pending documents from DB (recovery after crash or channel
     // drops). claim_pending_auto_tags is atomic — concurrent workers each get
     // a disjoint batch, so no document is ever sent to the API twice.
-    if let Ok(pending) = tag_store.claim_pending_auto_tags(100) {
-        // Publish immediately after the claim so the UI shows these rows
-        // as in-flight while the batch runs.
-        refresh_queue_snapshot(&tag_store, &queue_snapshot);
-        let stages = crate::indexer::stages::create_extractor_chain();
-        for p in pending {
+    // While the circuit breaker is open, do not claim: rows stay 'pending'
+    // and are retried automatically once the probe closes the breaker —
+    // a breaker skip must never mark a file 'failed'.
+    if breaker.allow_request() {
+        if let Ok(pending) = tag_store.claim_pending_auto_tags(100) {
+            // Publish immediately after the claim so the UI shows these rows
+            // as in-flight while the batch runs.
+            refresh_queue_snapshot(&tag_store, &queue_snapshot);
+            let stages = crate::indexer::stages::create_extractor_chain();
+            for p in pending {
             if shutdown_flag.load(Ordering::Acquire) {
                 break;
             }
@@ -299,6 +303,7 @@ pub fn run_auto_tagger(
         }
         // Batch finished — publish the queue state (rows that remain).
         refresh_queue_snapshot(&tag_store, &queue_snapshot);
+        }
     }
     // Cadence gate for idle refreshes — the snapshot must not cost a DB
     // query per loop tick.
@@ -344,6 +349,11 @@ pub fn run_auto_tagger(
                 if last_queue_refresh.elapsed() >= Duration::from_secs(2) {
                     refresh_queue_snapshot(&tag_store, &queue_snapshot);
                     last_queue_refresh = std::time::Instant::now();
+                }
+                // Pause while the breaker is open — the rows stay 'pending'
+                // and the next probe resumes the drain automatically.
+                if !breaker.allow_request() {
+                    continue;
                 }
                 if let Ok(pending) = tag_store.claim_pending_auto_tags(8) {
                     refresh_queue_snapshot(&tag_store, &queue_snapshot);
@@ -539,8 +549,9 @@ fn tag_document(
 
     // Tier 3: AI fallback
     // Circuit breaker: while the provider is down, fail fast — no API call,
-    // no retry sleeps. The docs stay marked 'failed' and can be re-queued
-    // after the outage (manual retag or re-index).
+    // no retry sleeps. The row is restored to 'pending' (NOT 'failed' — the
+    // file was never tried) and is retried automatically once the probe
+    // closes the breaker.
     if !breaker.allow_request() {
         info!("  → circuit breaker open — skipping AI call for {filename}");
         let _ = tag_store
@@ -548,7 +559,7 @@ fn tag_document(
                 content_hash,
                 filename,
                 content_hash_before_tag,
-                "failed",
+                "pending",
                 None,
                 Some("Skipped: API circuit breaker open (provider unavailable)"),
             )
@@ -874,7 +885,10 @@ mod tests {
         );
         assert_eq!(progress.load(Ordering::Relaxed), 1);
         let status = store.auto_tag_status("h1").unwrap().unwrap();
-        assert_eq!(status.status, "failed");
+        assert_eq!(
+            status.status, "pending",
+            "a breaker skip must never mark the file failed — it was never tried"
+        );
         assert!(
             status
                 .last_error
@@ -1506,5 +1520,110 @@ mod tests {
             "once the drain finishes, the queue snapshot must be empty"
         );
         assert_eq!(*calls.lock().unwrap(), 1, "the API must have been called once");
+    }
+
+    #[test]
+    fn breaker_open_pauses_drain_and_rows_stay_pending_until_recovery() {
+        // While the circuit breaker is open the workers must NOT claim
+        // rows (no false 'failed' statuses, no DB churn). After the
+        // breaker closes, the drain resumes automatically.
+        use crate::auto_tagger::config::AutoTagConfig;
+        use crate::auto_tagger::provider::{Entities, TagError, TagProvider, TagResponse};
+        use crate::tags::store::TagStore;
+        use rusqlite::Connection;
+
+        struct CountingProvider(std::sync::atomic::AtomicUsize);
+        impl TagProvider for CountingProvider {
+            fn generate_tags(
+                &self,
+                _: &str,
+                _: &str,
+                _: &[String],
+            ) -> Result<TagResponse, TagError> {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                Ok(TagResponse {
+                    tags: vec![],
+                    entities: Entities::default(),
+                })
+            }
+        }
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let file = dir.path().join("notice.txt");
+        std::fs::write(&file, "tax notice content").unwrap();
+
+        let conn = Connection::open(dir.path().join("test.db")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE documents (content_hash TEXT PRIMARY KEY, file_path TEXT NOT NULL, file_type TEXT NOT NULL, file_size INTEGER DEFAULT 0, modified_ts INTEGER DEFAULT 0, indexed_at TEXT DEFAULT '', last_error TEXT); CREATE TABLE tags (id INTEGER PRIMARY KEY, name TEXT UNIQUE NOT NULL); CREATE TABLE document_tags (content_hash TEXT REFERENCES documents ON DELETE CASCADE, tag_id INTEGER REFERENCES tags ON DELETE CASCADE, PRIMARY KEY(content_hash, tag_id)); CREATE TABLE auto_tag_status (content_hash TEXT PRIMARY KEY REFERENCES documents ON DELETE CASCADE, filename TEXT NOT NULL, content_hash_before_tag TEXT NOT NULL, status TEXT DEFAULT 'pending', tags_json TEXT, attempts INTEGER DEFAULT 0, last_error TEXT, created_at TEXT DEFAULT (datetime('now')), updated_at TEXT DEFAULT (datetime('now'))); CREATE TABLE auto_tag_cache (id INTEGER PRIMARY KEY AUTOINCREMENT, filename_tokens TEXT NOT NULL, tags_json TEXT NOT NULL, source_hash TEXT NOT NULL, hit_count INTEGER DEFAULT 1, created_at TEXT DEFAULT (datetime('now')), updated_at TEXT DEFAULT (datetime('now')));",
+        )
+        .unwrap();
+        let store = TagStore::new_for_test(conn);
+        let path_str = file.display().to_string();
+        store
+            .upsert_document("h1", &path_str, "txt", 0, 0)
+            .unwrap();
+        store
+            .upsert_auto_tag_status("h1", "notice.txt", "before", "pending", None, None)
+            .unwrap();
+
+        // Trip the breaker BEFORE the worker starts.
+        let breaker = Arc::new(ApiCircuitBreaker::new(1, 60_000));
+        breaker.record_failure();
+        assert!(!breaker.allow_request(), "breaker must be open");
+
+        let provider = CountingProvider(std::sync::atomic::AtomicUsize::new(0));
+        let config = AutoTagConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        // Keep the sender ALIVE — in production the pipeline holds it; a
+        // disconnected channel would end the worker before recovery.
+        let (tx, rx) = crossbeam::channel::bounded::<crate::app::AutoTagRequest>(1);
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown_for_worker = shutdown.clone();
+        let queue_snapshot = Arc::new(std::sync::Mutex::new(None));
+
+        let breaker_for_worker = breaker.clone();
+        let store_for_worker = store.clone();
+        let worker = std::thread::spawn(move || {
+            run_auto_tagger(
+                rx,
+                store_for_worker,
+                Box::new(provider),
+                config,
+                shutdown_for_worker,
+                None,
+                breaker_for_worker,
+                None,
+                queue_snapshot,
+            );
+        });
+        // While the breaker is open the row must stay pending and the API
+        // must not be called.
+        std::thread::sleep(Duration::from_millis(400));
+        let status = store.auto_tag_status("h1").unwrap().unwrap();
+        assert_eq!(
+            status.status, "pending",
+            "open breaker must pause the drain — the row is not claimed"
+        );
+
+        // Recovery: the breaker closes → the drain resumes by itself.
+        breaker.record_success();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut tagged = false;
+        while std::time::Instant::now() < deadline {
+            let status = store.auto_tag_status("h1").unwrap().unwrap();
+            if status.status == "tagged" {
+                tagged = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(tagged, "drain must resume automatically after recovery");
+
+        // Shut the worker down cleanly.
+        shutdown.store(true, Ordering::Relaxed);
+        drop(tx);
+        worker.join().unwrap();
     }
 }
