@@ -26,6 +26,8 @@ pub struct DeepSeekProvider {
     timeout: Duration,
     /// Maximum words of text to send (soft cap — truncates at word boundary).
     max_text_words: usize,
+    /// Reasoning effort for thinking models; None omits the field.
+    thinking_effort: Option<String>,
 }
 
 impl DeepSeekProvider {
@@ -36,6 +38,7 @@ impl DeepSeekProvider {
         api_key_env: impl Into<String>,
         timeout_secs: u64,
         max_text_words: usize,
+        thinking_effort: Option<String>,
     ) -> Self {
         Self {
             agent: ureq::AgentBuilder::new()
@@ -47,6 +50,7 @@ impl DeepSeekProvider {
             api_key_env: api_key_env.into(),
             timeout: Duration::from_secs(timeout_secs),
             max_text_words,
+            thinking_effort,
         }
     }
 
@@ -198,7 +202,7 @@ impl TagProvider for DeepSeekProvider {
         let truncated = self.truncate_text(text);
         let prompt = self.build_prompt(filename, truncated, existing_tags);
 
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "model": self.model,
             "messages": [
                 {
@@ -210,6 +214,11 @@ impl TagProvider for DeepSeekProvider {
             "max_tokens": 4000,
             "stream": false
         });
+        // Thinking models honor a reasoning-effort hint; faster, cheaper
+        // responses at "low". Omitted entirely for models that reject it.
+        if let Some(effort) = &self.thinking_effort {
+            body["thinking_effort"] = serde_json::json!(effort);
+        }
 
         let body_str = serde_json::to_string(&body).map_err(|e| {
             TagError::BadRequest(format!("failed to serialize request body: {}", e))
@@ -278,6 +287,7 @@ mod tests {
             "DEEPSEEK_API_KEY",
             30,
             500,
+            Some("low".into()),
         )
     }
 

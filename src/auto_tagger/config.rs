@@ -30,6 +30,10 @@ pub struct AutoTagConfig {
     /// Maximum words of document text sent to the API (≈ one page).
     #[serde(default = "default_max_text_words")]
     pub max_text_words: usize,
+    /// Reasoning effort for thinking models ("low"/"medium"/"high").
+    /// None omits the field entirely (for models that reject it).
+    #[serde(default = "default_thinking_effort")]
+    pub thinking_effort: Option<String>,
 }
 
 fn default_provider() -> String {
@@ -56,6 +60,9 @@ fn default_request_timeout() -> u64 {
 fn default_max_tags() -> usize {
     8
 }
+fn default_thinking_effort() -> Option<String> {
+    Some("low".into())
+}
 fn default_max_text_words() -> usize {
     // ≈ one page of a typical letter: enough for the AI to understand the
     // topic, small enough to keep calls fast and cheap.
@@ -74,6 +81,7 @@ impl Default for AutoTagConfig {
             request_timeout_secs: default_request_timeout(),
             max_tags_per_doc: default_max_tags(),
             max_text_words: default_max_text_words(),
+            thinking_effort: default_thinking_effort(),
         }
     }
 }

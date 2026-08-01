@@ -111,6 +111,7 @@ impl FolderRuntime {
                     auto_tag_config.api_key_env.clone(),
                     auto_tag_config.request_timeout_secs,
                     auto_tag_config.max_text_words,
+                    auto_tag_config.thinking_effort.clone(),
                 ));
                 let at_config = auto_tag_config.clone();
                 let rx = auto_tagger_rx.clone();
