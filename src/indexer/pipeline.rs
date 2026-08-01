@@ -90,74 +90,76 @@ impl Pipeline {
         crate::indexer::pipeline::reconcile(self.search_engine.clone(), &self.tag_store);
         info!("Reconciliation complete.");
 
-        // Check if the index already has documents — if so, skip initial scan.
-        // Subsequent file changes are handled by the watcher.
-        let doc_count = {
-            let eng = self.search_engine.lock().unwrap_or_else(|e| e.into_inner());
-            eng.doc_count().unwrap_or(0)
-        };
+        // Always scan the folder at startup. Unchanged files are skipped via
+        // the metadata fast-path (path+size+mtime), so only new or changed
+        // files are extracted — this catches files added or modified while
+        // the app was closed, which the watcher cannot report.
+        info!("Running initial file scan...");
+        let (scan_tx, scan_rx) = crossbeam::channel::bounded::<IndexerMessage>(256);
+        let folder = self.watcher_folder.clone();
+        std::thread::spawn(move || {
+            if let Err(e) = crate::watcher::watcher::emit_initial_scan(&folder, &scan_tx) {
+                tracing::error!("Initial scan failed: {}", e);
+            }
+        });
         let mut scan_processed = 0usize;
-        if doc_count > 0 {
-            info!(
-                "Index already has {} documents — skipping initial scan",
-                doc_count
-            );
-        } else {
-            info!("Running initial file scan...");
-            let (scan_tx, scan_rx) = crossbeam::channel::bounded::<IndexerMessage>(256);
-            let folder = self.watcher_folder.clone();
-            std::thread::spawn(move || {
-                if let Err(e) = crate::watcher::watcher::emit_initial_scan(&folder, &scan_tx) {
-                    tracing::error!("Initial scan failed: {}", e);
-                }
-            });
-            scan_processed = 0;
 
-            // Batch files for parallel extraction (Tantivy writes stay sequential).
-            // Larger batch = better parallelism, but also more memory for extracted text.
-            // 32 files × ~50KB avg text = ~1.6MB per batch — well within desktop memory.
-            const PARALLEL_BATCH: usize = 32;
-            let mut batch: Vec<(PathBuf, u64, u64)> = Vec::with_capacity(PARALLEL_BATCH);
+        // Batch files for parallel extraction (Tantivy writes stay sequential).
+        // Larger batch = better parallelism, but also more memory for extracted text.
+        // 32 files × ~50KB avg text = ~1.6MB per batch — well within desktop memory.
+        const PARALLEL_BATCH: usize = 32;
+        let mut batch: Vec<(PathBuf, u64, u64)> = Vec::with_capacity(PARALLEL_BATCH);
 
-            for msg in scan_rx {
-                // Check shutdown flag periodically — allows fast close during scan
-                if self.shutdown.load(Ordering::Relaxed) {
-                    info!(
-                        "Initial scan interrupted by shutdown at {} files",
-                        scan_processed
-                    );
-                    break;
-                }
-                match msg {
-                    IndexerMessage::Upsert { path, mtime, size } => {
-                        batch.push((path, mtime, size));
-                        if batch.len() >= PARALLEL_BATCH {
-                            let batch_start = scan_processed;
-                            scan_processed += self.process_batch(&batch, batch_start);
-                            batch.clear();
-                            self.maybe_send_docs_snapshot();
-                        }
+        for msg in scan_rx {
+            // Check shutdown flag periodically — allows fast close during scan
+            if self.shutdown.load(Ordering::Relaxed) {
+                info!(
+                    "Initial scan interrupted by shutdown at {} files",
+                    scan_processed
+                );
+                break;
+            }
+            match msg {
+                IndexerMessage::Upsert { path, mtime, size } => {
+                    // Fast-path: skip files already indexed with identical
+                    // metadata (same path+size+mtime). On lookup error, treat
+                    // as not indexed — re-indexing is idempotent.
+                    let path_str = path.display().to_string();
+                    if self
+                        .tag_store
+                        .already_indexed_by_metadata(&path_str, size, mtime)
+                        .unwrap_or(false)
+                    {
+                        debug!("Skipping {} (unchanged metadata)", path_str);
+                        continue;
                     }
-                    IndexerMessage::Delete { path } => {
-                        debug!("Pipeline delete: {}", path.display());
-                        if let Err(e) = self.process_delete(&path) {
-                            error!("Delete error for {}: {}", path.display(), e);
-                        }
+                    batch.push((path, mtime, size));
+                    if batch.len() >= PARALLEL_BATCH {
+                        let batch_start = scan_processed;
+                        scan_processed += self.process_batch(&batch, batch_start);
+                        batch.clear();
+                        self.maybe_send_docs_snapshot();
+                    }
+                }
+                IndexerMessage::Delete { path } => {
+                    debug!("Pipeline delete: {}", path.display());
+                    if let Err(e) = self.process_delete(&path) {
+                        error!("Delete error for {}: {}", path.display(), e);
                     }
                 }
             }
-            // Process remaining batch
-            if !batch.is_empty() {
-                let batch_start = scan_processed;
-                scan_processed += self.process_batch(&batch, batch_start);
+        }
+        // Process remaining batch
+        if !batch.is_empty() {
+            let batch_start = scan_processed;
+            scan_processed += self.process_batch(&batch, batch_start);
+        }
+        // Commit any pending files from the initial scan
+        if self.pending_count > 0 {
+            if let Err(e) = self.commit() {
+                error!("Initial scan commit error: {}", e);
             }
-            // Commit any pending files from the initial scan
-            if self.pending_count > 0 {
-                if let Err(e) = self.commit() {
-                    error!("Initial scan commit error: {}", e);
-                }
-                self.pending_count = 0;
-            }
+            self.pending_count = 0;
         }
         let _ = self.progress_tx.send(IndexerProgress::ScanComplete {
             total: scan_processed,
@@ -1177,6 +1179,228 @@ mod tests {
         assert_eq!(last.len(), 1, "snapshot must include the seeded document");
         assert_eq!(last[0].content_hash, "h1");
         assert_eq!(last[0].file_path, "/test/doc.pdf");
+    }
+
+    #[test]
+    fn startup_scan_indexes_files_added_while_app_was_closed() {
+        // A previous session indexed existing.txt; while the app was closed,
+        // newfile.txt was added to the folder. The watcher cannot see events
+        // it missed, so the startup scan must pick up newfile.txt while
+        // skipping existing.txt (unchanged metadata).
+        use crate::app::TagUpdate;
+        use crate::search::engine::SearchEngine;
+        use crate::tags::store::DocumentInfo;
+        use crate::watcher::watcher::IndexerMessage;
+
+        let (store, _dir) = setup_tag_store();
+
+        // Watched folder with one "old" file and one "new" file.
+        let watched = tempfile::TempDir::new().unwrap();
+        let existing = watched.path().join("existing.txt");
+        std::fs::write(&existing, "existing content").unwrap();
+        let em = std::fs::metadata(&existing).unwrap();
+        let existing_mtime = em
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let new_file = watched.path().join("newfile.txt");
+        std::fs::write(&new_file, "brand new content").unwrap();
+
+        // Temp search engine (same inline setup as sibling tests).
+        let index_dir = tempfile::TempDir::new().unwrap();
+        let schema = crate::search::schema::build_schema();
+        let fields = crate::search::schema::SchemaFields::from_schema(&schema);
+        let index = tantivy::Index::create_in_dir(index_dir.path(), schema.clone()).unwrap();
+        let tokenizer = tantivy::tokenizer::TextAnalyzer::builder(
+            tantivy::tokenizer::SimpleTokenizer::default(),
+        )
+        .filter(tantivy::tokenizer::LowerCaser)
+        .build();
+        index.tokenizers().register("body", tokenizer);
+        let writer = index.writer(50_000_000).unwrap();
+        let reader = index
+            .reader_builder()
+            .reload_policy(tantivy::ReloadPolicy::Manual)
+            .try_into()
+            .unwrap();
+        let engine = Arc::new(std::sync::Mutex::new(SearchEngine {
+            index,
+            schema,
+            fields,
+            reader,
+            writer,
+        }));
+
+        // Seed the "previous session" state: SQLite row + Tantivy doc, so the
+        // old behavior (doc_count > 0 → skip initial scan) would trigger.
+        let existing_path_str = existing.display().to_string();
+        store
+            .upsert_document(
+                "hash-existing",
+                &existing_path_str,
+                "txt",
+                em.len() as i64,
+                existing_mtime as i64,
+            )
+            .unwrap();
+        {
+            let mut eng = engine.lock().unwrap_or_else(|e| e.into_inner());
+            eng.index_document(
+                "hash-existingtxt",
+                &existing,
+                "existing.txt",
+                "existing content",
+                "txt",
+                existing_mtime as i64,
+                "hash-existing",
+                &[],
+            )
+            .unwrap();
+            eng.commit().unwrap();
+            eng.reload().unwrap(); // Manual reload policy: make the seed visible
+        }
+
+        let (msg_tx, msg_rx) = crossbeam::channel::bounded::<IndexerMessage>(100);
+        let (tag_tx, tag_rx) = crossbeam::channel::bounded::<TagUpdate>(100);
+        let (progress_tx, progress_rx) = crossbeam::channel::unbounded::<IndexerProgress>();
+
+        let mut pipeline = Pipeline::new(
+            engine.clone(),
+            store,
+            watched.path().to_path_buf(),
+            msg_rx,
+            tag_rx,
+            progress_tx,
+            None,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(true)), // browser refresh requested at startup
+        );
+
+        // No watcher events; closing the channel ends run() after the scan.
+        drop(msg_tx);
+        drop(tag_tx);
+        pipeline.run();
+
+        let mut snapshots: Vec<Vec<DocumentInfo>> = Vec::new();
+        let mut scan_total: Option<usize> = None;
+        while let Ok(msg) = progress_rx.try_recv() {
+            match msg {
+                IndexerProgress::DocsSnapshot { docs } => snapshots.push(docs),
+                IndexerProgress::ScanComplete { total } => scan_total = Some(total),
+                _ => {}
+            }
+        }
+
+        let last = snapshots.last().expect("at least one DocsSnapshot");
+        let new_path_str = new_file.display().to_string();
+        assert!(
+            last.iter().any(|d| d.file_path == new_path_str),
+            "startup scan must index the file added while the app was closed"
+        );
+        assert_eq!(
+            last.iter().filter(|d| d.file_path == existing_path_str).count(),
+            1,
+            "unchanged file must not be duplicated by the scan"
+        );
+        assert_eq!(
+            scan_total,
+            Some(1),
+            "scan must process only the new file (unchanged file skipped)"
+        );
+    }
+
+    #[test]
+    fn startup_scan_reindexes_files_changed_while_app_was_closed() {
+        // A file modified while the app was closed has stale metadata in
+        // SQLite; the startup scan must re-extract and re-index it.
+        use crate::app::TagUpdate;
+        use crate::search::engine::SearchEngine;
+        use crate::tags::store::DocumentInfo;
+        use crate::watcher::watcher::IndexerMessage;
+
+        let (store, _dir) = setup_tag_store();
+
+        let watched = tempfile::TempDir::new().unwrap();
+        let file = watched.path().join("doc.txt");
+        std::fs::write(&file, "changed content").unwrap();
+
+        // Stale row from the "previous session": old size, old mtime,
+        // old hash — none of them match the on-disk file.
+        let path_str = file.display().to_string();
+        store
+            .upsert_document("hash-stale", &path_str, "txt", 0, 0)
+            .unwrap();
+
+        // Temp search engine (same inline setup as sibling tests).
+        let index_dir = tempfile::TempDir::new().unwrap();
+        let schema = crate::search::schema::build_schema();
+        let fields = crate::search::schema::SchemaFields::from_schema(&schema);
+        let index = tantivy::Index::create_in_dir(index_dir.path(), schema.clone()).unwrap();
+        let tokenizer = tantivy::tokenizer::TextAnalyzer::builder(
+            tantivy::tokenizer::SimpleTokenizer::default(),
+        )
+        .filter(tantivy::tokenizer::LowerCaser)
+        .build();
+        index.tokenizers().register("body", tokenizer);
+        let writer = index.writer(50_000_000).unwrap();
+        let reader = index
+            .reader_builder()
+            .reload_policy(tantivy::ReloadPolicy::Manual)
+            .try_into()
+            .unwrap();
+        let engine = Arc::new(std::sync::Mutex::new(SearchEngine {
+            index,
+            schema,
+            fields,
+            reader,
+            writer,
+        }));
+
+        let (msg_tx, msg_rx) = crossbeam::channel::bounded::<IndexerMessage>(100);
+        let (tag_tx, tag_rx) = crossbeam::channel::bounded::<TagUpdate>(100);
+        let (progress_tx, progress_rx) = crossbeam::channel::unbounded::<IndexerProgress>();
+
+        let mut pipeline = Pipeline::new(
+            engine.clone(),
+            store,
+            watched.path().to_path_buf(),
+            msg_rx,
+            tag_rx,
+            progress_tx,
+            None,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(true)), // browser refresh requested at startup
+        );
+
+        // No watcher events; closing the channel ends run() after the scan.
+        drop(msg_tx);
+        drop(tag_tx);
+        pipeline.run();
+
+        let mut snapshots: Vec<Vec<DocumentInfo>> = Vec::new();
+        let mut scan_total: Option<usize> = None;
+        while let Ok(msg) = progress_rx.try_recv() {
+            match msg {
+                IndexerProgress::DocsSnapshot { docs } => snapshots.push(docs),
+                IndexerProgress::ScanComplete { total } => scan_total = Some(total),
+                _ => {}
+            }
+        }
+
+        let last = snapshots.last().expect("at least one DocsSnapshot");
+        let doc = last
+            .iter()
+            .find(|d| d.file_path == path_str)
+            .expect("changed file must be re-indexed by the scan");
+        let expected_hash = crate::indexer::pipeline::compute_content_hash("changed content", "txt");
+        assert_eq!(
+            doc.content_hash, expected_hash,
+            "changed file must be re-extracted and re-indexed"
+        );
+        assert_eq!(scan_total, Some(1), "scan must process the changed file");
     }
 
     #[test]
