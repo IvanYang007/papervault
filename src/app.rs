@@ -900,9 +900,15 @@ impl PapervaultApp {
             return;
         }
 
-        // Re-extract text from the file
-        let Ok(content) = std::fs::read_to_string(path) else {
-            return;
+        // Re-extract text from the file. PDFs are binary — read_to_string
+        // fails on them — so use the same extractor chain the indexer uses.
+        let stages = crate::indexer::stages::create_extractor_chain();
+        let content = match crate::indexer::stages::run_chain(path, &stages) {
+            Ok(Some(extracted)) => extracted.text,
+            _ => {
+                tracing::warn!("Could not extract text for re-tag: {}", file_path);
+                return;
+            }
         };
         let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
 
@@ -925,12 +931,18 @@ impl PapervaultApp {
         // The pending reset wipes tags_json — drop the stale display cache entry.
         self.invalidate_auto_tag(&hash);
 
-        let _ = tx.send(AutoTagRequest::TagDocument {
+        // Non-blocking send — the UI thread must never wait on a full
+        // queue; a dropped request is recovered from the DB 'pending' row.
+        if tx.try_send(AutoTagRequest::TagDocument {
             content_hash: hash.clone(),
             filename: file_name.to_string(),
             text: content,
             content_hash_before_tag,
-        });
+        })
+        .is_err()
+        {
+            tracing::warn!("Auto-tagger queue full — re-tag will be picked up from the DB queue");
+        }
     }
 
     /// Send an auto-tag request from the UI thread without ever blocking.
