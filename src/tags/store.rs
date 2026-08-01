@@ -321,6 +321,21 @@ impl TagStore {
         })
     }
 
+    /// Look up the on-disk path for a content hash. Used by the auto-tagger
+    /// to re-extract the document text before tagging rows recovered from
+    /// the durable DB queue (the queue stores the filename only).
+    pub fn file_path_for_content_hash(&self, content_hash: &str) -> SqlResult<Option<String>> {
+        self.with_conn(|conn| {
+            let mut stmt =
+                conn.prepare_cached("SELECT file_path FROM documents WHERE content_hash = ?1")?;
+            match stmt.query_row(params![content_hash], |row| row.get(0)) {
+                Ok(path) => Ok(Some(path)),
+                Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+                Err(e) => Err(e),
+            }
+        })
+    }
+
     /// List all indexed documents for the file browser.
     pub fn list_all_documents(&self) -> SqlResult<Vec<DocumentInfo>> {
         self.with_conn(|conn| {
@@ -1842,5 +1857,23 @@ mod tests {
             })
             .unwrap();
         assert_eq!(count, CACHE_MAX_ROWS);
+    }
+
+    #[test]
+    fn file_path_for_content_hash_returns_path_and_none_for_missing() {
+        let (store, _dir) = setup_test_store();
+        store.upsert_document("h1", "/a/b/notice.pdf", "pdf", 0, 0).unwrap();
+        assert_eq!(
+            store
+                .file_path_for_content_hash("h1")
+                .unwrap()
+                .as_deref(),
+            Some("/a/b/notice.pdf")
+        );
+        assert_eq!(
+            store.file_path_for_content_hash("nope").unwrap(),
+            None,
+            "unknown hash must return None"
+        );
     }
 }
