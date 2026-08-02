@@ -11,7 +11,7 @@ const PROMPT_TEMPLATE: &str = r#"Output ONLY this JSON. No other text.
 If text is empty or unextractable, generate tags from the filename alone.
 Rules:
 - No explanations.
-- Max 12 tags.
+- Max 5 tags.
 - Prefer exact text spans.
 - Persons: include full names and obvious variants only if present.
 - Years: 4-digit years only.

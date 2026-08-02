@@ -64,7 +64,7 @@ fn default_request_timeout() -> u64 {
     240
 }
 fn default_max_tags() -> usize {
-    8
+    5
 }
 fn default_thinking_effort() -> Option<String> {
     Some("low".into())
