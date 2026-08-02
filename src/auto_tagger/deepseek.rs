@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use serde_json::Value;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use super::provider::{TagError, TagProvider, TagResponse};
 
@@ -28,6 +28,8 @@ pub struct DeepSeekProvider {
     max_text_words: usize,
     /// Reasoning effort for thinking models; None omits the field.
     thinking_effort: Option<String>,
+    /// Output token budget — must exceed worst-case reasoning length.
+    max_tokens: usize,
 }
 
 impl DeepSeekProvider {
@@ -39,6 +41,7 @@ impl DeepSeekProvider {
         timeout_secs: u64,
         max_text_words: usize,
         thinking_effort: Option<String>,
+        max_tokens: usize,
     ) -> Self {
         Self {
             agent: ureq::AgentBuilder::new()
@@ -51,6 +54,7 @@ impl DeepSeekProvider {
             timeout: Duration::from_secs(timeout_secs),
             max_text_words,
             thinking_effort,
+            max_tokens,
         }
     }
 
@@ -211,7 +215,7 @@ impl TagProvider for DeepSeekProvider {
                 }
             ],
             "temperature": 0.1,
-            "max_tokens": 4000,
+            "max_tokens": self.max_tokens,
             "stream": false
         });
         // Thinking models honor a reasoning-effort hint; faster, cheaper
@@ -228,6 +232,8 @@ impl TagProvider for DeepSeekProvider {
             "🤖 DeepSeek API call: {filename} ({} chars of text)",
             truncated.len()
         );
+        // Diagnostic interception: the exact bytes sent on the wire.
+        debug!("DeepSeek request body: {}", body_str);
         let started = std::time::Instant::now();
         let response = self
             .agent
@@ -260,6 +266,10 @@ impl TagProvider for DeepSeekProvider {
 
         let result = Self::parse_response(&body_str);
         let elapsed_ms = started.elapsed().as_millis();
+        if result.is_err() {
+            // Diagnostic interception: the full raw API response on failure.
+            debug!("DeepSeek raw response ({} ms): {}", elapsed_ms, body_str);
+        }
         match &result {
             Ok(r) => info!(
                 "📥 DeepSeek response for {filename}: {} tags, {} persons ({} ms)",
@@ -288,6 +298,7 @@ mod tests {
             30,
             500,
             Some("low".into()),
+            16000,
         )
     }
 

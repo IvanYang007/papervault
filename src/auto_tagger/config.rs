@@ -34,6 +34,11 @@ pub struct AutoTagConfig {
     /// None omits the field entirely (for models that reject it).
     #[serde(default = "default_thinking_effort")]
     pub thinking_effort: Option<String>,
+    /// Output token budget. Must leave headroom for reasoning: with
+    /// max_tokens=4000 the model sometimes burned the whole budget
+    /// thinking and returned empty content (finish_reason "length").
+    #[serde(default = "default_max_tokens")]
+    pub max_tokens: usize,
 }
 
 fn default_provider() -> String {
@@ -52,16 +57,20 @@ fn default_max_retries() -> u32 {
     3
 }
 fn default_request_timeout() -> u64 {
-    // LLM generation on a loaded origin regularly takes 30-60s; the old
-    // 30s read timeout killed real requests (Windows reports the read
-    // timeout as os error 10060, which looked like a network outage).
-    120
+    // LLM generation on a loaded origin regularly takes 30-60s (and a
+    // reasoning model with a large token budget can take minutes); the
+    // old 30s read timeout killed real requests (Windows reports the
+    // read timeout as os error 10060, which looked like a network outage).
+    240
 }
 fn default_max_tags() -> usize {
     8
 }
 fn default_thinking_effort() -> Option<String> {
     Some("low".into())
+}
+fn default_max_tokens() -> usize {
+    16000
 }
 fn default_max_text_words() -> usize {
     // ≈ one page of a typical letter: enough for the AI to understand the
@@ -82,6 +91,7 @@ impl Default for AutoTagConfig {
             max_tags_per_doc: default_max_tags(),
             max_text_words: default_max_text_words(),
             thinking_effort: default_thinking_effort(),
+            max_tokens: default_max_tokens(),
         }
     }
 }
