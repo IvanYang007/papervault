@@ -1,6 +1,6 @@
 # Papervault
 
-Fast, lightweight PDF & text file search and viewer for Windows 11. Full-text search with snippets, PDF preview with zoom, AI-powered auto-tagging via DeepSeek (with `xiaomi/mimo-v2.5` on OpenRouter for image-only documents), split-panel layout, multi-selection batch tagging, and CJK (Chinese/Japanese) font support — all local, built in Rust.
+Fast, lightweight PDF & text file search and viewer for Windows 11. Full-text search with snippets, PDF preview with zoom, AI-powered auto-tagging via DeepSeek, split-panel layout, multi-selection batch tagging, and CJK (Chinese/Japanese) font support — all local, built in Rust.
 
 ## Features
 
@@ -11,7 +11,7 @@ Fast, lightweight PDF & text file search and viewer for Windows 11. Full-text se
 - **Parallel indexing** — initial folder scan extracts 32 files at once via rayon; subsequent launches skip the scan if the index is up-to-date; SQLite writes batched into one transaction per 32-file batch
 - **PDF preview** — cached parsed document (parsed once per file, ~6× faster page flips), two-pass rendering (low-res→full-res), LRU page cache, display-resolution rendering, encrypted PDF support
 - **Page prefetch** — next page renders during idle, forward nav feels instant
-- **AI auto-tagging** — DeepSeek API generates document tags from content with 3-tier caching (exact hash, filename token overlap, AI fallback). **Image documents** (scans with no extractable text layer) are processed with the `xiaomi/mimo-v2.5` vision model via OpenRouter
+- **AI auto-tagging** — DeepSeek API generates document tags from content with 3-tier caching (exact hash, filename token overlap, AI fallback)
 - **No wasted API calls** — already-tagged files are never re-sent to the API; re-indexing preserves both AI and manual tags (no wipe via FK cascade)
 - **One-click re-index for tags** — re-tags the whole library through a durable DB queue (survives queue backpressure, picks up automatically)
 - **API circuit breaker** — a dead DeepSeek endpoint fails fast instead of churning for hours; recovers with a probe call after the cooldown
@@ -28,7 +28,7 @@ Fast, lightweight PDF & text file search and viewer for Windows 11. Full-text se
 2. Place `pdfium.dll` next to `papervault.exe`
 3. Launch the app, click 📁 Folder, select your documents folder
 4. Files are indexed automatically — start searching immediately
-5. Optional: Set `DEEPSEEK_API_KEY` env var and enable Auto-tagging in the Folder dialog for AI-generated tags. For image-only documents (no text layer), also set `OPENROUTER_API_KEY` — those are tagged via the `xiaomi/mimo-v2.5` vision model on OpenRouter
+5. Optional: Set `DEEPSEEK_API_KEY` env var and enable Auto-tagging in the Folder dialog for AI-generated tags
 
 ## Build from Source
 
@@ -56,7 +56,7 @@ cargo build --release
 | PDF rendering | pdfium-render 0.8.37 (Chromium pdfium) |
 | File watching | notify 7 + walkdir (recursive) |
 | Tags | SQLite (rusqlite, WAL + synchronous=NORMAL, prepared-statement cache, batched transactions) |
-| Auto-tagging | DeepSeek API (ureq, 3-worker thread pool, circuit breaker, atomic row claiming); image documents: `xiaomi/mimo-v2.5` vision model via OpenRouter |
+| Auto-tagging | DeepSeek API (ureq, 3-worker thread pool, circuit breaker, atomic row claiming) |
 | Fonts | Microsoft YaHei / SimSun CJK via egui FontDefinitions |
 
 ## Architecture
