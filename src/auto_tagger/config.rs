@@ -70,7 +70,8 @@ fn default_thinking_effort() -> Option<String> {
     Some("low".into())
 }
 fn default_max_tokens() -> usize {
-    16000
+    // Worst measured reasoning: ~14.6K tokens on a 500-word document.
+    24000
 }
 fn default_max_text_words() -> usize {
     // ≈ one page of a typical letter: enough for the AI to understand the

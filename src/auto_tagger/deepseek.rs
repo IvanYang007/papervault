@@ -120,12 +120,22 @@ impl DeepSeekProvider {
                 TagError::Parse("API response missing 'choices[0].message.content'".into())
             })?;
 
-        // Empty completions are transient model behavior — retryable so
-        // the worker's retry loop gives the model another chance.
+        // Empty completions: either transient model behavior (retryable)
+        // or the model exhausted its token budget reasoning before it
+        // could write the answer (finish_reason "length") — distinguish
+        // them so the failure is diagnosable.
         if content.trim().is_empty() {
-            return Err(TagError::Unavailable(
-                "model returned empty content — retrying".into(),
-            ));
+            let fr = root["choices"][0]["finish_reason"]
+                .as_str()
+                .unwrap_or("");
+            let msg = if fr == "length" {
+                format!(
+                    "model exhausted its token budget reasoning (finish_reason=length) — raise max_tokens"
+                )
+            } else {
+                "model returned empty content — retrying".to_string()
+            };
+            return Err(TagError::Unavailable(msg));
         }
 
         let tag_json = extract_json_object(content).ok_or_else(|| {
@@ -475,6 +485,32 @@ mod tests {
         assert!(
             matches!(result, Err(TagError::Unavailable(_))),
             "empty content must be retryable"
+        );
+    }
+
+    #[test]
+    fn parse_response_flags_token_budget_exhaustion() {
+        // finish_reason=length + empty content = the model reasoned past
+        // its token budget; the error must say so.
+        let body = r#"{
+            "choices": [{
+                "finish_reason": "length",
+                "message": {
+                    "content": ""
+                }
+            }]
+        }"#;
+        let result = DeepSeekProvider::parse_response(body);
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, TagError::Unavailable(_)),
+            "budget exhaustion must stay retryable: {:?}",
+            err
+        );
+        assert!(
+            err.to_string().contains("max_tokens"),
+            "error must point at the token budget: {:?}",
+            err
         );
     }
 
