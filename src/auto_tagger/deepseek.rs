@@ -9,7 +9,14 @@ use super::provider::{TagError, TagProvider, TagResponse};
 /// Prompt template — minimal to force JSON compliance with deepseek-v4-flash.
 const PROMPT_TEMPLATE: &str = r#"Output ONLY this JSON. No other text.
 If text is empty or unextractable, generate tags from the filename alone.
-IMPORTANT for person names: extract ALL name variants (full, partial, initials). Names may appear with/without spaces, reversed order, or CamelCase.
+Rules:
+- No explanations.
+- Max 12 tags.
+- Prefer exact text spans.
+- Persons: include full names and obvious variants only if present.
+- Years: 4-digit years only.
+- Amounts: currency or numeric amounts only.
+- doc_id: form/document numbers only.
 {"tags":["keyword1","keyword2"],"entities":{"persons":["Full Name"],"organizations":["Org Name"],"years":["2024"],"doc_id":["form-number"],"amounts":["$1,000"]}}
 
 Filename: {{FILENAME}}
