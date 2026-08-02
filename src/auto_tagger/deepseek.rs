@@ -8,6 +8,7 @@ use super::provider::{TagError, TagProvider, TagResponse};
 /// Prompt template for the DeepSeek API — kept minimal to force JSON compliance.
 /// Prompt template — minimal to force JSON compliance with deepseek-v4-flash.
 const PROMPT_TEMPLATE: &str = r#"Output ONLY this JSON. No other text.
+Do NOT think step by step. Do NOT reason. Answer immediately.
 If text is empty or unextractable, generate tags from the filename alone.
 Rules:
 - No explanations.
