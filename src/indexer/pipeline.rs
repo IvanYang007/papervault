@@ -696,6 +696,20 @@ impl Pipeline {
     fn process_delete(&mut self, path: &Path) -> anyhow::Result<()> {
         let path_str = path.display().to_string();
 
+        // Defense in depth against spurious Remove events (common on network
+        // shares). Deleting the documents row CASCADEs away the auto-tag
+        // status (AI tags); a file that still exists would be re-tagged on
+        // the next scan — paid API calls for nothing. The watcher already
+        // filters these, but races (Remove+Create collapse inside the debounce
+        // window) can still reach here with a live file.
+        if path.exists() {
+            debug!(
+                "Skipping delete for {} (file still exists — likely spurious Remove event)",
+                path_str
+            );
+            return Ok(());
+        }
+
         // Look up content hash from SQLite
         if let Some(content_hash) = self.tag_store.get_hash_by_path(&path_str)? {
             // Remove from Tantivy
@@ -982,6 +996,110 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(new_hash, hash);
+    }
+
+    #[test]
+    fn process_delete_keeps_rows_when_file_still_exists() {
+        // A spurious Remove event (network-share watcher) must not delete the
+        // documents row — the cascade would wipe the auto-tag status (AI
+        // tags) and the file would be re-tagged on the next scan.
+        use crate::app::TagUpdate;
+        use crate::search::engine::SearchEngine;
+        use crate::watcher::watcher::IndexerMessage;
+
+        let (store, _dir) = setup_tag_store();
+
+        let watched = tempfile::TempDir::new().unwrap();
+        let file = watched.path().join("doc.pdf");
+        std::fs::write(&file, "content").unwrap();
+        let path_str = file.display().to_string();
+        store
+            .upsert_document("hash1", &path_str, "pdf", 7, 0)
+            .unwrap();
+        store
+            .upsert_auto_tag_status(
+                "hash1",
+                "doc.pdf",
+                "before",
+                "tagged",
+                Some(r#"{"tags":["keep"]}"#),
+                None,
+            )
+            .unwrap();
+
+        let index_dir = tempfile::TempDir::new().unwrap();
+        let schema = crate::search::schema::build_schema();
+        let fields = crate::search::schema::SchemaFields::from_schema(&schema);
+        let index = tantivy::Index::create_in_dir(index_dir.path(), schema.clone()).unwrap();
+        let tokenizer = tantivy::tokenizer::TextAnalyzer::builder(
+            tantivy::tokenizer::SimpleTokenizer::default(),
+        )
+        .filter(tantivy::tokenizer::LowerCaser)
+        .build();
+        index.tokenizers().register("body", tokenizer);
+        let writer = index.writer(50_000_000).unwrap();
+        let reader = index
+            .reader_builder()
+            .reload_policy(tantivy::ReloadPolicy::Manual)
+            .try_into()
+            .unwrap();
+        let engine = Arc::new(std::sync::Mutex::new(SearchEngine {
+            index,
+            schema,
+            fields,
+            reader,
+            writer,
+        }));
+        {
+            let mut eng = engine.lock().unwrap_or_else(|e| e.into_inner());
+            eng.index_document(
+                "hash1pdf",
+                &file,
+                "doc.pdf",
+                "content",
+                "pdf",
+                0,
+                "hash1",
+                &[],
+            )
+            .unwrap();
+            eng.commit().unwrap();
+        }
+
+        let (_msg_tx, msg_rx) = crossbeam::channel::bounded::<IndexerMessage>(100);
+        let (_tag_tx, tag_rx) = crossbeam::channel::bounded::<TagUpdate>(100);
+        let (progress_tx, _progress_rx) = crossbeam::channel::unbounded::<IndexerProgress>();
+        let mut pipeline = Pipeline::new(
+            engine,
+            store.clone(),
+            watched.path().to_path_buf(),
+            msg_rx,
+            tag_rx,
+            progress_tx,
+            None,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        );
+
+        // File still on disk → spurious Remove must be ignored.
+        pipeline.process_delete(&file).unwrap();
+        assert!(
+            store.auto_tag_status("hash1").unwrap().is_some(),
+            "auto-tag status must survive a spurious Remove event"
+        );
+        assert!(
+            store.get_hash_by_path(&path_str).unwrap().is_some(),
+            "documents row must survive a spurious Remove event"
+        );
+
+        // File really gone → delete proceeds (rows removed).
+        std::fs::remove_file(&file).unwrap();
+        pipeline.process_delete(&file).unwrap();
+        assert!(
+            store.auto_tag_status("hash1").unwrap().is_none(),
+            "a real delete must remove the auto-tag status row"
+        );
+        assert!(store.get_hash_by_path(&path_str).unwrap().is_none());
     }
 
     #[test]

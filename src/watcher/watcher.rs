@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
 /// Messages sent from the watcher to the indexer thread.
 #[derive(Debug, Clone)]
@@ -61,8 +61,21 @@ pub fn start_watching(
                     }
                     EventKind::Remove(_) => {
                         for path in &event.paths {
-                            if is_supported_extension(path) {
+                            // Watch for spurious Remove events: on network shares
+                            // (SMB/Z:) the watcher can report a file as removed
+                            // while it is still on disk (lease breaks, other
+                            // clients, reconnect bursts). Honoring such an event
+                            // deletes the SQLite row and CASCADEs away the file's
+                            // auto-tag status (AI tags) — the next scan then
+                            // re-tags the file, spending API calls for nothing.
+                            // Only emit the Delete when the file is really gone.
+                            if is_supported_extension(path) && !path.exists() {
                                 let _ = tx.send(IndexerMessage::Delete { path: path.clone() });
+                            } else if is_supported_extension(path) {
+                                debug!(
+                                    "Ignoring spurious Remove event (file still exists): {}",
+                                    path.display()
+                                );
                             }
                         }
                     }
