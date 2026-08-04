@@ -171,6 +171,24 @@ ef68dc8 fix: address rust-code-review P2 findings
 
 ---
 
+## v3.1 — Auto-Tagging Cost & Stability Fixes (2026-08-04)
+
+Three root causes were found in one debugging session after the auto-tagger
+re-tagged ~250-400 files (paid DeepSeek calls) on every launch. Full write-up
+(agent-readable, with deploy checklist): `D:/Github/docs/solutions/rust-windows/
+auto-tagger-retag-churn.md`.
+
+| Commit | Fix | Root cause |
+|--------|-----|------------|
+| `bf2a5e9` | Watcher only honors Remove events when the file is really gone (`path.exists()` check in `watcher.rs` + `process_delete`) | SMB shares report spurious `FILE_ACTION_REMOVED`; each one cascade-wiped the document row and its AI tags, forcing a re-tag |
+| `dbe85db` | Send `thinking: {"type": "disabled"}` by default; config key `thinking_enabled` (was `thinking_effort`, an invalid DeepSeek param the API silently ignored) | Every call ran chain-of-thought at full strength: 2-3x latency, empty responses, ~14.6K reasoning tokens per 500-word doc |
+| `a9f2231` | `already_tagged`/tier-1 accept the content-only identity `blake3(text)`; new rows store it; legacy name-based rows still match | Duplicate scans of one document under different filenames shared a row, but `content_hash_before_tag` included the filename — every name-variant re-tagged every session |
+
+**Verification:** after the one-time migration pass, a launch shows `0`
+DeepSeek calls and the tagging queue stays at zero (871/871 tagged).
+
+---
+
 ## Remaining Work
 
 | Priority | Item |
