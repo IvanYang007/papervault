@@ -30,13 +30,15 @@ pub struct AutoTagConfig {
     /// Maximum words of document text sent to the API (≈ one page).
     #[serde(default = "default_max_text_words")]
     pub max_text_words: usize,
-    /// Reasoning effort for thinking models ("low"/"medium"/"high").
-    /// None omits the field entirely (for models that reject it).
-    #[serde(default = "default_thinking_effort")]
-    pub thinking_effort: Option<String>,
-    /// Output token budget. Must leave headroom for reasoning: with
-    /// max_tokens=4000 the model sometimes burned the whole budget
-    /// thinking and returned empty content (finish_reason "length").
+    /// Whether to enable the model's thinking (chain-of-thought) mode.
+    /// DeepSeek's `thinking` parameter defaults to enabled; tag extraction
+    /// does not need reasoning, and thinking burned tokens (empty responses,
+    /// latency, cost) — so the default is false (thinking disabled).
+    #[serde(default)]
+    pub thinking_enabled: bool,
+    /// Output token budget. Generous headroom only matters when thinking is
+    /// enabled (worst measured reasoning: ~14.6K tokens); with thinking
+    /// disabled the output is just the tag JSON.
     #[serde(default = "default_max_tokens")]
     pub max_tokens: usize,
 }
@@ -66,9 +68,6 @@ fn default_request_timeout() -> u64 {
 fn default_max_tags() -> usize {
     5
 }
-fn default_thinking_effort() -> Option<String> {
-    Some("low".into())
-}
 fn default_max_tokens() -> usize {
     // Worst measured reasoning: ~14.6K tokens on a 500-word document.
     24000
@@ -91,7 +90,7 @@ impl Default for AutoTagConfig {
             request_timeout_secs: default_request_timeout(),
             max_tags_per_doc: default_max_tags(),
             max_text_words: default_max_text_words(),
-            thinking_effort: default_thinking_effort(),
+            thinking_enabled: false,
             max_tokens: default_max_tokens(),
         }
     }

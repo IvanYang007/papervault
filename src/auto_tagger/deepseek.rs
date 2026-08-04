@@ -34,8 +34,8 @@ pub struct DeepSeekProvider {
     timeout: Duration,
     /// Maximum words of text to send (soft cap — truncates at word boundary).
     max_text_words: usize,
-    /// Reasoning effort for thinking models; None omits the field.
-    thinking_effort: Option<String>,
+    /// Whether the model's thinking (chain-of-thought) mode is enabled.
+    thinking_enabled: bool,
     /// Output token budget — must exceed worst-case reasoning length.
     max_tokens: usize,
 }
@@ -48,7 +48,7 @@ impl DeepSeekProvider {
         api_key_env: impl Into<String>,
         timeout_secs: u64,
         max_text_words: usize,
-        thinking_effort: Option<String>,
+        thinking_enabled: bool,
         max_tokens: usize,
     ) -> Self {
         Self {
@@ -61,7 +61,7 @@ impl DeepSeekProvider {
             api_key_env: api_key_env.into(),
             timeout: Duration::from_secs(timeout_secs),
             max_text_words,
-            thinking_effort,
+            thinking_enabled,
             max_tokens,
         }
     }
@@ -236,10 +236,17 @@ impl TagProvider for DeepSeekProvider {
             "max_tokens": self.max_tokens,
             "stream": false
         });
-        // Thinking models honor a reasoning-effort hint; faster, cheaper
-        // responses at "low". Omitted entirely for models that reject it.
-        if let Some(effort) = &self.thinking_effort {
-            body["thinking_effort"] = serde_json::json!(effort);
+        // DeepSeek's `thinking` object switches chain-of-thought mode:
+        // {"type": "enabled"} or {"type": "disabled"} (default enabled).
+        // `reasoning_effort` (low/high/max) only tunes depth when enabled.
+        // Tag extraction does not need reasoning — disabled by default.
+        // (The old `thinking_effort` key was not a valid DeepSeek parameter
+        // and was silently ignored, so thinking ran at full strength.)
+        if self.thinking_enabled {
+            body["thinking"] = serde_json::json!({ "type": "enabled" });
+            body["reasoning_effort"] = serde_json::json!("low");
+        } else {
+            body["thinking"] = serde_json::json!({ "type": "disabled" });
         }
 
         let body_str = serde_json::to_string(&body).map_err(|e| {
@@ -315,7 +322,7 @@ mod tests {
             "DEEPSEEK_API_KEY",
             30,
             500,
-            Some("low".into()),
+            false, // thinking disabled
             16000,
         )
     }

@@ -10,5 +10,6 @@
   "api_key_env": "DEEPSEEK_API_KEY",
   "max_retries": 3,
   "request_timeout_secs": 30,
-  "max_tags_per_doc": 8
+  "max_tags_per_doc": 8,
+  "thinking_enabled": false
 }
