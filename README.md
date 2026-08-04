@@ -45,6 +45,107 @@ cargo build --release
 .\target\release\papervault.exe
 ```
 
+## AI Agent Installation Guide
+
+Step-by-step install an AI agent (or a new user) can follow end-to-end on a
+fresh Windows 11 machine. A deeper postmortem of the auto-tagging pitfalls
+lives at `D:/Github/docs/solutions/rust-windows/auto-tagger-retag-churn.md`.
+
+### 1. Prerequisites
+
+- Windows 11, 64-bit
+- [Rust toolchain](https://rustup.rs) (stable)
+- Git
+- (Optional) A DeepSeek API key for AI auto-tagging
+
+### 2. Build
+
+```powershell
+# Close any running papervault.exe first — it locks the build output.
+git clone https://github.com/IvanYang007/papervault.git
+cd papervault
+cargo build --release
+```
+
+### 3. pdfium.dll (required for PDF preview)
+
+```powershell
+# Download from bblanchon/pdfium-binaries → chromium/7543 → pdfium-win-x64.tgz
+# Extract and place bin/pdfium.dll NEXT TO papervault.exe:
+Copy-Item pdfium.dll .\target\release\pdfium.dll
+```
+
+### 4. First run + folder
+
+```powershell
+.\target\release\papervault.exe
+```
+
+1. Click 📁 Folder and select the documents folder, OR pre-seed
+   `%APPDATA%\papervault\config.json`:
+   `{ "watched_folder": "Z:\\ScanOriginal" }`
+2. Files index automatically (metadata fast-path skips unchanged files on
+   later launches).
+
+### 5. Auto-tagging (optional, requires DeepSeek)
+
+1. Set the API key as a **user environment variable** (the app reads it at
+   request time; never write the key into any file):
+   ```powershell
+   setx DEEPSEEK_API_KEY "your-key-here"
+   ```
+2. Create `%APPDATA%\papervault\auto_tag.json`:
+   ```json
+   {
+     "enabled": true,
+     "provider": "deepseek",
+     "model": "deepseek-v4-flash",
+     "endpoint": "https://api.deepseek.com/v1/chat/completions",
+     "api_key_env": "DEEPSEEK_API_KEY",
+     "max_retries": 3,
+     "request_timeout_secs": 240,
+     "max_tags_per_doc": 5,
+     "max_text_words": 500,
+     "thinking_enabled": false,
+     "max_tokens": 24000
+   }
+   ```
+   `thinking_enabled: false` is the default and recommended — thinking
+   mode burns tokens for no benefit on tag extraction.
+3. Restart the app. The queue shows tagging progress; the first pass tags
+   every document.
+
+### 6. Verify the install (do this after the first pass finishes)
+
+1. Restart the app once more.
+2. The tagging queue must stay at zero (no "waiting" files).
+3. Check the session log — it must show **0** API calls:
+   ```powershell
+   $log = Get-ChildItem "$env:LOCALAPPDATA\papervault\papervault-*.log" |
+          Sort-Object LastWriteTime | Select-Object -Last 1
+   (Select-String -Path $log.FullName -Pattern "tier 3 \(AI fallback\)").Count
+   # expect: 0
+   ```
+4. Sanity: the status line in the log reads `871 docs total, 871 with tags`
+   (counts match your library size).
+
+### Known pitfalls (all fixed in code — do not "fix" them again)
+
+- **Network-share watcher:** on SMB drives (Z:), `notify` reports spurious
+  `Remove` events. The watcher now only deletes rows when the file is
+  really gone — do not remove that `path.exists()` guard.
+- **Re-tag churn:** duplicate scans under different filenames share one
+  content-hash row; `already_tagged` compares **content only**
+  (`blake3(text)`), accepting legacy name-based rows. A launch showing
+  API calls after the second restart means something regressed.
+- **DeepSeek thinking:** the only valid switch is
+  `thinking: {"type": "disabled"}`; `thinking_effort` is silently ignored.
+- **Debug logging:** `RUST_LOG=debug` grows the session log ~90 MB/min.
+  Use it briefly, then unset it.
+- **Logs & DB locations:** session logs and `papervault.db` live in
+  `%LOCALAPPDATA%\papervault\` (retention: 3 days); config in
+  `%APPDATA%\papervault\`.
+
 ## Tech Stack
 
 | Component | Technology |
