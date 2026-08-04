@@ -500,9 +500,16 @@ fn tag_document(
         text.len()
     );
 
-    // Tier 1: exact BLAKE3 hash match (content hasn't changed)
+    // Tier 1: exact BLAKE3 hash match (content hasn't changed).
+    // The stored hash-before may be the legacy filename-based form or the
+    // content-only form; accept either. Duplicate scans of the same
+    // document under different names share a row and must stay tagged.
     if let Ok(Some(status)) = tag_store.auto_tag_status(content_hash) {
-        if status.content_hash_before_tag == content_hash_before_tag && status.status == "tagged" {
+        let content_only = crate::indexer::pipeline::compute_content_hash(text, "");
+        if status.status == "tagged"
+            && (status.content_hash_before_tag == content_hash_before_tag
+                || status.content_hash_before_tag == content_only)
+        {
             info!(
                 "  → tier 1 (exact hash): {filename} — reusing {} byte tags_json",
                 status.tags_json.as_ref().map(|j| j.len()).unwrap_or(0)
@@ -527,7 +534,11 @@ fn tag_document(
                 .upsert_auto_tag_status(
                     content_hash,
                     filename,
-                    content_hash_before_tag,
+                    // Store the content-only identity (see
+                    // pipeline::already_tagged): the tags were derived from
+                    // this text, so the row must stay reusable by any
+                    // filename variant of the same content.
+                    &crate::indexer::pipeline::compute_content_hash(text, ""),
                     "tagged",
                     Some(&cached_json),
                     None,
@@ -613,7 +624,8 @@ fn tag_document(
                 if let Err(e) = tag_store.upsert_auto_tag_status(
                     content_hash,
                     filename,
-                    content_hash_before_tag,
+                    // Content-only identity (see pipeline::already_tagged).
+                    &crate::indexer::pipeline::compute_content_hash(text, ""),
                     "tagged",
                     Some(&tags_json),
                     None,

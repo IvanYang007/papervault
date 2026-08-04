@@ -961,7 +961,8 @@ impl PapervaultApp {
 
         let content_hash_before_tag = {
             let mut hasher = blake3::Hasher::new();
-            hasher.update(file_name.as_bytes());
+            // Content-only identity: duplicate scans under different names
+            // must reuse tags (see pipeline::already_tagged).
             hasher.update(content.as_bytes());
             hasher.finalize().to_hex().to_string()
         };
@@ -1063,7 +1064,8 @@ impl PapervaultApp {
 
             let content_hash_before_tag = {
                 let mut hasher = blake3::Hasher::new();
-                hasher.update(file_name.as_bytes());
+                // Content-only identity: duplicate scans under different
+                // names must reuse tags (see pipeline::already_tagged).
                 hasher.update(content.as_bytes());
                 hasher.finalize().to_hex().to_string()
             };

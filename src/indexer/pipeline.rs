@@ -367,11 +367,11 @@ impl Pipeline {
                 .into_iter()
                 .map(|t| t.name)
                 .collect::<Vec<String>>();
-            let content_hash_before_tag = compute_content_hash(&file_name, &extracted.text);
+            let content_hash_before_tag = compute_content_hash(&extracted.text, "");
             // Already-tagged content must keep its status row and tags — no
             // API call, no 'pending' wipe (even if the API is down).
             let already_tagged =
-                already_tagged(&self.tag_store, &content_hash, &content_hash_before_tag);
+                already_tagged(&self.tag_store, &content_hash, &file_name, &extracted.text);
 
             docs.push(PendingDoc {
                 path,
@@ -645,10 +645,10 @@ impl Pipeline {
         // Persist auto-tag request to DB after successful indexing
         // (replaces the old channel-based queue that silently dropped documents)
         {
-            let content_hash_before_tag = compute_content_hash(&file_name, extracted_text);
+            let content_hash_before_tag = compute_content_hash(extracted_text, "");
             // Never re-request tags for content that is already tagged —
             // the status row (and its tags) must survive re-indexing.
-            if already_tagged(&self.tag_store, &content_hash, &content_hash_before_tag) {
+            if already_tagged(&self.tag_store, &content_hash, &file_name, extracted_text) {
                 debug!(
                     "Skipping auto-tag request for {} (already tagged)",
                     path.display()
@@ -745,12 +745,23 @@ pub fn compute_content_hash(text: &str, file_type: &str) -> String {
 /// still stored. Re-indexing such a file must NOT wipe its status row or
 /// re-call the API — that would lose tags for no benefit (and permanently,
 /// if the API happens to be down at that moment).
-fn already_tagged(store: &TagStore, content_hash: &str, content_hash_before_tag: &str) -> bool {
+///
+/// The identity is the CONTENT, not the filename: the library contains
+/// duplicate scans of the same document under different names (date-
+/// prefixed variants, re-scans), and those shared one content_hash row —
+/// comparing the filename-based hash made every name-variant look
+/// "changed" and re-tagged it every session. New rows store the
+/// content-only hash (blake3(text)); legacy rows store blake3(filename,
+/// text) — accept either so existing rows keep working and renames/
+/// duplicates stay tagged. The reindex flow's synthetic marker matches
+/// neither, so it still forces a re-tag.
+fn already_tagged(store: &TagStore, content_hash: &str, filename: &str, text: &str) -> bool {
     match store.auto_tag_status(content_hash) {
         Ok(Some(status)) => {
             status.status == "tagged"
                 && status.tags_json.is_some()
-                && status.content_hash_before_tag == content_hash_before_tag
+                && (status.content_hash_before_tag == compute_content_hash(text, "")
+                    || status.content_hash_before_tag == compute_content_hash(filename, text))
         }
         _ => false,
     }
@@ -996,6 +1007,52 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(new_hash, hash);
+    }
+
+    #[test]
+    fn already_tagged_accepts_duplicate_filename_same_content() {
+        // Duplicate scans of the same document under different names share
+        // one content_hash row; the tags must be reused, not re-tagged.
+        let (store, _dir) = setup_tag_store();
+        store
+            .upsert_document("h1", "/a.pdf", "pdf", 7, 0)
+            .unwrap();
+        let content = "same document text";
+
+        // Content-only rows (new format): any filename matches.
+        let content_only = compute_content_hash(content, "");
+        store
+            .upsert_auto_tag_status(
+                "h1",
+                "a.pdf",
+                &content_only,
+                "tagged",
+                Some(r#"{"tags":["x"]}"#),
+                None,
+            )
+            .unwrap();
+        assert!(already_tagged(&store, "h1", "a.pdf", content));
+        assert!(
+            already_tagged(&store, "h1", "b.pdf", content),
+            "duplicate scan under another name must reuse tags"
+        );
+        assert!(
+            !already_tagged(&store, "h1", "b.pdf", "changed content"),
+            "changed content must re-tag"
+        );
+
+        // Legacy name-based rows (old format): same name still matches.
+        store
+            .upsert_auto_tag_status(
+                "h1",
+                "a.pdf",
+                &compute_content_hash("a.pdf", content),
+                "tagged",
+                Some(r#"{"tags":["x"]}"#),
+                None,
+            )
+            .unwrap();
+        assert!(already_tagged(&store, "h1", "a.pdf", content));
     }
 
     #[test]
@@ -1920,7 +1977,8 @@ mod tests {
         let meta = std::fs::metadata(&f).unwrap();
         let file_name = "a.txt";
         let content_hash = compute_content_hash(text, "txt");
-        let hash_before = compute_content_hash(file_name, text);
+        // New rows store the content-only identity (see already_tagged).
+        let hash_before = compute_content_hash(text, "");
         store
             .upsert_document(&content_hash, f.to_str().unwrap(), "txt", 0, 0)
             .unwrap();
